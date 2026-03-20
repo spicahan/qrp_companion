@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.cpp"
-    INCLUDE_DIRS "."
+    SRCS "main_tab5.cpp" "pal_tab5.cpp" "../core/app.cpp"
+    INCLUDE_DIRS "." "../pal" "../core"
     REQUIRES M5Unified
 )
