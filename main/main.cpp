@@ -32,6 +32,11 @@ static float fps;
 static int64_t fps_last_time;
 static float t_rot_ms, t_flush_ms, t_hud_ms, t_total_ms;
 
+// Touch event display
+static int64_t touch_time;       // timestamp of last touch event (us)
+static int touch_log_x, touch_log_y;  // logical landscape coordinates
+static char touch_text[64];
+
 static uint16_t spectrum_color(float norm)
 {
     if (norm > 1.0f) norm = 1.0f;
@@ -227,6 +232,27 @@ static void draw_frame()
     hud_sprite.print("WATERFALL");
     blit_hud_rotated(8, wf_y + 4, 80, 12);
 
+    // Touch event text (visible for 1 second)
+    int64_t now_us = esp_timer_get_time();
+    if (touch_time > 0 && (now_us - touch_time) < 1000000) {
+        int tw = strlen(touch_text) * 6;  // approx width at textSize 1
+        int th = 16;
+        int tx = touch_log_x - tw / 2;
+        int ty = touch_log_y - th - 4;
+        if (tx < 0) tx = 0;
+        if (tx + tw > LOG_W) tx = LOG_W - tw;
+        if (ty < 0) ty = touch_log_y + 8;
+
+        hud_sprite.createSprite(tw + 8, th);
+        hud_sprite.fillSprite(lgfx::color565(40, 40, 40));
+        hud_sprite.drawRect(0, 0, tw + 8, th, TFT_WHITE);
+        hud_sprite.setTextColor(TFT_YELLOW);
+        hud_sprite.setTextSize(1);
+        hud_sprite.setCursor(4, 2);
+        hud_sprite.print(touch_text);
+        blit_hud_rotated(tx, ty, tw + 8, th);
+    }
+
     t2 = esp_timer_get_time();
 
     // --- Cache flush ---
@@ -270,11 +296,28 @@ static void setup()
     fps = 0;
     frame_count = 0;
     fps_last_time = esp_timer_get_time();
+    touch_time = 0;
 }
 
 static void loop()
 {
     M5.update();
+
+    // Check for touch events
+    auto touch_count = M5.Touch.getCount();
+    if (touch_count > 0) {
+        auto detail = M5.Touch.getDetail(0);
+        if (detail.wasPressed()) {
+            // Physical portrait coords → logical landscape coords
+            // Reverse of 90° CW: log_x = LOG_W - 1 - phys_y, log_y = phys_x
+            touch_log_x = LOG_W - 1 - detail.y;
+            touch_log_y = detail.x;
+            snprintf(touch_text, sizeof(touch_text),
+                     "Touch @(%d,%d)", touch_log_x, touch_log_y);
+            touch_time = esp_timer_get_time();
+        }
+    }
+
     draw_frame();
 }
 
