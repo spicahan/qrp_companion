@@ -1,156 +1,191 @@
 #include <M5Unified.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <esp_timer.h>
 
-static void draw_test(M5GFX &display)
+static M5Canvas canvas;      // Off-screen sprite for double-buffered drawing
+static uint32_t frame_count;
+static float fps;
+static int64_t fps_last_time;
+
+// Fake spectrum signal generator with slowly drifting peaks
+static void calc_spectrum(float *out, int bins, int64_t time_us)
 {
-    int w = display.width();
-    int h = display.height();
+    float t = time_us / 1000000.0f;
+    float peaks[]    = {0.15f, 0.35f, 0.50f, 0.72f, 0.88f};
+    float widths[]   = {0.02f, 0.01f, 0.03f, 0.015f, 0.01f};
+    float strengths[] = {80, 120, 60, 140, 90};
+    int n_peaks = 5;
 
-    // Clear to black
-    display.fillScreen(TFT_BLACK);
+    for (int i = 0; i < bins; i++) {
+        float f = (float)i / bins;
+        float v = 10.0f;
+        for (int p = 0; p < n_peaks; p++) {
+            // Drift peaks slowly over time
+            float center = peaks[p] + 0.02f * sinf(t * (0.3f + p * 0.17f));
+            float dist = (f - center) / widths[p];
+            v += strengths[p] / (1.0f + dist * dist);
+        }
+        // Add some noise
+        uint32_t hash = (uint32_t)(i * 2654435761u + (uint32_t)(t * 1000));
+        v += (float)(hash & 0xFF) / 64.0f;
+        out[i] = v;
+    }
+}
 
-    // Draw a header bar
-    display.fillRect(0, 0, w, 40, TFT_NAVY);
-    display.setTextColor(TFT_WHITE, TFT_NAVY);
-    display.setTextSize(2);
-    display.setCursor(10, 10);
-    display.print("QRP Companion - Tab5 Graphics Test");
+static uint16_t spectrum_color(float amplitude, float max_val)
+{
+    float norm = amplitude / max_val;
+    if (norm > 1.0f) norm = 1.0f;
+    uint8_t r, g;
+    if (norm < 0.5f) {
+        r = (uint8_t)(norm * 2 * 255);
+        g = 255;
+    } else {
+        r = 255;
+        g = (uint8_t)((1.0f - norm) * 2 * 255);
+    }
+    return lgfx::color565(r, g, 0);
+}
 
-    // Draw color gradient bars (simulating a spectrum display)
-    int bar_y = 60;
-    int bar_h = 80;
-    for (int x = 0; x < w; x++) {
-        // HSV-like rainbow gradient
-        uint8_t r, g, b;
-        int hue = (x * 360) / w;
-        if (hue < 60)       { r = 255; g = hue * 255 / 60;       b = 0; }
-        else if (hue < 120) { r = (120 - hue) * 255 / 60; g = 255; b = 0; }
-        else if (hue < 180) { r = 0; g = 255; b = (hue - 120) * 255 / 60; }
-        else if (hue < 240) { r = 0; g = (240 - hue) * 255 / 60; b = 255; }
-        else if (hue < 300) { r = (hue - 240) * 255 / 60; g = 0;  b = 255; }
-        else                { r = 255; g = 0; b = (360 - hue) * 255 / 60; }
-        uint16_t color = display.color565(r, g, b);
-        display.drawFastVLine(x, bar_y, bar_h, color);
+static uint16_t waterfall_color(float amplitude, float max_val)
+{
+    int intensity = (int)(amplitude / max_val * 255);
+    if (intensity > 255) intensity = 255;
+    if (intensity < 0) intensity = 0;
+    uint8_t r, g, b;
+    if (intensity < 85) {
+        r = 0; g = 0; b = intensity * 3;
+    } else if (intensity < 170) {
+        r = (intensity - 85) * 3; g = (intensity - 85) * 3; b = 255 - (intensity - 85) * 3;
+    } else {
+        r = 255; g = 255 - (intensity - 170) * 3; b = 0;
+    }
+    return lgfx::color565(r, g, b);
+}
+
+// Waterfall history buffer
+static constexpr int WF_MAX_ROWS = 200;
+static uint16_t *wf_linebuf = nullptr;  // WF_MAX_ROWS * screen_width, ring buffer
+static int wf_head = 0;
+static int wf_width = 0;
+
+static void draw_frame(M5GFX &display)
+{
+    int64_t now = esp_timer_get_time();
+    int w = canvas.width();
+    int h = canvas.height();
+
+    // --- FPS calculation (update once per second) ---
+    frame_count++;
+    int64_t elapsed = now - fps_last_time;
+    if (elapsed >= 1000000) {
+        fps = (float)frame_count * 1000000.0f / elapsed;
+        frame_count = 0;
+        fps_last_time = now;
     }
 
-    // Label for gradient
-    display.setTextColor(TFT_WHITE, TFT_BLACK);
-    display.setTextSize(1);
-    display.setCursor(10, bar_y + bar_h + 5);
-    display.print("Rainbow gradient (spectrum color palette test)");
+    canvas.fillScreen(TFT_BLACK);
 
-    // Draw simulated spectrum bars
-    int spec_y = bar_y + bar_h + 30;
-    int spec_h = 150;
-    display.drawRect(0, spec_y, w, spec_h, TFT_DARKGREY);
+    // Header
+    canvas.fillRect(0, 0, w, 32, TFT_NAVY);
+    canvas.setTextColor(TFT_WHITE, TFT_NAVY);
+    canvas.setTextSize(2);
+    canvas.setCursor(8, 8);
+    canvas.print("QRP Companion - Graphics Test");
 
-    // Fake spectrum data
-    for (int x = 0; x < w; x += 2) {
-        // Generate a "signal" with peaks
-        float f = (float)x / w;
-        int amplitude = 10;
-        // Add some peaks to simulate signals
-        float peaks[] = {0.15f, 0.35f, 0.5f, 0.72f, 0.88f};
-        float widths[] = {0.02f, 0.01f, 0.03f, 0.015f, 0.01f};
-        int strengths[] = {80, 120, 60, 140, 90};
-        for (int p = 0; p < 5; p++) {
-            float dist = (f - peaks[p]) / widths[p];
-            amplitude += (int)(strengths[p] / (1.0f + dist * dist));
-        }
-        if (amplitude > spec_h - 2) amplitude = spec_h - 2;
-
-        // Color based on intensity (green -> yellow -> red)
-        uint8_t r, g;
-        if (amplitude < spec_h / 2) {
-            r = amplitude * 255 / (spec_h / 2);
-            g = 255;
-        } else {
-            r = 255;
-            g = 255 - (amplitude - spec_h / 2) * 255 / (spec_h / 2);
-        }
-        uint16_t color = display.color565(r, g, 0);
-        display.drawFastVLine(x, spec_y + spec_h - 1 - amplitude, amplitude, color);
+    // FPS display (right-aligned in header)
+    {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.1f FPS", fps);
+        int tw = canvas.textWidth(buf);
+        canvas.setCursor(w - tw - 8, 8);
+        // Color-code: green > 30, yellow > 15, red otherwise
+        uint16_t fps_color = (fps > 30) ? TFT_GREEN : (fps > 15) ? TFT_YELLOW : TFT_RED;
+        canvas.setTextColor(fps_color, TFT_NAVY);
+        canvas.print(buf);
     }
 
-    display.setTextColor(TFT_CYAN, TFT_BLACK);
-    display.setCursor(10, spec_y + spec_h + 5);
-    display.print("Simulated RF spectrum with signal peaks");
+    // --- Spectrum ---
+    int spec_y = 40;
+    int spec_h = 180;
+    canvas.drawRect(0, spec_y, w, spec_h, TFT_DARKGREY);
 
-    // Draw waterfall preview (horizontal color bands fading)
-    int wf_y = spec_y + spec_h + 30;
-    int wf_h = 120;
-    display.drawRect(0, wf_y, w, wf_h, TFT_DARKGREY);
+    float spectrum[1280];
+    int bins = w;
+    calc_spectrum(spectrum, bins, now);
 
-    for (int row = 0; row < wf_h - 2; row++) {
-        for (int x = 1; x < w - 1; x += 2) {
-            float f = (float)x / w;
-            int intensity = 0;
-            float peaks[] = {0.15f, 0.35f, 0.5f, 0.72f, 0.88f};
-            float widths[] = {0.02f, 0.01f, 0.03f, 0.015f, 0.01f};
-            int strengths[] = {80, 120, 60, 140, 90};
-            for (int p = 0; p < 5; p++) {
-                float dist = (f - peaks[p]) / widths[p];
-                intensity += (int)(strengths[p] / (1.0f + dist * dist));
-            }
-            // Fade with row (simulate waterfall scrolling)
-            intensity = intensity * (wf_h - row) / wf_h;
-            if (intensity > 255) intensity = 255;
-
-            // Blue-to-yellow-to-red colormap
-            uint8_t r, g, b;
-            if (intensity < 85) {
-                r = 0; g = 0; b = intensity * 3;
-            } else if (intensity < 170) {
-                r = (intensity - 85) * 3; g = (intensity - 85) * 3; b = 255 - (intensity - 85) * 3;
-            } else {
-                r = 255; g = 255 - (intensity - 170) * 3; b = 0;
-            }
-            uint16_t color = display.color565(r, g, b);
-            display.drawFastVLine(x, wf_y + 1 + row, 1, color);
-        }
+    float max_val = (float)spec_h;
+    for (int x = 0; x < bins; x++) {
+        float amp = spectrum[x];
+        if (amp > max_val) amp = max_val;
+        int bar = (int)amp;
+        if (bar < 1) bar = 1;
+        uint16_t color = spectrum_color(amp, max_val);
+        canvas.drawFastVLine(x, spec_y + spec_h - 1 - bar, bar, color);
     }
 
-    display.setTextColor(TFT_CYAN, TFT_BLACK);
-    display.setCursor(10, wf_y + wf_h + 5);
-    display.print("Simulated waterfall display");
+    canvas.setTextColor(TFT_CYAN, TFT_BLACK);
+    canvas.setTextSize(1);
+    canvas.setCursor(8, spec_y + 4);
+    canvas.print("SPECTRUM");
 
-    // Draw basic shapes test
-    int shape_y = wf_y + wf_h + 30;
-    display.setTextColor(TFT_WHITE, TFT_BLACK);
-    display.setTextSize(1);
-    display.setCursor(10, shape_y);
-    display.print("Shape primitives:");
+    // --- Waterfall ---
+    int wf_y = spec_y + spec_h + 4;
+    int wf_h = h - wf_y - 40;
+    if (wf_h > WF_MAX_ROWS) wf_h = WF_MAX_ROWS;
 
-    int sx = 10;
-    shape_y += 15;
-    display.drawRect(sx, shape_y, 60, 40, TFT_RED);
-    display.fillRect(sx + 5, shape_y + 5, 50, 30, TFT_DARKGREEN);
-    sx += 80;
+    // Initialize waterfall buffer on first call
+    if (wf_linebuf == nullptr || wf_width != w) {
+        free(wf_linebuf);
+        wf_width = w;
+        wf_linebuf = (uint16_t *)heap_caps_calloc(WF_MAX_ROWS * w, sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        wf_head = 0;
+    }
 
-    display.drawCircle(sx + 20, shape_y + 20, 20, TFT_YELLOW);
-    display.fillCircle(sx + 20, shape_y + 20, 10, TFT_ORANGE);
-    sx += 60;
+    // Write new spectrum line into ring buffer
+    uint16_t *new_line = &wf_linebuf[wf_head * w];
+    for (int x = 0; x < bins; x++) {
+        new_line[x] = waterfall_color(spectrum[x], max_val);
+    }
+    wf_head = (wf_head + 1) % wf_h;
 
-    display.drawTriangle(sx, shape_y + 40, sx + 20, shape_y, sx + 40, shape_y + 40, TFT_MAGENTA);
-    sx += 60;
+    // Draw waterfall from ring buffer (newest at top)
+    for (int row = 0; row < wf_h; row++) {
+        int buf_idx = (wf_head - 1 - row + wf_h) % wf_h;
+        canvas.pushImage(0, wf_y + row, w, 1, &wf_linebuf[buf_idx * w]);
+    }
 
-    display.drawRoundRect(sx, shape_y, 60, 40, 8, TFT_CYAN);
-    sx += 80;
+    canvas.setTextColor(TFT_CYAN, TFT_BLACK);
+    canvas.setCursor(8, wf_y + 4);
+    canvas.print("WATERFALL");
 
-    display.drawLine(sx, shape_y, sx + 60, shape_y + 40, TFT_GREEN);
-    display.drawLine(sx, shape_y + 40, sx + 60, shape_y, TFT_GREEN);
+    // --- Info bar ---
+    int info_y = h - 32;
+    canvas.fillRect(0, info_y, w, 32, 0x2104); // dark grey
+    canvas.setTextColor(TFT_WHITE, 0x2104);
+    canvas.setTextSize(1);
+    canvas.setCursor(8, info_y + 4);
+    canvas.printf("Display: %dx%d  Board: %d  Depth: %dbit  Heap: %dK free",
+                  w, h, (int)M5.getBoard(), display.getColorDepth(),
+                  (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
 
-    // Display info at bottom
-    int info_y = h - 50;
-    display.fillRect(0, info_y, w, 50, TFT_DARKGREY);
-    display.setTextColor(TFT_WHITE, TFT_DARKGREY);
-    display.setTextSize(1);
-    display.setCursor(10, info_y + 5);
-    display.printf("Display: %d x %d  Board: %d  Color depth: %d bit",
-                   w, h, (int)M5.getBoard(), display.getColorDepth());
-    display.setCursor(10, info_y + 25);
-    display.print("Touch the screen to continue...");
+    // Frame time stats
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Frame: %.1fms", fps > 0 ? 1000.0f / fps : 0);
+        int tw = canvas.textWidth(buf);
+        canvas.setCursor(w - tw - 8, info_y + 4);
+        canvas.print(buf);
+    }
+
+    canvas.setCursor(8, info_y + 18);
+    canvas.printf("PSRAM: %dK free  Uptime: %ds",
+                  (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                  (int)(now / 1000000));
+
+    // Push canvas to display
+    canvas.pushSprite(&display, 0, 0);
 }
 
 static void setup()
@@ -160,21 +195,27 @@ static void setup()
 
     auto &display = M5.Display;
 
-    // Use landscape orientation
     if (display.width() < display.height()) {
         display.setRotation(1);
     }
 
     display.setBrightness(128);
-    display.startWrite();
-    draw_test(display);
-    display.endWrite();
+
+    // Create off-screen canvas in PSRAM for double-buffered rendering
+    canvas.setPsram(true);
+    canvas.createSprite(display.width(), display.height());
+
+    fps = 0;
+    frame_count = 0;
+    fps_last_time = esp_timer_get_time();
 }
 
 static void loop()
 {
     M5.update();
-    vTaskDelay(pdMS_TO_TICKS(10));
+    M5.Display.startWrite();
+    draw_frame(M5.Display);
+    M5.Display.endWrite();
 }
 
 extern "C" void app_main(void)
