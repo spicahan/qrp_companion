@@ -1,193 +1,182 @@
 #include <M5Unified.h>
+#include <lgfx/v1/platforms/esp32p4/Panel_DSI.hpp>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_timer.h>
+#include <esp_cache.h>
+#include <string.h>
 
-static M5Canvas canvas;      // Off-screen sprite for double-buffered drawing
+// Physical display: 720×1280 portrait (no rotation!)
+static int phys_w, phys_h;
+static uint32_t fb_size;
+static uint8_t *framebuffer;      // Direct pointer to display framebuffer in PSRAM
+
+// Pre-computed full frame
+static uint16_t *frame_data;      // 720×1280 pre-rendered pixels in PSRAM
+
+// Layout constants (portrait: 720 wide, 1280 tall)
+static constexpr int HEADER_H = 28;
+static constexpr int SPEC_H   = 240;
+static constexpr int GAP      = 2;
+static constexpr int INFO_H   = 28;
+static int wf_y, wf_h;
+
+// FPS
 static uint32_t frame_count;
 static float fps;
 static int64_t fps_last_time;
+static float t_copy_ms, t_flush_ms, t_hud_ms, t_total_ms;
 
-// Fake spectrum signal generator with slowly drifting peaks
-static void calc_spectrum(float *out, int bins, int64_t time_us)
+static uint16_t spectrum_color(float norm)
 {
-    float t = time_us / 1000000.0f;
-    float peaks[]    = {0.15f, 0.35f, 0.50f, 0.72f, 0.88f};
-    float widths[]   = {0.02f, 0.01f, 0.03f, 0.015f, 0.01f};
-    float strengths[] = {80, 120, 60, 140, 90};
-    int n_peaks = 5;
-
-    for (int i = 0; i < bins; i++) {
-        float f = (float)i / bins;
-        float v = 10.0f;
-        for (int p = 0; p < n_peaks; p++) {
-            // Drift peaks slowly over time
-            float center = peaks[p] + 0.02f * sinf(t * (0.3f + p * 0.17f));
-            float dist = (f - center) / widths[p];
-            v += strengths[p] / (1.0f + dist * dist);
-        }
-        // Add some noise
-        uint32_t hash = (uint32_t)(i * 2654435761u + (uint32_t)(t * 1000));
-        v += (float)(hash & 0xFF) / 64.0f;
-        out[i] = v;
-    }
-}
-
-static uint16_t spectrum_color(float amplitude, float max_val)
-{
-    float norm = amplitude / max_val;
     if (norm > 1.0f) norm = 1.0f;
     uint8_t r, g;
-    if (norm < 0.5f) {
-        r = (uint8_t)(norm * 2 * 255);
-        g = 255;
-    } else {
-        r = 255;
-        g = (uint8_t)((1.0f - norm) * 2 * 255);
-    }
+    if (norm < 0.5f) { r = (uint8_t)(norm * 2 * 255); g = 255; }
+    else             { r = 255; g = (uint8_t)((1.0f - norm) * 2 * 255); }
     return lgfx::color565(r, g, 0);
 }
 
-static uint16_t waterfall_color(float amplitude, float max_val)
+static uint16_t waterfall_color(int intensity)
 {
-    int intensity = (int)(amplitude / max_val * 255);
     if (intensity > 255) intensity = 255;
     if (intensity < 0) intensity = 0;
     uint8_t r, g, b;
-    if (intensity < 85) {
-        r = 0; g = 0; b = intensity * 3;
-    } else if (intensity < 170) {
-        r = (intensity - 85) * 3; g = (intensity - 85) * 3; b = 255 - (intensity - 85) * 3;
-    } else {
-        r = 255; g = 255 - (intensity - 170) * 3; b = 0;
-    }
+    if (intensity < 85)       { r = 0; g = 0; b = intensity * 3; }
+    else if (intensity < 170) { r = (intensity-85)*3; g = (intensity-85)*3; b = 255-(intensity-85)*3; }
+    else                      { r = 255; g = 255-(intensity-170)*3; b = 0; }
     return lgfx::color565(r, g, b);
 }
 
-// Spectrum scratch buffer (too large for stack)
-static float *spectrum_buf = nullptr;
-
-// Waterfall history buffer
-static constexpr int WF_MAX_ROWS = 200;
-static uint16_t *wf_linebuf = nullptr;  // WF_MAX_ROWS * screen_width, ring buffer
-static int wf_head = 0;
-static int wf_width = 0;
-
-static void draw_frame(M5GFX &display)
+static void precompute_frame()
 {
-    int64_t now = esp_timer_get_time();
-    int w = canvas.width();
-    int h = canvas.height();
+    float peaks[]     = {0.15f, 0.35f, 0.50f, 0.72f, 0.88f};
+    float widths[]    = {0.02f, 0.01f, 0.03f, 0.015f, 0.01f};
+    float strengths[] = {80, 120, 60, 140, 90};
 
-    // --- FPS calculation (update once per second) ---
-    frame_count++;
-    int64_t elapsed = now - fps_last_time;
-    if (elapsed >= 1000000) {
-        fps = (float)frame_count * 1000000.0f / elapsed;
-        frame_count = 0;
-        fps_last_time = now;
+    // Header (navy)
+    uint16_t navy = lgfx::color565(0, 0, 128);
+    for (int y = 0; y < HEADER_H; y++)
+        for (int x = 0; x < phys_w; x++)
+            frame_data[y * phys_w + x] = navy;
+
+    // Gap (black)
+    int spec_start = HEADER_H + GAP;
+    for (int y = HEADER_H; y < spec_start; y++)
+        for (int x = 0; x < phys_w; x++)
+            frame_data[y * phys_w + x] = 0;
+
+    // Spectrum
+    for (int x = 0; x < phys_w; x++) {
+        float f = (float)x / phys_w;
+        float v = 10.0f;
+        for (int p = 0; p < 5; p++) {
+            float dist = (f - peaks[p]) / widths[p];
+            v += strengths[p] / (1.0f + dist * dist);
+        }
+        if (v > SPEC_H) v = SPEC_H;
+        int bar = (int)v;
+        uint16_t color = spectrum_color(v / SPEC_H);
+        for (int y = 0; y < SPEC_H; y++) {
+            int fy = spec_start + y;
+            frame_data[fy * phys_w + x] = (SPEC_H - 1 - y < bar) ? color : 0;
+        }
     }
 
-    canvas.fillScreen(TFT_BLACK);
+    // Gap
+    for (int y = spec_start + SPEC_H; y < wf_y; y++)
+        for (int x = 0; x < phys_w; x++)
+            frame_data[y * phys_w + x] = 0;
 
-    // Header
-    canvas.fillRect(0, 0, w, 32, TFT_NAVY);
-    canvas.setTextColor(TFT_WHITE, TFT_NAVY);
-    canvas.setTextSize(2);
-    canvas.setCursor(8, 8);
-    canvas.print("QRP Companion - Graphics Test");
-
-    // FPS display (right-aligned in header)
-    {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%.1f FPS", fps);
-        int tw = canvas.textWidth(buf);
-        canvas.setCursor(w - tw - 8, 8);
-        // Color-code: green > 30, yellow > 15, red otherwise
-        uint16_t fps_color = (fps > 30) ? TFT_GREEN : (fps > 15) ? TFT_YELLOW : TFT_RED;
-        canvas.setTextColor(fps_color, TFT_NAVY);
-        canvas.print(buf);
-    }
-
-    // --- Spectrum ---
-    int spec_y = 40;
-    int spec_h = 180;
-    canvas.drawRect(0, spec_y, w, spec_h, TFT_DARKGREY);
-
-    int bins = w;
-    calc_spectrum(spectrum_buf, bins, now);
-
-    float max_val = (float)spec_h;
-    for (int x = 0; x < bins; x++) {
-        float amp = spectrum_buf[x];
-        if (amp > max_val) amp = max_val;
-        int bar = (int)amp;
-        if (bar < 1) bar = 1;
-        uint16_t color = spectrum_color(amp, max_val);
-        canvas.drawFastVLine(x, spec_y + spec_h - 1 - bar, bar, color);
-    }
-
-    canvas.setTextColor(TFT_CYAN, TFT_BLACK);
-    canvas.setTextSize(1);
-    canvas.setCursor(8, spec_y + 4);
-    canvas.print("SPECTRUM");
-
-    // --- Waterfall ---
-    int wf_y = spec_y + spec_h + 4;
-    int wf_h = h - wf_y - 40;
-    if (wf_h > WF_MAX_ROWS) wf_h = WF_MAX_ROWS;
-
-    // Initialize waterfall buffer on first call
-    if (wf_linebuf == nullptr || wf_width != w) {
-        free(wf_linebuf);
-        wf_width = w;
-        wf_linebuf = (uint16_t *)heap_caps_calloc(WF_MAX_ROWS * w, sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        wf_head = 0;
-    }
-
-    // Write new spectrum line into ring buffer
-    uint16_t *new_line = &wf_linebuf[wf_head * w];
-    for (int x = 0; x < bins; x++) {
-        new_line[x] = waterfall_color(spectrum_buf[x], max_val);
-    }
-    wf_head = (wf_head + 1) % wf_h;
-
-    // Draw waterfall from ring buffer (newest at top)
+    // Waterfall
     for (int row = 0; row < wf_h; row++) {
-        int buf_idx = (wf_head - 1 - row + wf_h) % wf_h;
-        canvas.pushImage(0, wf_y + row, w, 1, &wf_linebuf[buf_idx * w]);
+        float fade = 1.0f - (float)row / wf_h;
+        int fy = wf_y + row;
+        for (int x = 0; x < phys_w; x++) {
+            float f = (float)x / phys_w;
+            float v = 10.0f;
+            for (int p = 0; p < 5; p++) {
+                float dist = (f - peaks[p]) / widths[p];
+                v += strengths[p] / (1.0f + dist * dist);
+            }
+            int intensity = (int)(v / SPEC_H * 255 * fade);
+            frame_data[fy * phys_w + x] = waterfall_color(intensity);
+        }
     }
 
-    canvas.setTextColor(TFT_CYAN, TFT_BLACK);
-    canvas.setCursor(8, wf_y + 4);
-    canvas.print("WATERFALL");
+    // Info bar (dark grey)
+    uint16_t dgrey = lgfx::color565(32, 32, 32);
+    int info_start = phys_h - INFO_H;
+    for (int y = info_start; y < phys_h; y++)
+        for (int x = 0; x < phys_w; x++)
+            frame_data[y * phys_w + x] = dgrey;
+}
 
-    // --- Info bar ---
-    int info_y = h - 32;
-    canvas.fillRect(0, info_y, w, 32, 0x2104); // dark grey
-    canvas.setTextColor(TFT_WHITE, 0x2104);
-    canvas.setTextSize(1);
-    canvas.setCursor(8, info_y + 4);
-    canvas.printf("Display: %dx%d  Board: %d  Depth: %dbit  Heap: %dK free",
-                  w, h, (int)M5.getBoard(), display.getColorDepth(),
-                  (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+static void draw_frame()
+{
+    int64_t t0, t1, t2, t3;
 
-    // Frame time stats
-    {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "Frame: %.1fms", fps > 0 ? 1000.0f / fps : 0);
-        int tw = canvas.textWidth(buf);
-        canvas.setCursor(w - tw - 8, info_y + 4);
-        canvas.print(buf);
+    // FPS
+    t0 = esp_timer_get_time();
+    frame_count++;
+    if (t0 - fps_last_time >= 1000000) {
+        fps = (float)frame_count * 1000000.0f / (t0 - fps_last_time);
+        frame_count = 0;
+        fps_last_time = t0;
     }
 
-    canvas.setCursor(8, info_y + 18);
-    canvas.printf("PSRAM: %dK free  Uptime: %ds",
-                  (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
-                  (int)(now / 1000000));
+    // --- Blit entire pre-computed frame to framebuffer ---
+    memcpy(framebuffer, frame_data, fb_size);
+    t1 = esp_timer_get_time();
 
-    // Push canvas to display
-    canvas.pushSprite(&display, 0, 0);
+    // --- Cache flush so DMA sees the new data ---
+    esp_cache_msync(framebuffer, fb_size,
+                    ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    t2 = esp_timer_get_time();
+
+    // --- HUD text overlay via M5GFX (no rotation = fast memcpy path) ---
+    auto &dsp = M5.Display;
+    dsp.startWrite();
+
+    // Header text
+    dsp.setTextColor(TFT_WHITE, lgfx::color565(0, 0, 128));
+    dsp.setTextSize(2);
+    dsp.setCursor(8, 6);
+    dsp.print("QRP Companion");
+
+    uint16_t fps_color = (fps >= 24) ? TFT_GREEN : (fps >= 10) ? TFT_YELLOW : TFT_RED;
+    dsp.setTextColor(fps_color, lgfx::color565(0, 0, 128));
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.1f FPS", fps);
+    dsp.setCursor(phys_w - dsp.textWidth(buf) - 8, 6);
+    dsp.print(buf);
+
+    // Labels
+    dsp.setTextColor(TFT_CYAN, TFT_BLACK);
+    dsp.setTextSize(1);
+    dsp.setCursor(8, HEADER_H + GAP + 4);
+    dsp.print("SPECTRUM");
+    dsp.setCursor(8, wf_y + 4);
+    dsp.print("WATERFALL");
+
+    // Info bar text
+    int info_y = phys_h - INFO_H;
+    dsp.setTextColor(TFT_WHITE, lgfx::color565(32, 32, 32));
+    dsp.setCursor(8, info_y + 4);
+    dsp.printf("copy:%.1f flush:%.1f hud:%.1f total:%.1fms",
+               t_copy_ms, t_flush_ms, t_hud_ms, t_total_ms);
+    dsp.setCursor(8, info_y + 16);
+    dsp.printf("%dx%d  heap:%dK  psram:%dK",
+               phys_w, phys_h,
+               (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+               (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+
+    dsp.endWrite();
+    t3 = esp_timer_get_time();
+
+    t_copy_ms  = (t1 - t0) / 1000.0f;
+    t_flush_ms = (t2 - t1) / 1000.0f;
+    t_hud_ms   = (t3 - t2) / 1000.0f;
+    t_total_ms = (t3 - t0) / 1000.0f;
 }
 
 static void setup()
@@ -195,21 +184,25 @@ static void setup()
     auto cfg = M5.config();
     M5.begin(cfg);
 
-    auto &display = M5.Display;
+    auto &dsp = M5.Display;
+    // NO rotation — use native portrait 720×1280
+    dsp.setBrightness(128);
 
-    if (display.width() < display.height()) {
-        display.setRotation(1);
-    }
+    phys_w = dsp.width();    // 720
+    phys_h = dsp.height();   // 1280
+    fb_size = phys_w * phys_h * 2;  // RGB565
 
-    display.setBrightness(128);
+    // Layout
+    wf_y = HEADER_H + GAP + SPEC_H + GAP;
+    wf_h = phys_h - wf_y - INFO_H;
 
-    // Create off-screen canvas in PSRAM for double-buffered rendering
-    canvas.setPsram(true);
-    canvas.setColorDepth(16);
-    canvas.createSprite(display.width(), display.height());
+    // Get direct framebuffer pointer from Panel_DSI
+    auto panel = static_cast<lgfx::Panel_DSI*>(dsp.getPanel());
+    framebuffer = (uint8_t*)panel->config_detail().buffer;
 
-    // Allocate spectrum buffer in PSRAM (too large for stack)
-    spectrum_buf = (float *)heap_caps_malloc(display.width() * sizeof(float), MALLOC_CAP_SPIRAM);
+    // Pre-compute full frame in PSRAM
+    frame_data = (uint16_t*)heap_caps_malloc(fb_size, MALLOC_CAP_SPIRAM);
+    precompute_frame();
 
     fps = 0;
     frame_count = 0;
@@ -219,9 +212,7 @@ static void setup()
 static void loop()
 {
     M5.update();
-    M5.Display.startWrite();
-    draw_frame(M5.Display);
-    M5.Display.endWrite();
+    draw_frame();
 }
 
 extern "C" void app_main(void)
