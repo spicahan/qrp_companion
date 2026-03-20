@@ -64,6 +64,9 @@ static uint16_t waterfall_color(float amplitude, float max_val)
     return lgfx::color565(r, g, b);
 }
 
+// Spectrum scratch buffer (too large for stack)
+static float *spectrum_buf = nullptr;
+
 // Waterfall history buffer
 static constexpr int WF_MAX_ROWS = 200;
 static uint16_t *wf_linebuf = nullptr;  // WF_MAX_ROWS * screen_width, ring buffer
@@ -111,13 +114,12 @@ static void draw_frame(M5GFX &display)
     int spec_h = 180;
     canvas.drawRect(0, spec_y, w, spec_h, TFT_DARKGREY);
 
-    float spectrum[1280];
     int bins = w;
-    calc_spectrum(spectrum, bins, now);
+    calc_spectrum(spectrum_buf, bins, now);
 
     float max_val = (float)spec_h;
     for (int x = 0; x < bins; x++) {
-        float amp = spectrum[x];
+        float amp = spectrum_buf[x];
         if (amp > max_val) amp = max_val;
         int bar = (int)amp;
         if (bar < 1) bar = 1;
@@ -146,7 +148,7 @@ static void draw_frame(M5GFX &display)
     // Write new spectrum line into ring buffer
     uint16_t *new_line = &wf_linebuf[wf_head * w];
     for (int x = 0; x < bins; x++) {
-        new_line[x] = waterfall_color(spectrum[x], max_val);
+        new_line[x] = waterfall_color(spectrum_buf[x], max_val);
     }
     wf_head = (wf_head + 1) % wf_h;
 
@@ -203,7 +205,11 @@ static void setup()
 
     // Create off-screen canvas in PSRAM for double-buffered rendering
     canvas.setPsram(true);
+    canvas.setColorDepth(16);
     canvas.createSprite(display.width(), display.height());
+
+    // Allocate spectrum buffer in PSRAM (too large for stack)
+    spectrum_buf = (float *)heap_caps_malloc(display.width() * sizeof(float), MALLOC_CAP_SPIRAM);
 
     fps = 0;
     frame_count = 0;
@@ -225,5 +231,5 @@ extern "C" void app_main(void)
             setup();
             for (;;) { loop(); }
         },
-        "main_task", 8192, nullptr, 1, nullptr, 1);
+        "main_task", 32768, nullptr, 1, nullptr, 1);
 }
