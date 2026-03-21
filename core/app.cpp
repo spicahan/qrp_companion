@@ -174,12 +174,14 @@ void app::tick()
         fps_last_time = t0;
     }
 
-    // DSP update at 8 Hz
-    if (t0 - last_dsp_time >= DSP_INTERVAL_US) {
-        dsp::process_frame();
+    // DSP: try external input first (UAC audio), fallback to test tone at 8 Hz
+    bool new_spectrum = dsp::processIfReady();
+    if (!new_spectrum && (t0 - last_dsp_time >= DSP_INTERVAL_US)) {
+        dsp::processTestTone();
+        new_spectrum = true;
+    }
+    if (new_spectrum) {
         last_dsp_time = t0;
-
-        // Push new spectrum line into waterfall ring buffer
         const float *mag = dsp::getMagnitudeDb();
         memcpy(&wf_db[wf_head * num_bins], mag, num_bins * sizeof(float));
         wf_head = (wf_head + 1) % WF_MAX_LINES;
@@ -227,8 +229,8 @@ void app::tick()
 
     // Labels
     draw::drawText(fb, log_w, log_h, 8, HEADER_H + GAP + 4, "SPECTRUM", COL_CYAN, COL_BLACK);
-    snprintf(buf, sizeof(buf), "1.5kHz tone  48kHz/%d-pt FFT  %dHz update",
-             FFT_SIZE, DSP_HZ);
+    snprintf(buf, sizeof(buf), "48kHz/%d-pt FFT",
+             FFT_SIZE);
     tw = draw::textWidth(buf);
     draw::drawText(fb, log_w, log_h, log_w - tw - 8, HEADER_H + GAP + 4, buf, COL_DGREY, COL_BLACK);
 

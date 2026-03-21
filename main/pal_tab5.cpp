@@ -1,4 +1,6 @@
 #include "pal.h"
+#include "dsp.h"
+#include "uac_host.h"
 
 #include <M5Unified.h>
 #include <lgfx/v1/platforms/esp32p4/Panel_DSI.hpp>
@@ -148,3 +150,9 @@ int freePsramKb()
 }
 
 } // namespace pal
+
+// C bridge: called from uac_host.c to push audio into the C++ DSP pipeline
+extern "C" void uac_push_audio_samples(const float *samples, int count)
+{
+    dsp::pushSamples(samples, count);
+}
