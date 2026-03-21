@@ -1,6 +1,7 @@
 #include "app.h"
 #include "pal.h"
 #include "draw.h"
+#include "dsp.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -18,9 +19,6 @@ static int wf_y, wf_h;
 static uint16_t COL_NAVY, COL_DGREY, COL_BLACK, COL_WHITE;
 static uint16_t COL_CYAN, COL_GREEN, COL_YELLOW, COL_RED;
 
-// Pre-computed background frame
-static uint16_t *bg_frame = nullptr;
-
 // FPS
 static uint32_t frame_count;
 static float fps;
@@ -32,19 +30,40 @@ static int64_t touch_time;
 static int touch_x, touch_y;
 static char touch_text[64];
 
+// DSP
+static constexpr int SAMPLE_RATE = 48000;
+static constexpr int FFT_SIZE    = 1024;
+static constexpr int DSP_HZ      = 8;
+static constexpr int64_t DSP_INTERVAL_US = 1000000 / DSP_HZ;
+static int64_t last_dsp_time;
+
+// Waterfall ring buffer (stores dB values)
+static constexpr int WF_MAX_LINES = 512;
+static float *wf_db = nullptr;     // WF_MAX_LINES * num_bins
+static int wf_head = 0;
+static int wf_count = 0;
+static int num_bins;
+
+// Spectrum dB range for display mapping
+static constexpr float DB_MIN = -100.0f;
+static constexpr float DB_MAX = 0.0f;
+
 static uint16_t spectrum_color(float norm)
 {
     if (norm > 1.0f) norm = 1.0f;
+    if (norm < 0.0f) norm = 0.0f;
     uint8_t r, g;
     if (norm < 0.5f) { r = (uint8_t)(norm * 2 * 255); g = 255; }
     else             { r = 255; g = (uint8_t)((1.0f - norm) * 2 * 255); }
     return draw::rgb565(r, g, 0);
 }
 
-static uint16_t waterfall_color(int intensity)
+static uint16_t waterfall_color_from_db(float db)
 {
-    if (intensity > 255) intensity = 255;
-    if (intensity < 0) intensity = 0;
+    float norm = (db - DB_MIN) / (DB_MAX - DB_MIN);
+    if (norm < 0.0f) norm = 0.0f;
+    if (norm > 1.0f) norm = 1.0f;
+    int intensity = (int)(norm * 255);
     uint8_t r, g, b;
     if (intensity < 85)       { r = 0; g = 0; b = intensity * 3; }
     else if (intensity < 170) { r = (intensity-85)*3; g = (intensity-85)*3; b = 255-(intensity-85)*3; }
@@ -52,57 +71,65 @@ static uint16_t waterfall_color(int intensity)
     return draw::rgb565(r, g, b);
 }
 
-static void precompute_background()
+// Map FFT bin index to display x coordinate
+static int bin_to_x(int bin)
 {
-    float peaks[]     = {0.15f, 0.35f, 0.50f, 0.72f, 0.88f};
-    float widths[]    = {0.02f, 0.01f, 0.03f, 0.015f, 0.01f};
-    float strengths[] = {80, 120, 60, 140, 90};
+    return bin * log_w / num_bins;
+}
 
-    // Header
-    draw::fillRect(bg_frame, log_w, 0, 0, log_w, HEADER_H, COL_NAVY);
+static void draw_spectrum(uint16_t *fb, const float *mag_db)
+{
+    int spec_y = HEADER_H + GAP;
 
-    // Gap
-    int spec_start = HEADER_H + GAP;
-    draw::fillRect(bg_frame, log_w, 0, HEADER_H, log_w, GAP, COL_BLACK);
+    // Clear spectrum area
+    draw::fillRect(fb, log_w, 0, spec_y, log_w, SPEC_H, COL_BLACK);
 
-    // Spectrum
-    for (int x = 0; x < log_w; x++) {
-        float f = (float)x / log_w;
-        float v = 10.0f;
-        for (int p = 0; p < 5; p++) {
-            float dist = (f - peaks[p]) / widths[p];
-            v += strengths[p] / (1.0f + dist * dist);
-        }
-        if (v > SPEC_H) v = SPEC_H;
-        int bar = (int)v;
-        uint16_t color = spectrum_color(v / SPEC_H);
-        for (int y = 0; y < SPEC_H; y++) {
-            int fy = spec_start + y;
-            bg_frame[fy * log_w + x] = (SPEC_H - 1 - y < bar) ? color : COL_BLACK;
-        }
+    // Draw spectrum bars
+    for (int bin = 0; bin < num_bins; bin++) {
+        int x0 = bin_to_x(bin);
+        int x1 = bin_to_x(bin + 1);
+        if (x1 <= x0) x1 = x0 + 1;
+        if (x0 >= log_w) break;
+
+        float norm = (mag_db[bin] - DB_MIN) / (DB_MAX - DB_MIN);
+        if (norm < 0.0f) norm = 0.0f;
+        if (norm > 1.0f) norm = 1.0f;
+
+        int bar_h = (int)(norm * SPEC_H);
+        if (bar_h < 1) bar_h = 1;
+
+        uint16_t color = spectrum_color(norm);
+        int bar_w = x1 - x0;
+        if (x0 + bar_w > log_w) bar_w = log_w - x0;
+        draw::fillRect(fb, log_w, x0, spec_y + SPEC_H - bar_h, bar_w, bar_h, color);
     }
+}
 
-    // Gap
-    draw::fillRect(bg_frame, log_w, 0, spec_start + SPEC_H, log_w, GAP, COL_BLACK);
+static void draw_waterfall(uint16_t *fb)
+{
+    int rows_to_draw = wf_count;
+    if (rows_to_draw > wf_h) rows_to_draw = wf_h;
 
-    // Waterfall
-    for (int row = 0; row < wf_h; row++) {
-        float fade = 1.0f - (float)row / wf_h;
+    // Clear waterfall area
+    draw::fillRect(fb, log_w, 0, wf_y, log_w, wf_h, COL_BLACK);
+
+    // Draw from newest (top) to oldest (bottom)
+    for (int row = 0; row < rows_to_draw; row++) {
+        int buf_idx = (wf_head - 1 - row + WF_MAX_LINES) % WF_MAX_LINES;
+        const float *line = &wf_db[buf_idx * num_bins];
         int fy = wf_y + row;
-        for (int x = 0; x < log_w; x++) {
-            float f = (float)x / log_w;
-            float v = 10.0f;
-            for (int p = 0; p < 5; p++) {
-                float dist = (f - peaks[p]) / widths[p];
-                v += strengths[p] / (1.0f + dist * dist);
-            }
-            int intensity = (int)(v / SPEC_H * 255 * fade);
-            bg_frame[fy * log_w + x] = waterfall_color(intensity);
+
+        for (int bin = 0; bin < num_bins; bin++) {
+            int x0 = bin_to_x(bin);
+            int x1 = bin_to_x(bin + 1);
+            if (x1 <= x0) x1 = x0 + 1;
+            if (x0 >= log_w) break;
+
+            uint16_t color = waterfall_color_from_db(line[bin]);
+            for (int x = x0; x < x1 && x < log_w; x++)
+                fb[fy * log_w + x] = color;
         }
     }
-
-    // Info bar
-    draw::fillRect(bg_frame, log_w, 0, log_h - INFO_H, log_w, INFO_H, COL_DGREY);
 }
 
 void app::init()
@@ -123,8 +150,11 @@ void app::init()
     COL_YELLOW = draw::rgb565(255, 255, 0);
     COL_RED    = draw::rgb565(255, 0, 0);
 
-    bg_frame = new uint16_t[log_w * log_h];
-    precompute_background();
+    // DSP init
+    dsp::init(SAMPLE_RATE, FFT_SIZE);
+    num_bins = dsp::getNumBins();
+    wf_db = new float[WF_MAX_LINES * num_bins]();
+    last_dsp_time = pal::micros();
 
     fps = 0;
     frame_count = 0;
@@ -144,6 +174,18 @@ void app::tick()
         fps_last_time = t0;
     }
 
+    // DSP update at 8 Hz
+    if (t0 - last_dsp_time >= DSP_INTERVAL_US) {
+        dsp::process_frame();
+        last_dsp_time = t0;
+
+        // Push new spectrum line into waterfall ring buffer
+        const float *mag = dsp::getMagnitudeDb();
+        memcpy(&wf_db[wf_head * num_bins], mag, num_bins * sizeof(float));
+        wf_head = (wf_head + 1) % WF_MAX_LINES;
+        if (wf_count < WF_MAX_LINES) wf_count++;
+    }
+
     // Poll touch events
     pal::TouchEvent evt;
     while (pal::pollEvent(evt)) {
@@ -155,9 +197,24 @@ void app::tick()
         }
     }
 
-    // Copy background to framebuffer
+    // --- Draw frame ---
     uint16_t *fb = pal::getFramebuffer();
-    memcpy(fb, bg_frame, log_w * log_h * sizeof(uint16_t));
+
+    // Header
+    draw::fillRect(fb, log_w, 0, 0, log_w, HEADER_H, COL_NAVY);
+    // Gap
+    draw::fillRect(fb, log_w, 0, HEADER_H, log_w, GAP, COL_BLACK);
+    // Info bar
+    draw::fillRect(fb, log_w, 0, log_h - INFO_H, log_w, INFO_H, COL_DGREY);
+
+    // Spectrum (from live DSP data)
+    draw_spectrum(fb, dsp::getMagnitudeDb());
+
+    // Gap
+    draw::fillRect(fb, log_w, 0, HEADER_H + GAP + SPEC_H, log_w, GAP, COL_BLACK);
+
+    // Waterfall
+    draw_waterfall(fb);
 
     // Header text
     draw::drawText(fb, log_w, log_h, 8, 6, "QRP Companion", COL_WHITE, COL_NAVY, 2);
@@ -170,9 +227,14 @@ void app::tick()
 
     // Labels
     draw::drawText(fb, log_w, log_h, 8, HEADER_H + GAP + 4, "SPECTRUM", COL_CYAN, COL_BLACK);
+    snprintf(buf, sizeof(buf), "1.5kHz tone  48kHz/%d-pt FFT  %dHz update",
+             FFT_SIZE, DSP_HZ);
+    tw = draw::textWidth(buf);
+    draw::drawText(fb, log_w, log_h, log_w - tw - 8, HEADER_H + GAP + 4, buf, COL_DGREY, COL_BLACK);
+
     draw::drawText(fb, log_w, log_h, 8, wf_y + 4, "WATERFALL", COL_CYAN, COL_BLACK);
 
-    // Touch event tooltip
+    // Touch tooltip
     if (touch_time > 0 && (t0 - touch_time) < 1000000) {
         int ttw = draw::textWidth(touch_text) + 8;
         int tx = touch_x - ttw / 2;
@@ -185,10 +247,10 @@ void app::tick()
         draw::drawText(fb, log_w, log_h, tx + 4, ty + 3, touch_text, COL_YELLOW, COL_DGREY);
     }
 
-    // Info bar
+    // Info bar text
     int info_y = log_h - INFO_H;
-    snprintf(buf, sizeof(buf), "draw:%.1f commit:%.1f total:%.1fms",
-             t_draw_ms, t_commit_ms, t_total_ms);
+    snprintf(buf, sizeof(buf), "draw:%.1f commit:%.1f total:%.1fms  bins:%d",
+             t_draw_ms, t_commit_ms, t_total_ms, num_bins);
     draw::drawText(fb, log_w, log_h, 8, info_y + 4, buf, COL_WHITE, COL_DGREY);
 
     snprintf(buf, sizeof(buf), "%dx%d  heap:%dK  psram:%dK",
@@ -196,10 +258,7 @@ void app::tick()
     draw::drawText(fb, log_w, log_h, 8, info_y + 16, buf, COL_WHITE, COL_DGREY);
 
     int64_t t1 = pal::micros();
-
-    // Push to screen
     pal::commitFrame();
-
     int64_t t2 = pal::micros();
 
     t_draw_ms   = (t1 - t0) / 1000.0f;

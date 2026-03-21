@@ -10,11 +10,14 @@ add_executable(qrp_companion_desktop
     main_desktop.cpp
     pal_desktop.cpp
     ../core/app.cpp
+    ../core/dsp.cpp
+    esp_dsp_compat/dsps_fft2r.cpp
 )
 
 target_include_directories(qrp_companion_desktop PRIVATE
     ../pal
     ../core
+    esp_dsp_compat
 )
 
 target_link_libraries(qrp_companion_desktop Qt5::Widgets)
