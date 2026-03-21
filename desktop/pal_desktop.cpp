@@ -127,6 +127,10 @@ void delayMs(int ms)
 int freeHeapKb() { return 0; }
 int freePsramKb() { return 0; }
 
+static const char empty[] = "";
+const char* debugLine1() { return empty; }
+const char* debugLine2() { return empty; }
+
 } // namespace pal
 
 // Expose widget creation for main

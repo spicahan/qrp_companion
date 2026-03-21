@@ -10,7 +10,7 @@
 static constexpr int HEADER_H = 28;
 static constexpr int SPEC_H   = 180;
 static constexpr int GAP      = 2;
-static constexpr int INFO_H   = 28;
+static constexpr int INFO_H   = 52;
 
 static int log_w, log_h;
 static int wf_y, wf_h;
@@ -33,8 +33,6 @@ static char touch_text[64];
 // DSP
 static constexpr int SAMPLE_RATE = 48000;
 static constexpr int FFT_SIZE    = 1024;
-static constexpr int DSP_HZ      = 8;
-static constexpr int64_t DSP_INTERVAL_US = 1000000 / DSP_HZ;
 static int64_t last_dsp_time;
 
 // Waterfall ring buffer (stores dB values)
@@ -174,12 +172,8 @@ void app::tick()
         fps_last_time = t0;
     }
 
-    // DSP: try external input first (UAC audio), fallback to test tone at 8 Hz
+    // DSP: process external input only (UAC audio)
     bool new_spectrum = dsp::processIfReady();
-    if (!new_spectrum && (t0 - last_dsp_time >= DSP_INTERVAL_US)) {
-        dsp::processTestTone();
-        new_spectrum = true;
-    }
     if (new_spectrum) {
         last_dsp_time = t0;
         const float *mag = dsp::getMagnitudeDb();
@@ -258,6 +252,12 @@ void app::tick()
     snprintf(buf, sizeof(buf), "%dx%d  heap:%dK  psram:%dK",
              log_w, log_h, pal::freeHeapKb(), pal::freePsramKb());
     draw::drawText(fb, log_w, log_h, 8, info_y + 16, buf, COL_WHITE, COL_DGREY);
+
+    // Platform debug lines (UAC info on Tab5)
+    const char *d1 = pal::debugLine1();
+    const char *d2 = pal::debugLine2();
+    if (d1[0]) draw::drawText(fb, log_w, log_h, 8, info_y + 28, d1, COL_YELLOW, COL_DGREY);
+    if (d2[0]) draw::drawText(fb, log_w, log_h, 8, info_y + 40, d2, COL_YELLOW, COL_DGREY);
 
     int64_t t1 = pal::micros();
     pal::commitFrame();

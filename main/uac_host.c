@@ -15,7 +15,9 @@ static const char *TAG = "uac";
 #define USB_HOST_TASK_PRIORITY  5
 #define UAC_TASK_PRIORITY       5
 #define MIC_TASK_PRIORITY       3
-#define MIC_BUFFER_SIZE         4096
+// Buffer must be a multiple of 288 (USB packet size for 48kHz/24-bit/stereo)
+// 4608 = 288 * 16. Non-aligned sizes cause frame boundary splits in the ring buffer.
+#define MIC_BUFFER_SIZE         4608
 #define FLOAT_BUF_SIZE          (MIC_BUFFER_SIZE / 6 + 1)  // max mono samples from stereo 24-bit
 
 // Desired format
@@ -40,6 +42,12 @@ static uint32_t s_mic_freq = TARGET_FREQ;
 static uint8_t  s_mic_bits = TARGET_BITS;
 static uint8_t  s_mic_ch   = TARGET_CH;
 
+// Debug info displayed on screen
+static uac_debug_info_t s_debug_info = { "UAC: waiting...", "" };
+static uint32_t s_debug_counter = 0;
+
+const uac_debug_info_t* uac_get_debug_info(void) { return &s_debug_info; }
+
 // Convert 24-bit stereo raw bytes to mono float [-1,1] and push to DSP
 static void process_audio_buffer(const uint8_t *buf, uint32_t bytes)
 {
@@ -48,6 +56,44 @@ static void process_audio_buffer(const uint8_t *buf, uint32_t bytes)
     uint32_t bytes_per_frame = s_mic_ch * (s_mic_bits / 8);
     if (bytes_per_frame == 0) return;
     uint32_t num_frames = bytes / bytes_per_frame;
+    uint32_t remainder = bytes % bytes_per_frame;
+
+    // Update debug info periodically (every ~250 calls ≈ 1 second)
+    if ((s_debug_counter % 250) == 0) {
+        // Line 1: format + alignment
+        snprintf(s_debug_info.line1, sizeof(s_debug_info.line1),
+                 "UAC: ch=%d b=%d %luHz  bytes=%lu frames=%lu rem=%lu",
+                 s_mic_ch, s_mic_bits, (unsigned long)s_mic_freq,
+                 (unsigned long)bytes, (unsigned long)num_frames,
+                 (unsigned long)remainder);
+
+        // Line 2: first 2 raw frames + first 4 mono floats
+        if (num_frames >= 2 && bytes_per_frame == 6) {
+            int32_t l0 = buf[0] | (buf[1] << 8) | (buf[2] << 16);
+            if (l0 & 0x800000) l0 |= (int32_t)0xFF000000;
+            int32_t l1 = buf[6] | (buf[7] << 8) | (buf[8] << 16);
+            if (l1 & 0x800000) l1 |= (int32_t)0xFF000000;
+
+            // Also compute what mono[0..3] will be
+            float m0 = 0, m1 = 0;
+            for (int ch = 0; ch < s_mic_ch; ch++) {
+                int32_t s0 = buf[ch*3] | (buf[ch*3+1] << 8) | (buf[ch*3+2] << 16);
+                if (s0 & 0x800000) s0 |= (int32_t)0xFF000000;
+                m0 += (float)s0 / 8388608.0f;
+                uint32_t o1 = bytes_per_frame + ch*3;
+                int32_t s1 = buf[o1] | (buf[o1+1] << 8) | (buf[o1+2] << 16);
+                if (s1 & 0x800000) s1 |= (int32_t)0xFF000000;
+                m1 += (float)s1 / 8388608.0f;
+            }
+            m0 /= s_mic_ch; m1 /= s_mic_ch;
+
+            snprintf(s_debug_info.line2, sizeof(s_debug_info.line2),
+                     "L0=%ld L1=%ld  mono=%.4f,%.4f  #%lu",
+                     (long)l0, (long)l1, m0, m1,
+                     (unsigned long)s_debug_counter);
+        }
+    }
+    s_debug_counter++;
 
     for (uint32_t i = 0; i < num_frames; i++) {
         float mono = 0.0f;
@@ -74,17 +120,33 @@ static void process_audio_buffer(const uint8_t *buf, uint32_t bytes)
 
 static void mic_task(void *arg)
 {
-    uint8_t *audio_buf = malloc(MIC_BUFFER_SIZE);
+    // Extra room for leftover bytes from previous read
+    uint8_t *audio_buf = malloc(MIC_BUFFER_SIZE + 8);
     if (!audio_buf) { vTaskDelete(NULL); return; }
+    uint32_t leftover = 0;  // bytes carried over from previous read
 
     while (1) {
         if (s_mic_handle && s_recording) {
             uint32_t bytes_read = 0;
-            esp_err_t ret = uac_host_device_read(s_mic_handle, audio_buf,
+            esp_err_t ret = uac_host_device_read(s_mic_handle, audio_buf + leftover,
                                                   MIC_BUFFER_SIZE, &bytes_read, pdMS_TO_TICKS(200));
+            bytes_read += leftover;
             if (ret == ESP_OK && bytes_read > 0) {
-                process_audio_buffer(audio_buf, bytes_read);
+                // Only process complete frames; save leftover bytes
+                uint32_t bpf = s_mic_ch * (s_mic_bits / 8);
+                uint32_t aligned = (bpf > 0) ? (bytes_read / bpf) * bpf : bytes_read;
+                leftover = bytes_read - aligned;
+
+                if (aligned > 0)
+                    process_audio_buffer(audio_buf, aligned);
+
+                // Move leftover bytes to start of buffer for next read
+                if (leftover > 0)
+                    memmove(audio_buf, audio_buf + aligned, leftover);
+
                 vTaskDelay(1);  // yield for watchdog
+            } else {
+                leftover = 0;
             }
         } else {
             vTaskDelay(pdMS_TO_TICKS(100));
