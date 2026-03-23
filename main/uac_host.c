@@ -42,12 +42,6 @@ static uint32_t s_mic_freq = TARGET_FREQ;
 static uint8_t  s_mic_bits = TARGET_BITS;
 static uint8_t  s_mic_ch   = TARGET_CH;
 
-// Debug info displayed on screen
-static uac_debug_info_t s_debug_info = { "UAC: waiting...", "" };
-static uint32_t s_debug_counter = 0;
-
-const uac_debug_info_t* uac_get_debug_info(void) { return &s_debug_info; }
-
 // Convert 24-bit stereo raw bytes to mono float [-1,1] and push to DSP
 static void process_audio_buffer(const uint8_t *buf, uint32_t bytes)
 {
@@ -56,44 +50,6 @@ static void process_audio_buffer(const uint8_t *buf, uint32_t bytes)
     uint32_t bytes_per_frame = s_mic_ch * (s_mic_bits / 8);
     if (bytes_per_frame == 0) return;
     uint32_t num_frames = bytes / bytes_per_frame;
-    uint32_t remainder = bytes % bytes_per_frame;
-
-    // Update debug info periodically (every ~250 calls ≈ 1 second)
-    if ((s_debug_counter % 250) == 0) {
-        // Line 1: format + alignment
-        snprintf(s_debug_info.line1, sizeof(s_debug_info.line1),
-                 "UAC: ch=%d b=%d %luHz  bytes=%lu frames=%lu rem=%lu",
-                 s_mic_ch, s_mic_bits, (unsigned long)s_mic_freq,
-                 (unsigned long)bytes, (unsigned long)num_frames,
-                 (unsigned long)remainder);
-
-        // Line 2: first 2 raw frames + first 4 mono floats
-        if (num_frames >= 2 && bytes_per_frame == 6) {
-            int32_t l0 = buf[0] | (buf[1] << 8) | (buf[2] << 16);
-            if (l0 & 0x800000) l0 |= (int32_t)0xFF000000;
-            int32_t l1 = buf[6] | (buf[7] << 8) | (buf[8] << 16);
-            if (l1 & 0x800000) l1 |= (int32_t)0xFF000000;
-
-            // Also compute what mono[0..3] will be
-            float m0 = 0, m1 = 0;
-            for (int ch = 0; ch < s_mic_ch; ch++) {
-                int32_t s0 = buf[ch*3] | (buf[ch*3+1] << 8) | (buf[ch*3+2] << 16);
-                if (s0 & 0x800000) s0 |= (int32_t)0xFF000000;
-                m0 += (float)s0 / 8388608.0f;
-                uint32_t o1 = bytes_per_frame + ch*3;
-                int32_t s1 = buf[o1] | (buf[o1+1] << 8) | (buf[o1+2] << 16);
-                if (s1 & 0x800000) s1 |= (int32_t)0xFF000000;
-                m1 += (float)s1 / 8388608.0f;
-            }
-            m0 /= s_mic_ch; m1 /= s_mic_ch;
-
-            snprintf(s_debug_info.line2, sizeof(s_debug_info.line2),
-                     "L0=%ld L1=%ld  mono=%.4f,%.4f  #%lu",
-                     (long)l0, (long)l1, m0, m1,
-                     (unsigned long)s_debug_counter);
-        }
-    }
-    s_debug_counter++;
 
     for (uint32_t i = 0; i < num_frames; i++) {
         float mono = 0.0f;

@@ -10,7 +10,7 @@
 static constexpr int HEADER_H = 28;
 static constexpr int SPEC_H   = 180;
 static constexpr int GAP      = 2;
-static constexpr int INFO_H   = 52;
+static constexpr int INFO_H   = 28;
 
 static int log_w, log_h;
 static int wf_y, wf_h;
@@ -252,12 +252,6 @@ void app::tick()
     snprintf(buf, sizeof(buf), "%dx%d  heap:%dK  psram:%dK",
              log_w, log_h, pal::freeHeapKb(), pal::freePsramKb());
     draw::drawText(fb, log_w, log_h, 8, info_y + 16, buf, COL_WHITE, COL_DGREY);
-
-    // Platform debug lines (UAC info on Tab5)
-    const char *d1 = pal::debugLine1();
-    const char *d2 = pal::debugLine2();
-    if (d1[0]) draw::drawText(fb, log_w, log_h, 8, info_y + 28, d1, COL_YELLOW, COL_DGREY);
-    if (d2[0]) draw::drawText(fb, log_w, log_h, 8, info_y + 40, d2, COL_YELLOW, COL_DGREY);
 
     int64_t t1 = pal::micros();
     pal::commitFrame();

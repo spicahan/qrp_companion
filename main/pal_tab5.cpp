@@ -149,16 +149,6 @@ int freePsramKb()
     return (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
 }
 
-const char* debugLine1()
-{
-    return uac_get_debug_info()->line1;
-}
-
-const char* debugLine2()
-{
-    return uac_get_debug_info()->line2;
-}
-
 } // namespace pal
 
 // C bridge: called from uac_host.c to push audio into the C++ DSP pipeline

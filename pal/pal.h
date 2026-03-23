@@ -33,8 +33,4 @@ void    delayMs(int ms);
 int freeHeapKb();
 int freePsramKb();  // 0 on desktop
 
-// Optional platform debug info (2 lines). Returns empty strings if none.
-const char* debugLine1();
-const char* debugLine2();
-
 } // namespace pal
