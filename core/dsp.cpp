@@ -1,9 +1,7 @@
 #include "dsp.h"
-#include "dsps_fft2r.h"
+#include "fft.h"  // portable Cooley-Tukey FFT (esp-dsp has issues on P4)
 #include <cmath>
 #include <cstring>
-#include <cstdio>
-
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -20,9 +18,6 @@ static float *g_input_buf[2];
 static volatile int g_write_buf;    // buffer index being written to (0 or 1)
 static int          g_write_pos;    // write position in current buffer
 static volatile int g_ready_buf;    // buffer index with complete data (-1 = none)
-
-// Debug: count processIfReady calls for periodic logging
-static uint32_t g_process_count = 0;
 
 static void compute_fft()
 {
@@ -90,27 +85,6 @@ bool dsp::processIfReady()
     for (int i = 0; i < g_fft_size; i++) {
         g_fft_data[2 * i]     = src[i];
         g_fft_data[2 * i + 1] = 0.0f;
-    }
-
-    // Debug: dump first 16 samples every ~2 seconds (every 10th FFT frame)
-    g_process_count++;
-    if ((g_process_count % 10) == 1) {
-        printf("FFT input[0..15] buf%d: ", rb);
-        for (int i = 0; i < 16 && i < g_fft_size; i++)
-            printf("%.4f ", g_fft_data[2 * i]);
-        printf("\n");
-
-        // Check for zeros or anomalies in the buffer
-        int zero_count = 0, nan_count = 0;
-        float min_val = 1e30f, max_val = -1e30f;
-        for (int i = 0; i < g_fft_size; i++) {
-            float v = g_fft_data[2 * i];
-            if (v == 0.0f) zero_count++;
-            if (v != v) nan_count++;  // NaN check
-            if (v < min_val) min_val = v;
-            if (v > max_val) max_val = v;
-        }
-        printf("  zeros=%d nans=%d min=%.4f max=%.4f\n", zero_count, nan_count, min_val, max_val);
     }
 
     compute_fft();
