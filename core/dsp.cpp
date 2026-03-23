@@ -1,5 +1,5 @@
 #include "dsp.h"
-#include "fft.h"  // portable Cooley-Tukey FFT (esp-dsp has issues on P4)
+#include "dsps_fft2r.h"
 #include <cmath>
 #include <cstring>
 #ifndef M_PI

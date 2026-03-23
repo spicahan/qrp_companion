@@ -1,4 +1,5 @@
 dependencies:
+  espressif/esp-dsp: "*"
   usb_host_uac:
     version: "1.2.*"
   espressif/usb: "*"

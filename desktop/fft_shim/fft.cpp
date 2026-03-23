@@ -1,6 +1,6 @@
 // Portable Cooley-Tukey radix-2 DIF FFT
 // Replaces esp-dsp's dsps_fft2r_fc32 which has precision issues on ESP32-P4
-#include "fft.h"
+#include "dsps_fft2r.h"
 #include <cmath>
 
 #ifndef M_PI
