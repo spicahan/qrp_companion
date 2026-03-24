@@ -133,7 +133,7 @@ int freePsramKb() { return 0; }
 static PaStream *s_pa_stream = nullptr;
 static AudioInputCallback s_audio_cb = nullptr;
 
-// PortAudio callback: receives interleaved 24-bit stereo, converts to mono float
+// PortAudio callback: receives interleaved stereo float, passes through as I/Q
 static int pa_input_callback(const void *input, void * /*output*/,
                              unsigned long frameCount,
                              const PaStreamCallbackTimeInfo * /*timeInfo*/,
@@ -141,20 +141,8 @@ static int pa_input_callback(const void *input, void * /*output*/,
                              void * /*userData*/)
 {
     if (!s_audio_cb || !input) return paContinue;
-
-    // Input is interleaved int24 packed as int32 (paInt24 uses 3 bytes in a 4-byte container?
-    // Actually paInt24 is 3-byte packed. But PortAudio with paInt32 is easier.
-    // We request paFloat32 stereo — PortAudio handles the conversion from device format.
-    const float *in = (const float *)input;
-
-    // Convert interleaved stereo float to mono float
-    // Temp buffer on stack (frameCount is typically 64-1024)
-    float mono[4096];
-    unsigned long n = (frameCount > 4096) ? 4096 : frameCount;
-    for (unsigned long i = 0; i < n; i++)
-        mono[i] = (in[i * 2] + in[i * 2 + 1]) * 0.5f;
-
-    s_audio_cb(mono, (int)n);
+    // Input is interleaved stereo float [L0,R0,L1,R1,...] = [I0,Q0,I1,Q1,...]
+    s_audio_cb((const float *)input, (int)frameCount);
     return paContinue;
 }
 

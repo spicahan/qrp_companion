@@ -130,10 +130,10 @@ static void draw_waterfall(uint16_t *fb)
     }
 }
 
-// Audio input callback — called from audio thread, pushes to DSP
-static void audio_input_cb(const float *mono_samples, int count)
+// Audio input callback — called from audio thread, pushes I/Q to DSP
+static void audio_input_cb(const float *iq_samples, int num_frames)
 {
-    dsp::pushSamples(mono_samples, count);
+    dsp::pushIQ(iq_samples, num_frames);
 }
 
 void app::init()
@@ -215,11 +215,19 @@ void app::tick()
     // Spectrum (from live DSP data)
     draw_spectrum(fb, dsp::getMagnitudeDb());
 
+    // DC marker (thin vertical line at center = bin N/2)
+    int dc_x = log_w / 2;
+    uint16_t COL_DC = draw::rgb565(255, 255, 255);
+    draw::drawVLine(fb, log_w, dc_x, HEADER_H + GAP, SPEC_H, COL_DC);
+
     // Gap
     draw::fillRect(fb, log_w, 0, HEADER_H + GAP + SPEC_H, log_w, GAP, COL_BLACK);
 
     // Waterfall
     draw_waterfall(fb);
+
+    // DC marker on waterfall too
+    draw::drawVLine(fb, log_w, dc_x, wf_y, wf_h, COL_DC);
 
     // Header text
     draw::drawText(fb, log_w, log_h, 8, 6, "QRP Companion", COL_WHITE, COL_NAVY, 2);
@@ -232,7 +240,7 @@ void app::tick()
 
     // Labels
     draw::drawText(fb, log_w, log_h, 8, HEADER_H + GAP + 4, "SPECTRUM", COL_CYAN, COL_BLACK);
-    snprintf(buf, sizeof(buf), "48kHz/%d-pt FFT",
+    snprintf(buf, sizeof(buf), "I/Q 48kHz/%d-pt CFFT  LO-12k..LO+36k",
              FFT_SIZE);
     tw = draw::textWidth(buf);
     draw::drawText(fb, log_w, log_h, log_w - tw - 8, HEADER_H + GAP + 4, buf, COL_DGREY, COL_BLACK);

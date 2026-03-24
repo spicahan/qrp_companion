@@ -4,18 +4,17 @@ namespace dsp {
 
 void init(int sample_rate, int fft_size);
 
-// Push mono float samples from an external source (e.g. UAC audio)
-// Thread-safe: can be called from a different task/thread than processIfReady()
-void pushSamples(const float *samples, int count);
+// Push I/Q sample pairs. iq is interleaved [I0,Q0,I1,Q1,...], num_frames pairs.
+// Thread-safe: can be called from a different task/thread than processIfReady().
+void pushIQ(const float *iq, int num_frames);
 
-// Process FFT from externally pushed samples. Returns true if new spectrum available.
+// Process FFT from buffered I/Q data. Returns true if new spectrum available.
+// Applies fs/4 complex down-conversion then complex FFT.
 bool processIfReady();
 
-// Fallback: generate test tone internally and process FFT.
-void processTestTone();
-
-int          getNumBins();           // fft_size / 2 + 1
-const float* getMagnitudeDb();       // dB values, getNumBins() elements
-float        getBinFrequency(int bin);
+int          getNumBins();           // fft_size (full complex spectrum)
+const float* getMagnitudeDb();       // dB values after fftshift, getNumBins() elements
+                                     // index 0 = -fs/2, index N/2 = DC, index N-1 = +fs/2
+float        getBinFrequency(int bin); // frequency relative to LO (after shift)
 
 } // namespace dsp

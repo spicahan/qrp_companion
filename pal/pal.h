@@ -33,9 +33,10 @@ void    delayMs(int ms);
 int freeHeapKb();
 int freePsramKb();  // 0 on desktop
 
-// Audio input (stereo 24-bit 48kHz, delivered as mono float)
-// Callback is called from the audio thread with mono [-1,1] samples.
-using AudioInputCallback = void(*)(const float *mono_samples, int count);
+// Audio input (stereo 24-bit 48kHz, delivered as I/Q float pairs)
+// Callback is called from the audio thread.
+// iq_samples: interleaved [I0, Q0, I1, Q1, ...], num_frames pairs.
+using AudioInputCallback = void(*)(const float *iq_samples, int num_frames);
 bool audioInputOpen(AudioInputCallback cb);
 void audioInputClose();
 

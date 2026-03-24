@@ -18,7 +18,7 @@ static const char *TAG = "uac";
 // Buffer must be a multiple of 288 (USB packet size for 48kHz/24-bit/stereo)
 // 4608 = 288 * 16. Non-aligned sizes cause frame boundary splits in the ring buffer.
 #define MIC_BUFFER_SIZE         4608
-#define FLOAT_BUF_SIZE          (MIC_BUFFER_SIZE / 6 + 1)  // max mono samples from stereo 24-bit
+#define FLOAT_BUF_SIZE          (MIC_BUFFER_SIZE / 3 + 2)  // max I/Q float pairs from stereo 24-bit
 
 // Desired format
 #define TARGET_FREQ   48000
@@ -42,7 +42,7 @@ static uint32_t s_mic_freq = TARGET_FREQ;
 static uint8_t  s_mic_bits = TARGET_BITS;
 static uint8_t  s_mic_ch   = TARGET_CH;
 
-// Convert 24-bit stereo raw bytes to mono float [-1,1] and push to DSP
+// Convert 24-bit stereo raw bytes to interleaved I/Q float pairs and push to DSP
 static void process_audio_buffer(const uint8_t *buf, uint32_t bytes)
 {
     static float float_buf[FLOAT_BUF_SIZE];
@@ -51,24 +51,23 @@ static void process_audio_buffer(const uint8_t *buf, uint32_t bytes)
     if (bytes_per_frame == 0) return;
     uint32_t num_frames = bytes / bytes_per_frame;
 
-    for (uint32_t i = 0; i < num_frames; i++) {
-        float mono = 0.0f;
-
-        if (s_mic_bits == 24) {
-            for (int ch = 0; ch < s_mic_ch; ch++) {
-                uint32_t off = i * bytes_per_frame + ch * 3;
-                int32_t s = buf[off] | (buf[off+1] << 8) | (buf[off+2] << 16);
-                if (s & 0x800000) s |= (int32_t)0xFF000000;
-                mono += (float)s / 8388608.0f;
-            }
-        } else if (s_mic_bits == 16) {
-            const int16_t *buf16 = (const int16_t *)buf;
-            for (int ch = 0; ch < s_mic_ch; ch++) {
-                mono += (float)buf16[i * s_mic_ch + ch] / 32768.0f;
-            }
+    if (s_mic_bits == 24 && s_mic_ch == 2) {
+        for (uint32_t i = 0; i < num_frames; i++) {
+            uint32_t off = i * 6;
+            // Left = I, Right = Q
+            int32_t iv = buf[off]   | (buf[off+1] << 8) | (buf[off+2] << 16);
+            if (iv & 0x800000) iv |= (int32_t)0xFF000000;
+            int32_t qv = buf[off+3] | (buf[off+4] << 8) | (buf[off+5] << 16);
+            if (qv & 0x800000) qv |= (int32_t)0xFF000000;
+            float_buf[2 * i]     = (float)iv / 8388608.0f;
+            float_buf[2 * i + 1] = (float)qv / 8388608.0f;
         }
-
-        float_buf[i] = mono / s_mic_ch;
+    } else if (s_mic_bits == 16 && s_mic_ch == 2) {
+        const int16_t *buf16 = (const int16_t *)buf;
+        for (uint32_t i = 0; i < num_frames; i++) {
+            float_buf[2 * i]     = (float)buf16[2 * i]     / 32768.0f;
+            float_buf[2 * i + 1] = (float)buf16[2 * i + 1] / 32768.0f;
+        }
     }
 
     uac_push_audio_samples(float_buf, num_frames);
