@@ -130,6 +130,12 @@ static void draw_waterfall(uint16_t *fb)
     }
 }
 
+// Audio input callback — called from audio thread, pushes to DSP
+static void audio_input_cb(const float *mono_samples, int count)
+{
+    dsp::pushSamples(mono_samples, count);
+}
+
 void app::init()
 {
     auto info = pal::getDisplayInfo();
@@ -153,6 +159,9 @@ void app::init()
     num_bins = dsp::getNumBins();
     wf_db = new float[WF_MAX_LINES * num_bins]();
     last_dsp_time = pal::micros();
+
+    // Open audio input (UAC on Tab5, PortAudio on desktop)
+    pal::audioInputOpen(audio_input_cb);
 
     fps = 0;
     frame_count = 0;

@@ -1,5 +1,6 @@
 #include "pal.h"
 
+#include <portaudio.h>
 #include <QWidget>
 #include <QImage>
 #include <QPainter>
@@ -9,6 +10,7 @@
 #include <queue>
 #include <mutex>
 #include <cstring>
+#include <cstdio>
 
 static int fb_w = 0, fb_h = 0;
 static uint16_t *fb_buffer = nullptr;
@@ -126,6 +128,98 @@ void delayMs(int ms)
 
 int freeHeapKb() { return 0; }
 int freePsramKb() { return 0; }
+
+// --- Audio input via PortAudio ---
+static PaStream *s_pa_stream = nullptr;
+static AudioInputCallback s_audio_cb = nullptr;
+
+// PortAudio callback: receives interleaved 24-bit stereo, converts to mono float
+static int pa_input_callback(const void *input, void * /*output*/,
+                             unsigned long frameCount,
+                             const PaStreamCallbackTimeInfo * /*timeInfo*/,
+                             PaStreamCallbackFlags /*statusFlags*/,
+                             void * /*userData*/)
+{
+    if (!s_audio_cb || !input) return paContinue;
+
+    // Input is interleaved int24 packed as int32 (paInt24 uses 3 bytes in a 4-byte container?
+    // Actually paInt24 is 3-byte packed. But PortAudio with paInt32 is easier.
+    // We request paFloat32 stereo — PortAudio handles the conversion from device format.
+    const float *in = (const float *)input;
+
+    // Convert interleaved stereo float to mono float
+    // Temp buffer on stack (frameCount is typically 64-1024)
+    float mono[4096];
+    unsigned long n = (frameCount > 4096) ? 4096 : frameCount;
+    for (unsigned long i = 0; i < n; i++)
+        mono[i] = (in[i * 2] + in[i * 2 + 1]) * 0.5f;
+
+    s_audio_cb(mono, (int)n);
+    return paContinue;
+}
+
+bool audioInputOpen(AudioInputCallback cb)
+{
+    PaError err = Pa_Initialize();
+    if (err != paNoError) {
+        fprintf(stderr, "PortAudio init failed: %s\n", Pa_GetErrorText(err));
+        return false;
+    }
+
+    // Find default input device
+    PaDeviceIndex dev = Pa_GetDefaultInputDevice();
+    if (dev == paNoDevice) {
+        fprintf(stderr, "No audio input device found\n");
+        Pa_Terminate();
+        return false;
+    }
+
+    const PaDeviceInfo *info = Pa_GetDeviceInfo(dev);
+    fprintf(stderr, "Audio input: %s (%.0f Hz max, %d ch)\n",
+            info->name, info->defaultSampleRate, info->maxInputChannels);
+
+    PaStreamParameters params = {};
+    params.device = dev;
+    params.channelCount = 2;       // stereo
+    params.sampleFormat = paFloat32; // let PortAudio convert from device native format
+    params.suggestedLatency = info->defaultLowInputLatency;
+
+    s_audio_cb = cb;
+
+    err = Pa_OpenStream(&s_pa_stream, &params, nullptr,
+                        48000.0, 1024, paClipOff,
+                        pa_input_callback, nullptr);
+    if (err != paNoError) {
+        fprintf(stderr, "Pa_OpenStream failed: %s\n", Pa_GetErrorText(err));
+        s_audio_cb = nullptr;
+        Pa_Terminate();
+        return false;
+    }
+
+    err = Pa_StartStream(s_pa_stream);
+    if (err != paNoError) {
+        fprintf(stderr, "Pa_StartStream failed: %s\n", Pa_GetErrorText(err));
+        Pa_CloseStream(s_pa_stream);
+        s_pa_stream = nullptr;
+        s_audio_cb = nullptr;
+        Pa_Terminate();
+        return false;
+    }
+
+    fprintf(stderr, "Audio input started: 48kHz stereo float32\n");
+    return true;
+}
+
+void audioInputClose()
+{
+    if (s_pa_stream) {
+        Pa_StopStream(s_pa_stream);
+        Pa_CloseStream(s_pa_stream);
+        s_pa_stream = nullptr;
+    }
+    s_audio_cb = nullptr;
+    Pa_Terminate();
+}
 
 } // namespace pal
 

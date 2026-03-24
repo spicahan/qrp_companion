@@ -1,5 +1,4 @@
 #include "pal.h"
-#include "dsp.h"
 #include "uac_host.h"
 
 #include <M5Unified.h>
@@ -149,10 +148,26 @@ int freePsramKb()
     return (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
 }
 
+// Audio input via UAC host
+static pal::AudioInputCallback s_audio_cb = nullptr;
+
+bool audioInputOpen(AudioInputCallback cb)
+{
+    s_audio_cb = cb;
+    uac_host_start();
+    return true;
+}
+
+void audioInputClose()
+{
+    s_audio_cb = nullptr;
+}
+
 } // namespace pal
 
-// C bridge: called from uac_host.c to push audio into the C++ DSP pipeline
+// C bridge: called from uac_host.c when audio data arrives
 extern "C" void uac_push_audio_samples(const float *samples, int count)
 {
-    dsp::pushSamples(samples, count);
+    if (pal::s_audio_cb)
+        pal::s_audio_cb(samples, count);
 }
