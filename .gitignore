@@ -6,3 +6,5 @@ managed_components/
 dependencies.lock
 .cache/
 components/
+.DS_Store
+*/.DS_Store
