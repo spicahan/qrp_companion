@@ -20,7 +20,7 @@ static volatile int g_write_buf;
 static int          g_write_pos;    // in frames (not floats)
 static volatile int g_ready_buf;
 
-// fs/4 down-conversion state (persists across buffers)
+// fs/4 down-conversion mixer phase (persists across buffers)
 static int g_mix_phase;
 
 static void compute_spectrum()
@@ -76,10 +76,7 @@ void dsp::pushIQ(const float *iq, int num_frames)
         float Q = iq[2 * i + 1];
 
         // fs/4 complex down-conversion: multiply by exp(-j*pi*n/2)
-        // Phase 0: (I, Q) * 1     = ( I,  Q)
-        // Phase 1: (I, Q) * (-j)  = ( Q, -I)
-        // Phase 2: (I, Q) * (-1)  = (-I, -Q)
-        // Phase 3: (I, Q) * (j)   = (-Q,  I)
+        // Shifts +12kHz (VFO) to DC for downstream DSP processing
         float oI, oQ;
         switch (g_mix_phase) {
             case 0: oI =  I; oQ =  Q; break;
@@ -121,9 +118,8 @@ bool dsp::processIfReady()
 int dsp::getNumBins()              { return g_num_bins; }
 const float* dsp::getMagnitudeDb() { return g_magnitude_db; }
 
-float dsp::getBinFrequency(int bin)
+int dsp::displayBin(int display_idx)
 {
-    // After fftshift: bin 0 = -fs/2, bin N/2 = DC (0 Hz), bin N-1 ≈ +fs/2
-    int half = g_fft_size / 2;
-    return (float)(bin - half) * g_sample_rate / g_fft_size;
+    // Virtual rotation: shift by 3N/4 to re-center from VFO to LO
+    return (display_idx + 3 * g_fft_size / 4) % g_fft_size;
 }

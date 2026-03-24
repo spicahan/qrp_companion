@@ -82,14 +82,15 @@ static void draw_spectrum(uint16_t *fb, const float *mag_db)
     // Clear spectrum area
     draw::fillRect(fb, log_w, 0, spec_y, log_w, SPEC_H, COL_BLACK);
 
-    // Draw spectrum bars
-    for (int bin = 0; bin < num_bins; bin++) {
-        int x0 = bin_to_x(bin);
-        int x1 = bin_to_x(bin + 1);
+    // Draw spectrum bars (virtual rotation: display centered at LO, not VFO)
+    for (int di = 0; di < num_bins; di++) {
+        int x0 = bin_to_x(di);
+        int x1 = bin_to_x(di + 1);
         if (x1 <= x0) x1 = x0 + 1;
         if (x0 >= log_w) break;
 
-        float norm = (mag_db[bin] - DB_MIN) / (DB_MAX - DB_MIN);
+        int fft_bin = dsp::displayBin(di);
+        float norm = (mag_db[fft_bin] - DB_MIN) / (DB_MAX - DB_MIN);
         if (norm < 0.0f) norm = 0.0f;
         if (norm > 1.0f) norm = 1.0f;
 
@@ -117,13 +118,14 @@ static void draw_waterfall(uint16_t *fb)
         const float *line = &wf_db[buf_idx * num_bins];
         int fy = wf_y + row;
 
-        for (int bin = 0; bin < num_bins; bin++) {
-            int x0 = bin_to_x(bin);
-            int x1 = bin_to_x(bin + 1);
+        for (int di = 0; di < num_bins; di++) {
+            int x0 = bin_to_x(di);
+            int x1 = bin_to_x(di + 1);
             if (x1 <= x0) x1 = x0 + 1;
             if (x0 >= log_w) break;
 
-            uint16_t color = waterfall_color_from_db(line[bin]);
+            int fft_bin = dsp::displayBin(di);
+            uint16_t color = waterfall_color_from_db(line[fft_bin]);
             for (int x = x0; x < x1 && x < log_w; x++)
                 fb[fy * log_w + x] = color;
         }
@@ -215,10 +217,10 @@ void app::tick()
     // Spectrum (from live DSP data)
     draw_spectrum(fb, dsp::getMagnitudeDb());
 
-    // DC marker (thin vertical line at center = bin N/2)
-    int dc_x = log_w / 2;
-    uint16_t COL_DC = draw::rgb565(255, 255, 255);
-    draw::drawVLine(fb, log_w, dc_x, HEADER_H + GAP, SPEC_H, COL_DC);
+    // VFO marker at +12kHz (LO offset) = 3/4 of display
+    int vfo_x = log_w * 3 / 4;
+    uint16_t COL_MARKER = draw::rgb565(255, 255, 255);
+    draw::drawVLine(fb, log_w, vfo_x, HEADER_H + GAP, SPEC_H, COL_MARKER);
 
     // Gap
     draw::fillRect(fb, log_w, 0, HEADER_H + GAP + SPEC_H, log_w, GAP, COL_BLACK);
@@ -226,8 +228,8 @@ void app::tick()
     // Waterfall
     draw_waterfall(fb);
 
-    // DC marker on waterfall too
-    draw::drawVLine(fb, log_w, dc_x, wf_y, wf_h, COL_DC);
+    // VFO marker on waterfall too
+    draw::drawVLine(fb, log_w, vfo_x, wf_y, wf_h, COL_MARKER);
 
     // Header text
     draw::drawText(fb, log_w, log_h, 8, 6, "QRP Companion", COL_WHITE, COL_NAVY, 2);
@@ -240,7 +242,7 @@ void app::tick()
 
     // Labels
     draw::drawText(fb, log_w, log_h, 8, HEADER_H + GAP + 4, "SPECTRUM", COL_CYAN, COL_BLACK);
-    snprintf(buf, sizeof(buf), "I/Q 48kHz/%d-pt CFFT  LO-12k..LO+36k",
+    snprintf(buf, sizeof(buf), "I/Q 48kHz/%d-pt CFFT  LO-24k..LO+24k",
              FFT_SIZE);
     tw = draw::textWidth(buf);
     draw::drawText(fb, log_w, log_h, log_w - tw - 8, HEADER_H + GAP + 4, buf, COL_DGREY, COL_BLACK);
