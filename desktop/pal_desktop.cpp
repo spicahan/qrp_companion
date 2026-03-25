@@ -85,10 +85,10 @@ static auto clock_base = std::chrono::steady_clock::now();
 namespace pal {
 
 // --- Desktop CAT forward declarations (defined below getVfoFreq) ---
-static int s_cat_fd;
-static std::atomic<uint64_t> s_vfo_freq;
+static int s_cat_fd = -1;
+static std::atomic<uint64_t> s_vfo_freq{0};
 static std::thread s_cat_thread;
-static std::atomic<bool> s_cat_running;
+static std::atomic<bool> s_cat_running{false};
 static void cat_thread_func();
 
 bool init(int width, int height)
