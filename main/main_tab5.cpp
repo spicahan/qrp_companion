@@ -7,7 +7,7 @@ extern "C" void app_main(void)
 {
     xTaskCreatePinnedToCore(
         [](void *) {
-            pal::init(1280, 720);
+            pal::init(720, 1280);  // portrait mode
             app::init();
             for (;;) { app::tick(); vTaskDelay(1); }
         },

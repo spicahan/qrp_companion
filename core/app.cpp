@@ -6,9 +6,9 @@
 #include <cstring>
 #include <cmath>
 
-// Layout constants (logical landscape)
+// Layout constants (portrait: 720 wide, 1280 tall)
 static constexpr int HEADER_H = 28;
-static constexpr int SPEC_H   = 180;
+static constexpr int SPEC_H   = 200;
 static constexpr int GAP      = 2;
 static constexpr int INFO_H   = 28;
 
@@ -38,17 +38,23 @@ static constexpr int SAMPLE_RATE = 48000;
 static constexpr int FFT_SIZE    = 1024;
 static int64_t last_dsp_time;
 
-// Waterfall ring buffer
-static constexpr int WF_MAX_LINES = 512;
-static float *wf_db = nullptr;     // WF_MAX_LINES * num_bins (dB values)
-static uint16_t *wf_pixels_t = nullptr; // transposed pixel cache: [log_w][WF_MAX_LINES]
-static int wf_head = 0;
-static int wf_count = 0;
+// Waterfall
 static int num_bins;
+static int wf_count = 0;
 
-// Spectrum dB range for display mapping
+// Spectrum dB range
 static constexpr float DB_MIN = -100.0f;
 static constexpr float DB_MAX = 0.0f;
+
+static int g_vfo_x;
+static uint16_t COL_MARKER;
+
+// Pre-computed pixel → FFT bin map
+static int *g_pixel_to_fftbin = nullptr;
+
+// Ring buffer state (portrait mode)
+static bool use_ring_buffer = false;
+static int ring_offset;  // current visible_offset value
 
 static uint16_t spectrum_color(float norm)
 {
@@ -73,20 +79,26 @@ static uint16_t waterfall_color_from_db(float db)
     return draw::rgb565(r, g, b);
 }
 
-// Map FFT bin index to display x coordinate
-static int bin_to_x(int bin)
-{
-    return bin * log_w / num_bins;
-}
+static int bin_to_x(int bin) { return bin * log_w / num_bins; }
 
-static int g_vfo_x;  // VFO marker x position
-static uint16_t COL_MARKER;
+static void precompute_pixel_bin_map()
+{
+    g_pixel_to_fftbin = new int[log_w];
+    for (int x = 0; x < log_w; x++) {
+        int di = x * num_bins / log_w;
+        if (di >= num_bins) di = num_bins - 1;
+        g_pixel_to_fftbin[x] = dsp::displayBin(di);
+    }
+}
 
 static void draw_spectrum(const float *mag_db)
 {
     int spec_y = HEADER_H + GAP;
 
-    // Draw each column: black above bar, colored bar, VFO marker integrated
+    // Clear spectrum area
+    draw::fillRect(fb, 0, spec_y, log_w, SPEC_H, COL_BLACK);
+
+    // Draw spectrum bars
     for (int di = 0; di < num_bins; di++) {
         int x0 = bin_to_x(di);
         int x1 = bin_to_x(di + 1);
@@ -101,78 +113,29 @@ static void draw_spectrum(const float *mag_db)
         int bar_h = (int)(norm * SPEC_H);
         if (bar_h < 1) bar_h = 1;
 
+        uint16_t color = spectrum_color(norm);
         int bar_w = x1 - x0;
         if (x0 + bar_w > log_w) bar_w = log_w - x0;
-
-        // Black above the bar
-        if (SPEC_H - bar_h > 0)
-            draw::fillRect(fb, x0, spec_y, bar_w, SPEC_H - bar_h, COL_BLACK);
-        // Colored bar
-        uint16_t color = spectrum_color(norm);
         draw::fillRect(fb, x0, spec_y + SPEC_H - bar_h, bar_w, bar_h, color);
     }
 
-    // VFO marker (single column overwrite — fast, minimal flicker)
+    // VFO marker
     draw::drawVLine(fb, g_vfo_x, spec_y, SPEC_H, COL_MARKER);
 }
 
-// Pre-computed bin index for each logical x pixel (avoids repeated bin_to_x + displayBin)
-static int *g_pixel_to_fftbin = nullptr;
-
-static void precompute_pixel_bin_map()
+// Write one new waterfall row directly into the framebuffer
+static void write_waterfall_line(const float *mag_db)
 {
-    g_pixel_to_fftbin = new int[log_w];
+    uint16_t *row = &fb.buf[wf_y * fb.phys_w];
     for (int x = 0; x < log_w; x++) {
-        // Which display bin does this pixel belong to?
-        int di = x * num_bins / log_w;
-        if (di >= num_bins) di = num_bins - 1;
-        g_pixel_to_fftbin[x] = dsp::displayBin(di);
+        int fft_bin = g_pixel_to_fftbin[x];
+        row[x] = waterfall_color_from_db(mag_db[fft_bin]);
     }
+    // VFO marker
+    row[g_vfo_x] = COL_MARKER;
 }
 
-static void draw_waterfall()
-{
-    if (wf_count == 0) return;
-
-    int n = wf_count;
-    if (n > wf_h) n = wf_h;
-
-    if (fb.rotated) {
-        // Each physical row = one frequency bin.
-        // Ring buffer: forward read from wf_head gives newest-first order.
-        // memcpy 1-2 segments per physical row (handles ring wrap).
-        for (int py = 0; py < fb.log_w; py++) {
-            int lx = fb.log_w - 1 - py;
-            const uint16_t *src = &wf_pixels_t[lx * WF_MAX_LINES];
-            uint16_t *dst = &fb.buf[py * fb.phys_w + wf_y];
-
-            int start = wf_head;
-            if (start + n <= WF_MAX_LINES) {
-                memcpy(dst, &src[start], n * sizeof(uint16_t));
-            } else {
-                int first = WF_MAX_LINES - start;
-                memcpy(dst, &src[start], first * sizeof(uint16_t));
-                memcpy(dst + first, &src[0], (n - first) * sizeof(uint16_t));
-            }
-
-            if (n < wf_h)
-                memset(dst + n, 0, (wf_h - n) * sizeof(uint16_t));
-        }
-    } else {
-        // Non-rotated (desktop): each logical row = one time step
-        for (int row = 0; row < n; row++) {
-            int fy = wf_y + row;
-            int time_idx = (wf_head + row) % WF_MAX_LINES;
-            uint16_t *dst = &fb.buf[fy * fb.phys_w];
-            for (int x = 0; x < log_w; x++)
-                dst[x] = wf_pixels_t[x * WF_MAX_LINES + time_idx];
-        }
-        if (n < wf_h)
-            draw::fillRect(fb, 0, wf_y + n, log_w, wf_h - n, COL_BLACK);
-    }
-}
-
-// Audio input callback — called from audio thread, pushes I/Q to DSP
+// Audio input callback
 static void audio_input_cb(const float *iq_samples, int num_frames)
 {
     dsp::pushIQ(iq_samples, num_frames);
@@ -181,16 +144,21 @@ static void audio_input_cb(const float *iq_samples, int num_frames)
 void app::init()
 {
     auto info = pal::getDisplayInfo();
-    log_w = info.width;
-    log_h = info.height;
+    log_w = info.width;   // 720 in portrait
+    log_h = info.height;  // 1280 in portrait
 
     wf_y = HEADER_H + GAP + SPEC_H + GAP;
     wf_h = log_h - wf_y - INFO_H;
 
-    // Set up framebuffer context
+    // Detect ring buffer mode
+    int ext_h = pal::getExtendedHeight();
+    use_ring_buffer = (ext_h > log_h);
+    ring_offset = ext_h - log_h;  // initial offset = WF_EXTRA
+
+    // Set up framebuf context — fb.buf will be updated each frame for ring buffer
     fb.buf    = pal::getFramebuffer();
     fb.phys_w = pal::getFramebufferStride();
-    fb.phys_h = pal::isRotated() ? log_w : log_h;  // physical height
+    fb.phys_h = log_h;
     fb.log_w  = log_w;
     fb.log_h  = log_h;
     fb.rotated = pal::isRotated();
@@ -204,19 +172,30 @@ void app::init()
     COL_YELLOW = draw::rgb565(255, 255, 0);
     COL_RED    = draw::rgb565(255, 0, 0);
 
-    // DSP init
     dsp::init(SAMPLE_RATE, FFT_SIZE);
     num_bins = dsp::getNumBins();
-    wf_db = new float[WF_MAX_LINES * num_bins]();
-    wf_pixels_t = new uint16_t[log_w * WF_MAX_LINES]();  // transposed pixel cache
     last_dsp_time = pal::micros();
 
     g_vfo_x = log_w * 3 / 4;
     COL_MARKER = draw::rgb565(255, 255, 255);
     precompute_pixel_bin_map();
 
-    // Open audio input (UAC on Tab5, PortAudio on desktop)
     pal::audioInputOpen(audio_input_cb);
+
+    // Clear entire extended buffer to black
+    uint16_t *base = pal::getFramebuffer();
+    // getFramebuffer() returns pointer at visible_offset, go back to start
+    if (use_ring_buffer) {
+        uint16_t *ext_start = base - ring_offset * fb.phys_w;
+        memset(ext_start, 0, ext_h * fb.phys_w * sizeof(uint16_t));
+    } else {
+        memset(base, 0, log_w * log_h * sizeof(uint16_t));
+    }
+
+    // Draw initial static backgrounds
+    draw::fillRect(fb, 0, 0, log_w, HEADER_H, COL_NAVY);
+    draw::fillRect(fb, 0, HEADER_H, log_w, GAP, COL_BLACK);
+    draw::fillRect(fb, 0, log_h - INFO_H, log_w, INFO_H, COL_DGREY);
 
     fps = 0;
     frame_count = 0;
@@ -240,25 +219,34 @@ void app::tick()
     bool new_spectrum = dsp::processIfReady();
     if (new_spectrum) {
         last_dsp_time = t0;
-        const float *mag = dsp::getMagnitudeDb();
-        memcpy(&wf_db[wf_head * num_bins], mag, num_bins * sizeof(float));
 
-        // Decrement head FIRST, then write — forward reads from head give newest-first
-        wf_head = (wf_head - 1 + WF_MAX_LINES) % WF_MAX_LINES;
+        if (use_ring_buffer) {
+            // Ring buffer wrap check
+            if (ring_offset <= 0) {
+                // Copy visible waterfall data back to top of extended area
+                uint16_t *cur_wf = &fb.buf[wf_y * fb.phys_w];
+                // After setVisibleOffset, fb.buf will point higher; copy before moving
+                int wf_extra = pal::getExtendedHeight() - log_h;
+                uint16_t *ext_start = fb.buf - ring_offset * fb.phys_w;  // absolute start
+                uint16_t *dst_wf = ext_start + (wf_extra + wf_y) * fb.phys_w;
+                memcpy(dst_wf, cur_wf, wf_h * fb.phys_w * sizeof(uint16_t));
+                ring_offset = wf_extra;
+            }
 
-        // Pre-render into transposed pixel cache [lx][WF_MAX_LINES]
-        for (int lx = 0; lx < log_w; lx++) {
-            int fft_bin = g_pixel_to_fftbin[lx];
-            uint16_t color = (lx == g_vfo_x) ? COL_MARKER
-                           : waterfall_color_from_db(mag[fft_bin]);
-            wf_pixels_t[lx * WF_MAX_LINES + wf_head] = color;
+            // Scroll: decrement offset, slide visible window up by 1 row
+            ring_offset--;
+            pal::setVisibleOffset(ring_offset);
+            fb.buf = pal::getFramebuffer();  // update fb.buf to new position
+
+            // Write one new waterfall row at wf_y (the new top of waterfall)
+            write_waterfall_line(dsp::getMagnitudeDb());
         }
 
-        if (wf_count < WF_MAX_LINES) wf_count++;
+        wf_count++;
     }
     int64_t t_dsp = pal::micros();
 
-    // Poll touch events
+    // Poll touch
     pal::TouchEvent evt;
     while (pal::pollEvent(evt)) {
         if (evt.action == pal::TouchEvent::DOWN) {
@@ -270,30 +258,23 @@ void app::tick()
     }
 
     // --- Draw frame ---
-    // On first frame, clear entire screen
-    static bool first_frame = true;
-    if (first_frame) {
-        // Fill entire physical framebuffer with black
-        int total = fb.rotated ? (fb.phys_w * fb.phys_h) : (fb.log_w * fb.log_h);
-        for (int i = 0; i < total; i++) fb.buf[i] = COL_BLACK;
-        // Draw static backgrounds once
-        draw::fillRect(fb, 0, 0, log_w, HEADER_H, COL_NAVY);
-        draw::fillRect(fb, 0, HEADER_H, log_w, GAP, COL_BLACK);
-        draw::fillRect(fb, 0, log_h - INFO_H, log_w, INFO_H, COL_DGREY);
-        first_frame = false;
-    }
+    // Header background
+    draw::fillRect(fb, 0, 0, log_w, HEADER_H, COL_NAVY);
 
-    // Spectrum (includes black fill above bars + VFO marker)
+    // Spectrum
     draw_spectrum(dsp::getMagnitudeDb());
     int64_t t_spec = pal::micros();
 
-    // Gap + Waterfall (includes VFO marker per-row)
-    draw::fillRect(fb, 0, HEADER_H + GAP + SPEC_H, log_w, GAP, COL_BLACK);
-    draw_waterfall();
+    // Waterfall: in ring buffer mode, already drawn inline above.
+    // In non-ring-buffer mode (desktop), draw VFO marker on waterfall area.
+    if (!use_ring_buffer) {
+        // Desktop: simple waterfall (no ring buffer optimization)
+        // Just draw VFO marker line
+        draw::drawVLine(fb, g_vfo_x, wf_y, wf_h, COL_MARKER);
+    }
     int64_t t_wf = pal::micros();
 
-    // HUD text — drawText paints bg per character cell, no separate clear needed
-    // Pad strings to fixed width to overwrite old content
+    // HUD text
     draw::drawText(fb, 8, 6, "QRP Companion", COL_WHITE, COL_NAVY, 2);
 
     char buf[80];
@@ -302,7 +283,7 @@ void app::tick()
     int tw = draw::textWidth(buf, 2);
     draw::drawText(fb, log_w - tw - 8, 6, buf, fps_col, COL_NAVY, 2);
 
-
+    // Touch tooltip
     if (touch_time > 0 && (t0 - touch_time) < 1000000) {
         int ttw = draw::textWidth(touch_text) + 8;
         int tx = touch_x - ttw / 2;
@@ -315,14 +296,15 @@ void app::tick()
         draw::drawText(fb, tx + 4, ty + 3, touch_text, COL_YELLOW, COL_DGREY);
     }
 
-    // Info bar text — pad to fixed width, bg overwrites old text
+    // Info bar
     int info_y = log_h - INFO_H;
+    draw::fillRect(fb, 0, info_y, log_w, INFO_H, COL_DGREY);
     snprintf(buf, sizeof(buf), "dsp:%4.1f spec:%4.1f wf:%5.1f hud:%4.1f commit:%4.1f total:%5.1fms",
              t_dsp_ms, t_spec_ms, t_wf_ms, t_hud_ms, t_commit_ms, t_total_ms);
     draw::drawText(fb, 8, info_y + 4, buf, COL_WHITE, COL_DGREY);
 
-    snprintf(buf, sizeof(buf), "%dx%d  heap:%dK  psram:%dK   ",
-             log_w, log_h, pal::freeHeapKb(), pal::freePsramKb());
+    snprintf(buf, sizeof(buf), "%dx%d  heap:%dK  psram:%dK  wf:%d",
+             log_w, log_h, pal::freeHeapKb(), pal::freePsramKb(), wf_count);
     draw::drawText(fb, 8, info_y + 16, buf, COL_WHITE, COL_DGREY);
 
     int64_t t_hud = pal::micros();

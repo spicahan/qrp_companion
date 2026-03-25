@@ -128,6 +128,9 @@ void delayMs(int ms)
 int freeHeapKb() { return 0; }
 int freePsramKb() { return 0; }
 
+int getExtendedHeight() { return fb_h; }
+void setVisibleOffset(int) { /* no-op on desktop */ }
+
 // --- Audio input via PortAudio ---
 static PaStream *s_pa_stream = nullptr;
 static AudioInputCallback s_audio_cb = nullptr;
