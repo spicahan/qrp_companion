@@ -11,6 +11,14 @@
 #include <mutex>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
+#include <atomic>
+
+// POSIX serial for CAT
+#include <fcntl.h>
+#include <unistd.h>
+#include <termios.h>
+#include <glob.h>
 
 static int fb_w = 0, fb_h = 0;
 static uint16_t *fb_buffer = nullptr;
@@ -76,17 +84,32 @@ static auto clock_base = std::chrono::steady_clock::now();
 
 namespace pal {
 
+// --- Desktop CAT forward declarations (defined below getVfoFreq) ---
+static int s_cat_fd;
+static std::atomic<uint64_t> s_vfo_freq;
+static std::thread s_cat_thread;
+static std::atomic<bool> s_cat_running;
+static void cat_thread_func();
+
 bool init(int width, int height)
 {
     fb_w = width;
     fb_h = height;
     fb_buffer = new uint16_t[width * height]();
     clock_base = std::chrono::steady_clock::now();
+
+    // Start CAT serial thread
+    s_cat_running = true;
+    s_cat_thread = std::thread(cat_thread_func);
+    s_cat_thread.detach();
+
     return true;
 }
 
 void shutdown()
 {
+    s_cat_running = false;
+    if (s_cat_fd >= 0) { close(s_cat_fd); s_cat_fd = -1; }
     delete[] fb_buffer;
     fb_buffer = nullptr;
 }
@@ -128,7 +151,102 @@ void delayMs(int ms)
 int freeHeapKb() { return 0; }
 int freePsramKb() { return 0; }
 
-uint64_t getVfoFreq() { return 0; }  // no CAT on desktop
+// --- Desktop CAT via POSIX serial (implementation) ---
+
+static int try_open_cat_port(const char *path)
+{
+    int fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0) return -1;
+
+    // Clear non-blocking for subsequent I/O
+    int flags = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+
+    struct termios tty = {};
+    tcgetattr(fd, &tty);
+    cfsetispeed(&tty, B115200);
+    cfsetospeed(&tty, B115200);
+    tty.c_cflag = CS8 | CLOCAL | CREAD;
+    tty.c_iflag = 0;
+    tty.c_oflag = 0;
+    tty.c_lflag = 0;
+    tty.c_cc[VMIN] = 0;
+    tty.c_cc[VTIME] = 5;  // 500ms read timeout
+    tcsetattr(fd, TCSANOW, &tty);
+    tcflush(fd, TCIOFLUSH);
+
+    // Probe: send FA; and check for response
+    write(fd, "FA;", 3);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    char buf[64];
+    int n = read(fd, buf, sizeof(buf) - 1);
+    if (n > 4 && buf[0] == 'F' && buf[1] == 'A') {
+        buf[n] = '\0';
+        fprintf(stderr, "CAT: found on %s: %s\n", path, buf);
+        return fd;
+    }
+
+    close(fd);
+    return -1;
+}
+
+static void cat_thread_func()
+{
+    // Auto-detect CAT port
+    while (s_cat_running && s_cat_fd < 0) {
+        glob_t gl;
+        if (glob("/dev/cu.usbmodem*", 0, nullptr, &gl) == 0) {
+            for (size_t i = 0; i < gl.gl_pathc && s_cat_fd < 0; i++)
+                s_cat_fd = try_open_cat_port(gl.gl_pathv[i]);
+            globfree(&gl);
+        }
+        if (s_cat_fd < 0)
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+
+    // Poll loop
+    char rx_buf[128];
+    int rx_pos = 0;
+
+    while (s_cat_running && s_cat_fd >= 0) {
+        write(s_cat_fd, "FA;", 3);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        int n = read(s_cat_fd, rx_buf + rx_pos, sizeof(rx_buf) - rx_pos - 1);
+        if (n > 0) {
+            rx_pos += n;
+            rx_buf[rx_pos] = '\0';
+
+            // Parse complete responses (terminated by ';')
+            char *start = rx_buf;
+            for (char *p = rx_buf; p < rx_buf + rx_pos; p++) {
+                if (*p == ';') {
+                    *p = '\0';
+                    if (p - start >= 13 && start[0] == 'F' && start[1] == 'A')
+                        s_vfo_freq.store(strtoull(start + 2, nullptr, 10));
+                    start = p + 1;
+                }
+            }
+            // Move leftover to front
+            int leftover = rx_buf + rx_pos - start;
+            if (leftover > 0 && start != rx_buf)
+                memmove(rx_buf, start, leftover);
+            rx_pos = leftover;
+        } else if (n < 0) {
+            // Port error — close and retry
+            close(s_cat_fd);
+            s_cat_fd = -1;
+            rx_pos = 0;
+            s_vfo_freq.store(0);
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(900));
+    }
+}
+
+uint64_t getVfoFreq() { return s_vfo_freq.load(); }
 
 void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
                uint16_t *dst, int dst_stride, int dst_x, int dst_y,
