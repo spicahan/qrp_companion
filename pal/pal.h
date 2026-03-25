@@ -35,6 +35,14 @@ void    delayMs(int ms);
 int freeHeapKb();
 int freePsramKb();  // 0 on desktop
 
+// 2D block copy (hardware-accelerated on Tab5 via PPA, CPU fallback on desktop)
+// Copies a rectangular block from src (with src_stride) to dst (with dst_stride).
+// mirror_y: if true, source rows are read in reverse order.
+// All sizes in pixels (uint16_t). Blocking call.
+void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
+               uint16_t *dst, int dst_stride, int dst_x, int dst_y,
+               int width, int height, bool mirror_y = false);
+
 // Audio input (stereo 24-bit 48kHz, delivered as I/Q float pairs)
 // Callback is called from the audio thread.
 // iq_samples: interleaved [I0, Q0, I1, Q1, ...], num_frames pairs.

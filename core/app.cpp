@@ -86,7 +86,10 @@ static void draw_spectrum(const float *mag_db)
 {
     int spec_y = HEADER_H + GAP;
 
-    // Draw each column: black above bar, colored bar, VFO marker integrated
+    // Clear entire spectrum area first to avoid residuals
+    draw::fillRect(fb, 0, spec_y, log_w, SPEC_H, COL_BLACK);
+
+    // Draw spectrum bars with VFO marker
     for (int di = 0; di < num_bins; di++) {
         int x0 = bin_to_x(di);
         int x1 = bin_to_x(di + 1);
@@ -104,10 +107,6 @@ static void draw_spectrum(const float *mag_db)
         int bar_w = x1 - x0;
         if (x0 + bar_w > log_w) bar_w = log_w - x0;
 
-        // Black above the bar
-        if (SPEC_H - bar_h > 0)
-            draw::fillRect(fb, x0, spec_y, bar_w, SPEC_H - bar_h, COL_BLACK);
-        // Colored bar
         uint16_t color = spectrum_color(norm);
         draw::fillRect(fb, x0, spec_y + SPEC_H - bar_h, bar_w, bar_h, color);
     }
@@ -138,25 +137,32 @@ static void draw_waterfall()
     if (n > wf_h) n = wf_h;
 
     if (fb.rotated) {
-        // Each physical row = one frequency bin.
-        // Ring buffer: forward read from wf_head gives newest-first order.
-        // memcpy 1-2 segments per physical row (handles ring wrap).
-        for (int py = 0; py < fb.log_w; py++) {
-            int lx = fb.log_w - 1 - py;
-            const uint16_t *src = &wf_pixels_t[lx * WF_MAX_LINES];
-            uint16_t *dst = &fb.buf[py * fb.phys_w + wf_y];
+        // wf_pixels_t layout: [log_w rows][WF_MAX_LINES cols], one row per freq bin.
+        // Physical row py reads from src row (log_w-1-py) → need mirror_y.
+        // Ring buffer: forward from wf_head = newest first.
+        // PPA blitBlock with mirror_y handles the Y-flip in hardware.
 
-            int start = wf_head;
-            if (start + n <= WF_MAX_LINES) {
-                memcpy(dst, &src[start], n * sizeof(uint16_t));
-            } else {
-                int first = WF_MAX_LINES - start;
-                memcpy(dst, &src[start], first * sizeof(uint16_t));
-                memcpy(dst + first, &src[0], (n - first) * sizeof(uint16_t));
-            }
+        int start = wf_head;
+        if (start + n <= WF_MAX_LINES) {
+            // Single contiguous region — one blitBlock call
+            pal::blitBlock(wf_pixels_t, WF_MAX_LINES, start, 0,
+                           fb.buf, fb.phys_w, wf_y, 0,
+                           n, log_w, true);
+        } else {
+            // Wrap around: two blitBlock calls
+            int first = WF_MAX_LINES - start;
+            int second = n - first;
+            pal::blitBlock(wf_pixels_t, WF_MAX_LINES, start, 0,
+                           fb.buf, fb.phys_w, wf_y, 0,
+                           first, log_w, true);
+            pal::blitBlock(wf_pixels_t, WF_MAX_LINES, 0, 0,
+                           fb.buf, fb.phys_w, wf_y + first, 0,
+                           second, log_w, true);
+        }
 
-            if (n < wf_h)
-                memset(dst + n, 0, (wf_h - n) * sizeof(uint16_t));
+        if (n < wf_h) {
+            for (int py = 0; py < log_w; py++)
+                memset(&fb.buf[py * fb.phys_w + wf_y + n], 0, (wf_h - n) * sizeof(uint16_t));
         }
     } else {
         // Non-rotated (desktop): each logical row = one time step

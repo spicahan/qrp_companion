@@ -128,6 +128,18 @@ void delayMs(int ms)
 int freeHeapKb() { return 0; }
 int freePsramKb() { return 0; }
 
+void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
+               uint16_t *dst, int dst_stride, int dst_x, int dst_y,
+               int width, int height, bool mirror_y)
+{
+    for (int y = 0; y < height; y++) {
+        int sy = mirror_y ? (src_y + height - 1 - y) : (src_y + y);
+        memcpy(&dst[(dst_y + y) * dst_stride + dst_x],
+               &src[sy * src_stride + src_x],
+               width * sizeof(uint16_t));
+    }
+}
+
 // --- Audio input via PortAudio ---
 static PaStream *s_pa_stream = nullptr;
 static AudioInputCallback s_audio_cb = nullptr;
