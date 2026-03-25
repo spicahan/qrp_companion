@@ -11,16 +11,13 @@ extern "C" {
 // before the UAC driver on composite USB devices.
 void cat_host_init(void);
 
-// Start periodic CAT polling (spawns its own task).
-// Call after USB host is running.
+// Start CDC device discovery (spawns background task).
 void cat_host_start(void);
 
-// Get the current VFO frequency in Hz. Returns 0 if not yet received.
-uint64_t cat_get_vfo_freq(void);
-
-// Get the current mode. Returns 0 if not yet received.
-// 1=LSB, 2=USB, 3=CW, 6=DIGI
-int cat_get_mode(void);
+// Raw serial transport for PAL
+int  cat_host_is_connected(void);
+int  cat_host_send(const char *data, int len);
+int  cat_host_recv(char *buf, int max_len);
 
 #ifdef __cplusplus
 }

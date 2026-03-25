@@ -19,13 +19,22 @@ void shutdown();
 
 // Display
 DisplayInfo  getDisplayInfo();
-uint16_t*    getFramebuffer();   // raw pixel buffer (physical or logical depending on platform)
-int          getFramebufferStride(); // physical width of buffer
-bool         isRotated();        // true if display uses 90° CW rotation
-void         commitFrame();      // push framebuffer to screen
+uint16_t*    getFramebuffer();
+int          getFramebufferStride();
+bool         isRotated();
+void         commitFrame();
+
+// Extended framebuffer for ring buffer waterfall (portrait mode)
+int  getExtendedHeight();
+void setVisibleOffset(int row);
+
+// 2D block copy (hardware-accelerated on Tab5 via PPA, CPU fallback on desktop)
+void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
+               uint16_t *dst, int dst_stride, int dst_x, int dst_y,
+               int width, int height, bool mirror_y = false);
 
 // Input
-bool pollEvent(TouchEvent &evt); // returns false if no pending event
+bool pollEvent(TouchEvent &evt);
 
 // Timing
 int64_t micros();
@@ -33,23 +42,17 @@ void    delayMs(int ms);
 
 // System info
 int freeHeapKb();
-int freePsramKb();  // 0 on desktop
+int freePsramKb();
 
-// 2D block copy (hardware-accelerated on Tab5 via PPA, CPU fallback on desktop)
-// Copies a rectangular block from src (with src_stride) to dst (with dst_stride).
-// mirror_y: if true, source rows are read in reverse order.
-// All sizes in pixels (uint16_t). Blocking call.
-void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
-               uint16_t *dst, int dst_stride, int dst_x, int dst_y,
-               int width, int height, bool mirror_y = false);
-
-// CAT (Computer Aided Transceiver) control
-uint64_t getVfoFreq();  // Current VFO frequency in Hz, 0 if unknown
-int      getMode();     // Current mode: 1=LSB 2=USB 3=CW 6=DIGI, 0=unknown
+// CAT serial transport (raw byte send/receive)
+// Returns true if a CAT-capable serial port is connected.
+bool catIsConnected();
+// Send raw bytes. Returns number of bytes sent, or -1 on error.
+int  catSend(const char *data, int len);
+// Receive up to max_len bytes. Non-blocking, returns bytes read (0 if none).
+int  catRecv(char *buf, int max_len);
 
 // Audio input (stereo 24-bit 48kHz, delivered as I/Q float pairs)
-// Callback is called from the audio thread.
-// iq_samples: interleaved [I0, Q0, I1, Q1, ...], num_frames pairs.
 using AudioInputCallback = void(*)(const float *iq_samples, int num_frames);
 bool audioInputOpen(AudioInputCallback cb);
 void audioInputClose();

@@ -2,6 +2,7 @@
 #include "pal.h"
 #include "draw.h"
 #include "dsp.h"
+#include "cat.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -227,6 +228,7 @@ void app::init()
 
     // Open audio input (UAC on Tab5, PortAudio on desktop)
     pal::audioInputOpen(audio_input_cb);
+    cat::init();
 
     fps = 0;
     frame_count = 0;
@@ -245,6 +247,9 @@ void app::tick()
         frame_count = 0;
         fps_last_time = t0;
     }
+
+    // --- CAT ---
+    cat::poll();
 
     // --- DSP ---
     bool new_spectrum = dsp::processIfReady();
@@ -302,26 +307,21 @@ void app::tick()
     // HUD text
     draw::drawText(fb, 8, 6, "QRP", COL_WHITE, COL_NAVY, 2);
 
-    // Mode + VFO frequency centered in header
+    // Mode + VFO frequency centered in header (fixed width to avoid residuals)
     char buf[80];
-    int mode = pal::getMode();
-    const char *mode_str = "---";
-    switch (mode) {
-        case 1: mode_str = "LSB";  break;
-        case 2: mode_str = "USB";  break;
-        case 3: mode_str = "CW";   break;
-        case 6: mode_str = "DIGI"; break;
-    }
-
-    uint64_t vfo = pal::getVfoFreq();
+    uint64_t vfo = cat::getVfoFreq();
     if (vfo > 0) {
         int mhz = (int)(vfo / 1000000);
         int khz = (int)((vfo % 1000000) / 1000);
         int hz  = (int)(vfo % 1000);
-        snprintf(buf, sizeof(buf), "%s %d.%03d.%03d", mode_str, mhz, khz, hz);
+        snprintf(buf, sizeof(buf), "%-4s %d.%03d.%03d", cat::getModeStr(), mhz, khz, hz);
     } else {
-        snprintf(buf, sizeof(buf), "%s ---.---.---", mode_str);
+        snprintf(buf, sizeof(buf), "%-4s ---.---.---", cat::getModeStr());
     }
+    // Pad to fixed 20 chars to overwrite any residuals
+    int blen = strlen(buf);
+    while (blen < 20) buf[blen++] = ' ';
+    buf[blen] = '\0';
     int freq_tw = draw::textWidth(buf, 2);
     draw::drawText(fb, (log_w - freq_tw) / 2, 6, buf, COL_GREEN, COL_NAVY, 2);
 

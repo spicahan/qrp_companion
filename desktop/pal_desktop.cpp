@@ -86,8 +86,6 @@ namespace pal {
 
 // --- Desktop CAT forward declarations (defined below getVfoFreq) ---
 static int s_cat_fd = -1;
-static std::atomic<uint64_t> s_vfo_freq{0};
-static std::atomic<int> s_cat_mode{0};
 static std::thread s_cat_thread;
 static std::atomic<bool> s_cat_running{false};
 static void cat_thread_func();
@@ -194,64 +192,65 @@ static int try_open_cat_port(const char *path)
 
 static void cat_thread_func()
 {
-    // Auto-detect CAT port
-    while (s_cat_running && s_cat_fd < 0) {
-        glob_t gl;
-        if (glob("/dev/cu.usbmodem*", 0, nullptr, &gl) == 0) {
-            for (size_t i = 0; i < gl.gl_pathc && s_cat_fd < 0; i++)
-                s_cat_fd = try_open_cat_port(gl.gl_pathv[i]);
-            globfree(&gl);
-        }
-        if (s_cat_fd < 0)
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-    }
-
-    // Poll loop
-    char rx_buf[128];
-    int rx_pos = 0;
-
-    while (s_cat_running && s_cat_fd >= 0) {
-        write(s_cat_fd, "FA;MD;", 6);
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-        int n = read(s_cat_fd, rx_buf + rx_pos, sizeof(rx_buf) - rx_pos - 1);
-        if (n > 0) {
-            rx_pos += n;
-            rx_buf[rx_pos] = '\0';
-
-            // Parse complete responses (terminated by ';')
-            char *start = rx_buf;
-            for (char *p = rx_buf; p < rx_buf + rx_pos; p++) {
-                if (*p == ';') {
-                    *p = '\0';
-                    int rlen = (int)(p - start);
-                    if (rlen >= 13 && start[0] == 'F' && start[1] == 'A')
-                        s_vfo_freq.store(strtoull(start + 2, nullptr, 10));
-                    else if (rlen >= 3 && start[0] == 'M' && start[1] == 'D')
-                        s_cat_mode.store(start[2] - '0');
-                    start = p + 1;
-                }
+    // Auto-detect and maintain CAT serial port connection
+    while (s_cat_running) {
+        if (s_cat_fd < 0) {
+            glob_t gl;
+            if (glob("/dev/cu.usbmodem*", 0, nullptr, &gl) == 0) {
+                for (size_t i = 0; i < gl.gl_pathc && s_cat_fd < 0; i++)
+                    s_cat_fd = try_open_cat_port(gl.gl_pathv[i]);
+                globfree(&gl);
             }
-            // Move leftover to front
-            int leftover = rx_buf + rx_pos - start;
-            if (leftover > 0 && start != rx_buf)
-                memmove(rx_buf, start, leftover);
-            rx_pos = leftover;
-        } else if (n < 0) {
-            // Port error — close and retry
-            close(s_cat_fd);
-            s_cat_fd = -1;
-            rx_pos = 0;
-            s_vfo_freq.store(0);
-            std::this_thread::sleep_for(std::chrono::seconds(2));
         }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(900));
+        std::this_thread::sleep_for(std::chrono::seconds(2));
     }
 }
 
-uint64_t getVfoFreq() { return s_vfo_freq.load(); }
-int getMode() { return s_cat_mode.load(); }
+// --- PAL CAT serial transport ---
+static std::mutex s_cat_rx_mutex;
+static char s_cat_rx_ring[256];
+static int s_cat_rx_head = 0, s_cat_rx_tail = 0;
+
+bool catIsConnected() { return s_cat_fd >= 0; }
+
+int catSend(const char *data, int len)
+{
+    if (s_cat_fd < 0) return -1;
+    int n = (int)write(s_cat_fd, data, len);
+    return n > 0 ? n : -1;
+}
+
+int catRecv(char *buf, int max_len)
+{
+    // Drain from serial port into ring buffer
+    if (s_cat_fd >= 0) {
+        char tmp[128];
+        int n = (int)read(s_cat_fd, tmp, sizeof(tmp));
+        if (n > 0) {
+            std::lock_guard<std::mutex> lock(s_cat_rx_mutex);
+            for (int i = 0; i < n; i++) {
+                int next = (s_cat_rx_head + 1) % 256;
+                if (next != s_cat_rx_tail) {
+                    s_cat_rx_ring[s_cat_rx_head] = tmp[i];
+                    s_cat_rx_head = next;
+                }
+            }
+        } else if (n < 0) {
+            // Port error
+            close(s_cat_fd);
+            s_cat_fd = -1;
+        }
+    }
+
+    // Return data from ring buffer
+    std::lock_guard<std::mutex> lock(s_cat_rx_mutex);
+    int count = 0;
+    while (count < max_len && s_cat_rx_head != s_cat_rx_tail) {
+        buf[count++] = s_cat_rx_ring[s_cat_rx_tail];
+        s_cat_rx_tail = (s_cat_rx_tail + 1) % 256;
+    }
+    return count;
+}
 
 void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
                uint16_t *dst, int dst_stride, int dst_x, int dst_y,

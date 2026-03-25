@@ -112,8 +112,9 @@ void delayMs(int ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
 int freeHeapKb() { return (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024); }
 int freePsramKb() { return (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024); }
 
-uint64_t getVfoFreq() { return cat_get_vfo_freq(); }
-int getMode() { return cat_get_mode(); }
+bool catIsConnected() { return cat_host_is_connected(); }
+int  catSend(const char *data, int len) { return cat_host_send(data, len); }
+int  catRecv(char *buf, int max_len) { return cat_host_recv(buf, max_len); }
 
 void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
                uint16_t *dst, int dst_stride, int dst_x, int dst_y,
