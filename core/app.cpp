@@ -273,14 +273,39 @@ void app::tick()
     }
     int64_t t_dsp = pal::micros();
 
-    // Poll touch events
+    // Poll touch events — touch-to-tune
     pal::TouchEvent evt;
     while (pal::pollEvent(evt)) {
         if (evt.action == pal::TouchEvent::DOWN) {
             touch_x = evt.x;
             touch_y = evt.y;
-            snprintf(touch_text, sizeof(touch_text), "Touch @(%d,%d)", touch_x, touch_y);
             touch_time = t0;
+
+            // Touch-to-tune: compute frequency delta from VFO marker
+            uint64_t vfo = cat::getVfoFreq();
+            if (vfo > 0) {
+                // Each pixel = SAMPLE_RATE / num_bins Hz
+                // Delta pixels from VFO marker (positive = higher freq)
+                int delta_px = touch_x - g_vfo_x;
+                int hz_per_bin = SAMPLE_RATE / FFT_SIZE;
+                // Pixels per bin = log_w / num_bins
+                // Delta in bins = delta_px * num_bins / log_w
+                // Delta in Hz = delta_px * num_bins / log_w * hz_per_bin
+                //             = delta_px * SAMPLE_RATE / log_w
+                int delta_hz = delta_px * SAMPLE_RATE / log_w;
+                uint64_t new_freq = (int64_t)vfo + delta_hz;
+                if (new_freq > 0) {
+                    cat::setVfoFreq(new_freq);
+                    snprintf(touch_text, sizeof(touch_text),
+                             "%+dHz -> %d.%03d.%03d",
+                             delta_hz,
+                             (int)(new_freq / 1000000),
+                             (int)((new_freq % 1000000) / 1000),
+                             (int)(new_freq % 1000));
+                }
+            } else {
+                snprintf(touch_text, sizeof(touch_text), "Touch @(%d,%d)", touch_x, touch_y);
+            }
         }
     }
 
