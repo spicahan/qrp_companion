@@ -183,6 +183,10 @@ static int try_open_cat_port(const char *path)
     if (n > 4 && buf[0] == 'F' && buf[1] == 'A') {
         buf[n] = '\0';
         fprintf(stderr, "CAT: found on %s: %s\n", path, buf);
+        // Switch to non-blocking reads for polling from main thread
+        tty.c_cc[VMIN] = 0;
+        tty.c_cc[VTIME] = 0;
+        tcsetattr(fd, TCSANOW, &tty);
         return fd;
     }
 
