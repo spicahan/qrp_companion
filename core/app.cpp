@@ -298,11 +298,24 @@ void app::tick()
     draw_waterfall();
     int64_t t_wf = pal::micros();
 
-    // HUD text — drawText paints bg per character cell, no separate clear needed
-    // Pad strings to fixed width to overwrite old content
-    draw::drawText(fb, 8, 6, "QRP Companion", COL_WHITE, COL_NAVY, 2);
+    // HUD text
+    draw::drawText(fb, 8, 6, "QRP", COL_WHITE, COL_NAVY, 2);
 
+    // VFO frequency centered in header
     char buf[80];
+    uint64_t vfo = pal::getVfoFreq();
+    if (vfo > 0) {
+        int mhz = (int)(vfo / 1000000);
+        int khz = (int)((vfo % 1000000) / 1000);
+        int hz  = (int)(vfo % 1000);
+        snprintf(buf, sizeof(buf), "%d.%03d.%03d", mhz, khz, hz);
+    } else {
+        snprintf(buf, sizeof(buf), "---.---.---");
+    }
+    int freq_tw = draw::textWidth(buf, 2);
+    draw::drawText(fb, (log_w - freq_tw) / 2, 6, buf, COL_GREEN, COL_NAVY, 2);
+
+    // FPS right-aligned
     snprintf(buf, sizeof(buf), "%5.1f FPS", fps);
     uint16_t fps_col = (fps >= 24) ? COL_GREEN : (fps >= 10) ? COL_YELLOW : COL_RED;
     int tw = draw::textWidth(buf, 2);

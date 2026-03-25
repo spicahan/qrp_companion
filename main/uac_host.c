@@ -1,4 +1,5 @@
 #include "uac_host.h"
+#include "cat_host.h"
 
 #include <string.h>
 #include <math.h>
@@ -165,6 +166,10 @@ static void usb_lib_task(void *arg)
     };
     ESP_ERROR_CHECK(usb_host_install(&cfg));
     ESP_LOGI(TAG, "USB Host installed");
+
+    // Install CDC-ACM driver BEFORE UAC for composite device support
+    cat_host_init();
+
     xTaskNotifyGive(arg);
 
     while (1) {
@@ -245,6 +250,9 @@ void uac_host_start(void)
 
     xTaskCreatePinnedToCore(usb_lib_task, "usb_events", 4096, (void *)uac_task_handle,
                             USB_HOST_TASK_PRIORITY, NULL, 0);
+
+    // Start CAT polling (CDC-ACM was installed in usb_lib_task)
+    cat_host_start();
 
     ESP_LOGI(TAG, "UAC host tasks started");
 }

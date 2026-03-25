@@ -1,5 +1,6 @@
 #include "pal.h"
 #include "uac_host.h"
+#include "cat_host.h"
 
 #include <M5Unified.h>
 #include <lgfx/v1/platforms/esp32p4/Panel_DSI.hpp>
@@ -110,6 +111,8 @@ int64_t micros() { return esp_timer_get_time(); }
 void delayMs(int ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
 int freeHeapKb() { return (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024); }
 int freePsramKb() { return (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024); }
+
+uint64_t getVfoFreq() { return cat_get_vfo_freq(); }
 
 void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
                uint16_t *dst, int dst_stride, int dst_x, int dst_y,

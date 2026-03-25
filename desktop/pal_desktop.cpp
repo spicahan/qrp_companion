@@ -128,6 +128,8 @@ void delayMs(int ms)
 int freeHeapKb() { return 0; }
 int freePsramKb() { return 0; }
 
+uint64_t getVfoFreq() { return 0; }  // no CAT on desktop
+
 void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
                uint16_t *dst, int dst_stride, int dst_x, int dst_y,
                int width, int height, bool mirror_y)
