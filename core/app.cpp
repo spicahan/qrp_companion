@@ -132,53 +132,43 @@ static void precompute_pixel_bin_map()
 
 static void draw_waterfall()
 {
-    int rows_to_draw = wf_count;
-    if (rows_to_draw > wf_h) rows_to_draw = wf_h;
+    if (wf_count == 0) return;
+
+    int n = wf_count;
+    if (n > wf_h) n = wf_h;
 
     if (fb.rotated) {
-        // Read from transposed pixel cache, write sequentially to physical rows.
-        // Physical row py → lx = log_w - 1 - py.
-        // Physical columns wf_y..wf_y+wf_h-1 → waterfall time rows (newest first).
-        uint16_t line_buf[512];  // max wf_h
-
+        // Each physical row = one frequency bin.
+        // Ring buffer: forward read from wf_head gives newest-first order.
+        // memcpy 1-2 segments per physical row (handles ring wrap).
         for (int py = 0; py < fb.log_w; py++) {
             int lx = fb.log_w - 1 - py;
             const uint16_t *src = &wf_pixels_t[lx * WF_MAX_LINES];
+            uint16_t *dst = &fb.buf[py * fb.phys_w + wf_y];
 
-            // Copy from ring buffer: newest (wf_head-1) first
-            // Split into up to 2 contiguous regions
-            int start = (wf_head - rows_to_draw + WF_MAX_LINES) % WF_MAX_LINES;
-            if (start + rows_to_draw <= WF_MAX_LINES) {
-                // No wrap — but we need reverse order (newest first)
-                for (int i = 0; i < rows_to_draw; i++)
-                    line_buf[i] = src[start + rows_to_draw - 1 - i];
+            int start = wf_head;
+            if (start + n <= WF_MAX_LINES) {
+                memcpy(dst, &src[start], n * sizeof(uint16_t));
             } else {
-                // Wrap around — newest entries are at [start..WF_MAX-1] and [0..wf_head-1]
-                // Reverse: newest = wf_head-1, oldest = start
-                for (int i = 0; i < rows_to_draw; i++) {
-                    int idx = (wf_head - 1 - i + WF_MAX_LINES) % WF_MAX_LINES;
-                    line_buf[i] = src[idx];
-                }
+                int first = WF_MAX_LINES - start;
+                memcpy(dst, &src[start], first * sizeof(uint16_t));
+                memcpy(dst + first, &src[0], (n - first) * sizeof(uint16_t));
             }
 
-            // Black for unfilled rows
-            for (int i = rows_to_draw; i < wf_h; i++)
-                line_buf[i] = COL_BLACK;
-
-            // Single sequential write to physical framebuffer
-            memcpy(&fb.buf[py * fb.phys_w + wf_y], line_buf, wf_h * sizeof(uint16_t));
+            if (n < wf_h)
+                memset(dst + n, 0, (wf_h - n) * sizeof(uint16_t));
         }
     } else {
-        // Non-rotated (desktop): iterate logical rows, read from transposed cache
-        for (int row = 0; row < rows_to_draw; row++) {
+        // Non-rotated (desktop): each logical row = one time step
+        for (int row = 0; row < n; row++) {
             int fy = wf_y + row;
-            int time_idx = (wf_head - 1 - row + WF_MAX_LINES) % WF_MAX_LINES;
+            int time_idx = (wf_head + row) % WF_MAX_LINES;
             uint16_t *dst = &fb.buf[fy * fb.phys_w];
             for (int x = 0; x < log_w; x++)
                 dst[x] = wf_pixels_t[x * WF_MAX_LINES + time_idx];
         }
-        if (rows_to_draw < wf_h)
-            draw::fillRect(fb, 0, wf_y + rows_to_draw, log_w, wf_h - rows_to_draw, COL_BLACK);
+        if (n < wf_h)
+            draw::fillRect(fb, 0, wf_y + n, log_w, wf_h - n, COL_BLACK);
     }
 }
 
@@ -253,9 +243,10 @@ void app::tick()
         const float *mag = dsp::getMagnitudeDb();
         memcpy(&wf_db[wf_head * num_bins], mag, num_bins * sizeof(float));
 
-        // Pre-render this waterfall line into the transposed pixel cache.
-        // wf_pixels_t is [log_w][WF_MAX_LINES] — for each pixel column (lx),
-        // we store the color at time index wf_head.
+        // Decrement head FIRST, then write — forward reads from head give newest-first
+        wf_head = (wf_head - 1 + WF_MAX_LINES) % WF_MAX_LINES;
+
+        // Pre-render into transposed pixel cache [lx][WF_MAX_LINES]
         for (int lx = 0; lx < log_w; lx++) {
             int fft_bin = g_pixel_to_fftbin[lx];
             uint16_t color = (lx == g_vfo_x) ? COL_MARKER
@@ -263,7 +254,6 @@ void app::tick()
             wf_pixels_t[lx * WF_MAX_LINES + wf_head] = color;
         }
 
-        wf_head = (wf_head + 1) % WF_MAX_LINES;
         if (wf_count < WF_MAX_LINES) wf_count++;
     }
     int64_t t_dsp = pal::micros();
