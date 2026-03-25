@@ -21,6 +21,7 @@ static const char *TAG = "cat";
 
 static cdc_acm_dev_hdl_t s_cdc_handle = NULL;
 static volatile uint64_t s_vfo_freq = 0;
+static volatile int s_mode = 0;
 
 // RX buffer for accumulating CAT response
 static char s_rx_buf[CAT_RX_BUF_SIZE];
@@ -31,7 +32,6 @@ static void process_cat_response(const char *resp, int len)
 {
     // FA command response: "FA00014070000;"
     if (len >= 14 && resp[0] == 'F' && resp[1] == 'A') {
-        // Parse 11-digit frequency string
         char freq_str[12];
         int flen = len - 3;  // skip "FA" and ";"
         if (flen > 11) flen = 11;
@@ -40,6 +40,13 @@ static void process_cat_response(const char *resp, int len)
         uint64_t freq = strtoull(freq_str, NULL, 10);
         if (freq > 0) {
             s_vfo_freq = freq;
+        }
+    }
+    // MD command response: "MD6;"
+    else if (len >= 3 && resp[0] == 'M' && resp[1] == 'D') {
+        int mode = resp[2] - '0';
+        if (mode >= 1 && mode <= 9) {
+            s_mode = mode;
         }
     }
 }
@@ -167,7 +174,7 @@ static void cat_poll_task(void *arg)
         }
 
         if (s_cdc_handle) {
-            esp_err_t err = cat_send("FA;");
+            esp_err_t err = cat_send("FA;MD;");
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "CAT send failed: %s", esp_err_to_name(err));
             }
@@ -204,4 +211,9 @@ void cat_host_start(void)
 uint64_t cat_get_vfo_freq(void)
 {
     return s_vfo_freq;
+}
+
+int cat_get_mode(void)
+{
+    return s_mode;
 }

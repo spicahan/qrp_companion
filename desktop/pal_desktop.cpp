@@ -87,6 +87,7 @@ namespace pal {
 // --- Desktop CAT forward declarations (defined below getVfoFreq) ---
 static int s_cat_fd = -1;
 static std::atomic<uint64_t> s_vfo_freq{0};
+static std::atomic<int> s_cat_mode{0};
 static std::thread s_cat_thread;
 static std::atomic<bool> s_cat_running{false};
 static void cat_thread_func();
@@ -210,7 +211,7 @@ static void cat_thread_func()
     int rx_pos = 0;
 
     while (s_cat_running && s_cat_fd >= 0) {
-        write(s_cat_fd, "FA;", 3);
+        write(s_cat_fd, "FA;MD;", 6);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         int n = read(s_cat_fd, rx_buf + rx_pos, sizeof(rx_buf) - rx_pos - 1);
@@ -223,8 +224,11 @@ static void cat_thread_func()
             for (char *p = rx_buf; p < rx_buf + rx_pos; p++) {
                 if (*p == ';') {
                     *p = '\0';
-                    if (p - start >= 13 && start[0] == 'F' && start[1] == 'A')
+                    int rlen = (int)(p - start);
+                    if (rlen >= 13 && start[0] == 'F' && start[1] == 'A')
                         s_vfo_freq.store(strtoull(start + 2, nullptr, 10));
+                    else if (rlen >= 3 && start[0] == 'M' && start[1] == 'D')
+                        s_cat_mode.store(start[2] - '0');
                     start = p + 1;
                 }
             }
@@ -247,6 +251,7 @@ static void cat_thread_func()
 }
 
 uint64_t getVfoFreq() { return s_vfo_freq.load(); }
+int getMode() { return s_cat_mode.load(); }
 
 void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
                uint16_t *dst, int dst_stride, int dst_x, int dst_y,

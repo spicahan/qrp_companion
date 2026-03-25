@@ -45,6 +45,7 @@ void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
 
 // CAT (Computer Aided Transceiver) control
 uint64_t getVfoFreq();  // Current VFO frequency in Hz, 0 if unknown
+int      getMode();     // Current mode: 1=LSB 2=USB 3=CW 6=DIGI, 0=unknown
 
 // Audio input (stereo 24-bit 48kHz, delivered as I/Q float pairs)
 // Callback is called from the audio thread.

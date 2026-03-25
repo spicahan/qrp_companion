@@ -113,6 +113,7 @@ int freeHeapKb() { return (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1
 int freePsramKb() { return (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024); }
 
 uint64_t getVfoFreq() { return cat_get_vfo_freq(); }
+int getMode() { return cat_get_mode(); }
 
 void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
                uint16_t *dst, int dst_stride, int dst_x, int dst_y,

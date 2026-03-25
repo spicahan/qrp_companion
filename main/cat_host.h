@@ -18,6 +18,10 @@ void cat_host_start(void);
 // Get the current VFO frequency in Hz. Returns 0 if not yet received.
 uint64_t cat_get_vfo_freq(void);
 
+// Get the current mode. Returns 0 if not yet received.
+// 1=LSB, 2=USB, 3=CW, 6=DIGI
+int cat_get_mode(void);
+
 #ifdef __cplusplus
 }
 #endif
