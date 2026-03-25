@@ -124,6 +124,12 @@ void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
                         (size_t)height * src_stride * sizeof(uint16_t),
                         ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
 
+        // Flush+invalidate destination so PPA DMA doesn't conflict with CPU cache
+        // This prevents stale CPU cache lines from overwriting PPA output on later flush
+        esp_cache_msync((void *)&dst[dst_y * dst_stride],
+                        (size_t)height * dst_stride * sizeof(uint16_t),
+                        ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+
         ppa_srm_oper_config_t srm_cfg = {};
         srm_cfg.in.buffer = src;
         srm_cfg.in.pic_w = src_stride;
@@ -149,7 +155,13 @@ void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
         srm_cfg.mode = PPA_TRANS_MODE_BLOCKING;
 
         esp_err_t err = ppa_do_scale_rotate_mirror(s_ppa_srm_client, &srm_cfg);
-        if (err == ESP_OK) return;
+        if (err == ESP_OK) {
+            // Invalidate destination cache so CPU sees PPA's DMA writes
+            esp_cache_msync((void *)&dst[dst_y * dst_stride],
+                            (size_t)height * dst_stride * sizeof(uint16_t),
+                            ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+            return;
+        }
         // Fall through to CPU copy on error
     }
 

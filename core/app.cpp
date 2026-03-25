@@ -113,6 +113,7 @@ static void draw_spectrum(const float *mag_db)
 
     // VFO marker (single column overwrite — fast, minimal flicker)
     draw::drawVLine(fb, g_vfo_x, spec_y, SPEC_H, COL_MARKER);
+
 }
 
 // Pre-computed bin index for each logical x pixel (avoids repeated bin_to_x + displayBin)
@@ -191,6 +192,9 @@ void app::init()
     log_h = info.height;
 
     wf_y = HEADER_H + GAP + SPEC_H + GAP;
+    // Align wf_y to 32-pixel (cache line) boundary to prevent PPA DMA
+    // cache invalidation from clobbering CPU-written spectrum data
+    wf_y = (wf_y + 31) & ~31;
     wf_h = log_h - wf_y - INFO_H;
 
     // Set up framebuffer context
@@ -276,13 +280,10 @@ void app::tick()
     }
 
     // --- Draw frame ---
-    // On first frame, clear entire screen
     static bool first_frame = true;
     if (first_frame) {
-        // Fill entire physical framebuffer with black
         int total = fb.rotated ? (fb.phys_w * fb.phys_h) : (fb.log_w * fb.log_h);
         for (int i = 0; i < total; i++) fb.buf[i] = COL_BLACK;
-        // Draw static backgrounds once
         draw::fillRect(fb, 0, 0, log_w, HEADER_H, COL_NAVY);
         draw::fillRect(fb, 0, HEADER_H, log_w, GAP, COL_BLACK);
         draw::fillRect(fb, 0, log_h - INFO_H, log_w, INFO_H, COL_DGREY);
