@@ -9,23 +9,66 @@ static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
     return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
 }
 
-static inline void fillRect(uint16_t *fb, int fb_w, int x, int y, int w, int h, uint16_t color)
+// --- Framebuffer context with optional 90° CW rotation ---
+// All draw functions take logical (landscape) coordinates.
+// If rotation is enabled, they transform to physical (portrait) coordinates.
+struct Framebuf {
+    uint16_t *buf;
+    int phys_w, phys_h;     // physical buffer dimensions
+    int log_w, log_h;       // logical (landscape) dimensions
+    bool rotated;            // true = 90° CW rotation
+
+    inline void setPixel(int lx, int ly, uint16_t color) const
+    {
+        if (rotated) {
+            // 90° CW: phys_x = log_y, phys_y = log_w - 1 - log_x
+            int px = ly;
+            int py = log_w - 1 - lx;
+            buf[py * phys_w + px] = color;
+        } else {
+            buf[ly * phys_w + lx] = color;
+        }
+    }
+};
+
+static inline void fillRect(const Framebuf &fb, int x, int y, int w, int h, uint16_t color)
 {
-    for (int row = y; row < y + h; row++) {
-        uint16_t *p = &fb[row * fb_w + x];
-        for (int i = 0; i < w; i++) p[i] = color;
+    if (!fb.rotated) {
+        for (int row = y; row < y + h; row++) {
+            uint16_t *p = &fb.buf[row * fb.phys_w + x];
+            for (int i = 0; i < w; i++) p[i] = color;
+        }
+    } else {
+        // Logical rect (x,y,w,h) → physical rect (y, log_w-1-x-w+1, h, w)
+        int px = y;
+        int py = fb.log_w - x - w;
+        int pw = h;
+        int ph = w;
+        for (int row = py; row < py + ph; row++) {
+            uint16_t *p = &fb.buf[row * fb.phys_w + px];
+            for (int i = 0; i < pw; i++) p[i] = color;
+        }
     }
 }
 
-static inline void drawRect(uint16_t *fb, int fb_w, int x, int y, int w, int h, uint16_t color)
+static inline void drawRect(const Framebuf &fb, int x, int y, int w, int h, uint16_t color)
 {
-    for (int i = x; i < x + w; i++) { fb[y * fb_w + i] = color; fb[(y+h-1) * fb_w + i] = color; }
-    for (int j = y; j < y + h; j++) { fb[j * fb_w + x] = color; fb[j * fb_w + x + w - 1] = color; }
+    // Top and bottom edges
+    for (int i = x; i < x + w; i++) { fb.setPixel(i, y, color); fb.setPixel(i, y+h-1, color); }
+    // Left and right edges
+    for (int j = y; j < y + h; j++) { fb.setPixel(x, j, color); fb.setPixel(x+w-1, j, color); }
 }
 
-static inline void drawVLine(uint16_t *fb, int fb_w, int x, int y, int h, uint16_t color)
+static inline void drawVLine(const Framebuf &fb, int x, int y, int h, uint16_t color)
 {
-    for (int i = 0; i < h; i++) fb[(y + i) * fb_w + x] = color;
+    if (!fb.rotated) {
+        for (int i = 0; i < h; i++) fb.buf[(y + i) * fb.phys_w + x] = color;
+    } else {
+        // Vertical line in landscape = horizontal line in portrait
+        int py = fb.log_w - 1 - x;
+        uint16_t *p = &fb.buf[py * fb.phys_w + y];
+        for (int i = 0; i < h; i++) p[i] = color;
+    }
 }
 
 // ---- Embedded 8x8 font (printable ASCII 32-126) ----
@@ -129,8 +172,8 @@ static const uint8_t font8x8[95][8] = {
     {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00}, // 126 '~'
 };
 
-static inline void drawChar(uint16_t *fb, int fb_w, int fb_h,
-                             int x, int y, char c, uint16_t fg, uint16_t bg, int scale = 1)
+static inline void drawChar(const Framebuf &fb, int x, int y, char c,
+                             uint16_t fg, uint16_t bg, int scale = 1)
 {
     if (c < 32 || c > 126) c = '?';
     const uint8_t *glyph = font8x8[c - 32];
@@ -140,25 +183,23 @@ static inline void drawChar(uint16_t *fb, int fb_w, int fb_h,
             uint16_t color = (bits & (1 << col)) ? fg : bg;
             for (int sy = 0; sy < scale; sy++) {
                 int py = y + row * scale + sy;
-                if (py < 0 || py >= fb_h) continue;
+                if (py < 0 || py >= fb.log_h) continue;
                 for (int sx = 0; sx < scale; sx++) {
                     int px = x + col * scale + sx;
-                    if (px < 0 || px >= fb_w) continue;
-                    fb[py * fb_w + px] = color;
+                    if (px < 0 || px >= fb.log_w) continue;
+                    fb.setPixel(px, py, color);
                 }
             }
         }
     }
 }
 
-static inline void drawText(uint16_t *fb, int fb_w, int fb_h,
-                             int x, int y, const char *text,
+static inline void drawText(const Framebuf &fb, int x, int y, const char *text,
                              uint16_t fg, uint16_t bg, int scale = 1)
 {
-    int cx = x;
     while (*text) {
-        drawChar(fb, fb_w, fb_h, cx, y, *text, fg, bg, scale);
-        cx += 8 * scale;
+        drawChar(fb, x, y, *text, fg, bg, scale);
+        x += 8 * scale;
         text++;
     }
 }

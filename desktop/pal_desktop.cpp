@@ -96,10 +96,9 @@ DisplayInfo getDisplayInfo()
     return { fb_w, fb_h };
 }
 
-uint16_t* getFramebuffer()
-{
-    return fb_buffer;
-}
+uint16_t* getFramebuffer() { return fb_buffer; }
+int getFramebufferStride() { return fb_w; }
+bool isRotated() { return false; }
 
 void commitFrame()
 {

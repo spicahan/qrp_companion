@@ -19,7 +19,9 @@ void shutdown();
 
 // Display
 DisplayInfo  getDisplayInfo();
-uint16_t*    getFramebuffer();   // logical landscape pixel buffer (RGB565)
+uint16_t*    getFramebuffer();   // raw pixel buffer (physical or logical depending on platform)
+int          getFramebufferStride(); // physical width of buffer
+bool         isRotated();        // true if display uses 90° CW rotation
 void         commitFrame();      // push framebuffer to screen
 
 // Input
