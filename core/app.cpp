@@ -311,11 +311,11 @@ void app::tick()
                 if (new_freq > 0) {
                     cat::setVfoFreq(new_freq);
                     snprintf(touch_text, sizeof(touch_text),
-                             "%+dHz -> %d.%03d.%03d",
+                             "%+dHz -> %d.%03d.%02d",
                              delta_hz,
                              (int)(new_freq / 1000000),
                              (int)((new_freq % 1000000) / 1000),
-                             (int)(new_freq % 1000));
+                             (int)((new_freq % 1000) / 10));
                 }
             } else if (drag_vfo_dirty && drag_start_freq > 0) {
                 // Final drag update
@@ -375,12 +375,12 @@ void app::tick()
     char buf[80];
     uint64_t vfo = cat::getVfoFreq();
     if (vfo > 0) {
-        int mhz = (int)(vfo / 1000000);
-        int khz = (int)((vfo % 1000000) / 1000);
-        int hz  = (int)(vfo % 1000);
-        snprintf(buf, sizeof(buf), "%-4s %d.%03d.%03d", cat::getModeStr(), mhz, khz, hz);
+        int mhz  = (int)(vfo / 1000000);
+        int khz  = (int)((vfo % 1000000) / 1000);
+        int hz10 = (int)((vfo % 1000) / 10);  // 10 Hz resolution
+        snprintf(buf, sizeof(buf), "%-4s %d.%03d.%02d", cat::getModeStr(), mhz, khz, hz10);
     } else {
-        snprintf(buf, sizeof(buf), "%-4s ---.---.---", cat::getModeStr());
+        snprintf(buf, sizeof(buf), "%-4s ---.---.--", cat::getModeStr());
     }
     // Pad to fixed 20 chars to overwrite any residuals
     int blen = strlen(buf);
