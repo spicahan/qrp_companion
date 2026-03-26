@@ -87,14 +87,14 @@ bool pollEvent(TouchEvent &evt)
     auto count = M5.Touch.getCount();
     if (count > 0) {
         auto detail = M5.Touch.getDetail(0);
+        int lx = log_w - 1 - detail.y;
+        int ly = detail.x;
         if (detail.wasPressed()) {
-            int lx = log_w - 1 - detail.y;
-            int ly = detail.x;
             evt_push({lx, ly, TouchEvent::DOWN});
+        } else if (detail.isPressed()) {
+            evt_push({lx, ly, TouchEvent::MOVE});
         }
         if (detail.wasReleased()) {
-            int lx = log_w - 1 - detail.y;
-            int ly = detail.x;
             evt_push({lx, ly, TouchEvent::UP});
         }
     }

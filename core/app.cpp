@@ -29,10 +29,15 @@ static int64_t fps_last_time;
 // Per-phase timing (ms)
 static float t_dsp_ms, t_spec_ms, t_wf_ms, t_hud_ms, t_commit_ms, t_total_ms;
 
-// Touch
+// Touch / drag-to-tune
 static int64_t touch_time;
 static int touch_x, touch_y;
 static char touch_text[64];
+static bool  dragging = false;
+static int   drag_start_x;          // screen X at touch DOWN
+static uint64_t drag_start_freq;    // VFO freq at touch DOWN
+static int   drag_current_x;        // latest drag X
+static bool  drag_vfo_dirty = false; // true if drag moved since last FFT sync
 
 // DSP
 static constexpr int SAMPLE_RATE = 48000;
@@ -273,40 +278,64 @@ void app::tick()
     }
     int64_t t_dsp = pal::micros();
 
-    // Poll touch events — touch-to-tune
+    // Poll touch events — touch/drag to tune
     pal::TouchEvent evt;
     while (pal::pollEvent(evt)) {
-        if (evt.action == pal::TouchEvent::DOWN) {
-            touch_x = evt.x;
-            touch_y = evt.y;
-            touch_time = t0;
+        touch_x = evt.x;
+        touch_y = evt.y;
+        touch_time = t0;
 
-            // Touch-to-tune: compute frequency delta from VFO marker
+        if (evt.action == pal::TouchEvent::DOWN) {
             uint64_t vfo = cat::getVfoFreq();
             if (vfo > 0) {
-                // Each pixel = SAMPLE_RATE / num_bins Hz
-                // Delta pixels from VFO marker (positive = higher freq)
+                // Click-to-tune: jump VFO to touched frequency
                 int delta_px = touch_x - g_vfo_x;
-                int hz_per_bin = SAMPLE_RATE / FFT_SIZE;
-                // Pixels per bin = log_w / num_bins
-                // Delta in bins = delta_px * num_bins / log_w
-                // Delta in Hz = delta_px * num_bins / log_w * hz_per_bin
-                //             = delta_px * SAMPLE_RATE / log_w
                 int delta_hz = delta_px * SAMPLE_RATE / log_w;
                 uint64_t new_freq = (int64_t)vfo + delta_hz;
-                if (new_freq > 0) {
+                if (new_freq > 0)
                     cat::setVfoFreq(new_freq);
-                    snprintf(touch_text, sizeof(touch_text),
-                             "%+dHz -> %d.%03d.%03d",
-                             delta_hz,
-                             (int)(new_freq / 1000000),
-                             (int)((new_freq % 1000000) / 1000),
-                             (int)(new_freq % 1000));
-                }
-            } else {
-                snprintf(touch_text, sizeof(touch_text), "Touch @(%d,%d)", touch_x, touch_y);
+
+                // Start drag from the VFO marker position (after jump)
+                dragging = true;
+                drag_start_x = touch_x;
+                drag_start_freq = new_freq > 0 ? new_freq : vfo;
+                drag_current_x = touch_x;
+                drag_vfo_dirty = false;
             }
         }
+        else if (evt.action == pal::TouchEvent::MOVE && dragging) {
+            drag_current_x = evt.x;
+            drag_vfo_dirty = true;
+        }
+        else if (evt.action == pal::TouchEvent::UP) {
+            if (dragging && drag_vfo_dirty) {
+                // Final drag update
+                int delta_px = drag_current_x - drag_start_x;
+                int delta_hz = -delta_px * SAMPLE_RATE / log_w;
+                uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
+                if (new_freq > 0)
+                    cat::setVfoFreq(new_freq);
+            }
+            dragging = false;
+            drag_vfo_dirty = false;
+        }
+    }
+
+    // Sync drag VFO update with FFT (throttle to FFT rate, not touch rate)
+    if (dragging && drag_vfo_dirty && new_spectrum) {
+        int delta_px = drag_current_x - drag_start_x;
+        int delta_hz = -delta_px * SAMPLE_RATE / log_w;
+        uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
+        if (new_freq > 0) {
+            cat::setVfoFreq(new_freq);
+            snprintf(touch_text, sizeof(touch_text),
+                     "%+dHz -> %d.%03d.%03d",
+                     delta_hz,
+                     (int)(new_freq / 1000000),
+                     (int)((new_freq % 1000000) / 1000),
+                     (int)(new_freq % 1000));
+        }
+        drag_vfo_dirty = false;
     }
 
     // --- Draw frame ---
