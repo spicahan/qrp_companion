@@ -278,7 +278,9 @@ void app::tick()
     }
     int64_t t_dsp = pal::micros();
 
-    // Poll touch events — touch/drag to tune
+    // Poll touch events — tap-to-tune (on release) + drag-to-tune
+    static constexpr int TAP_THRESHOLD = 5;  // pixels — below this is a tap, above is drag
+
     pal::TouchEvent evt;
     while (pal::pollEvent(evt)) {
         touch_x = evt.x;
@@ -286,29 +288,36 @@ void app::tick()
         touch_time = t0;
 
         if (evt.action == pal::TouchEvent::DOWN) {
-            uint64_t vfo = cat::getVfoFreq();
-            if (vfo > 0) {
-                // Click-to-tune: jump VFO to touched frequency
-                int delta_px = touch_x - g_vfo_x;
-                int delta_hz = delta_px * SAMPLE_RATE / log_w;
-                uint64_t new_freq = (int64_t)vfo + delta_hz;
-                if (new_freq > 0)
-                    cat::setVfoFreq(new_freq);
-
-                // Start drag from the VFO marker position (after jump)
-                dragging = true;
-                drag_start_x = touch_x;
-                drag_start_freq = new_freq > 0 ? new_freq : vfo;
-                drag_current_x = touch_x;
-                drag_vfo_dirty = false;
-            }
+            // Just record start — don't tune yet
+            dragging = true;
+            drag_start_x = evt.x;
+            drag_start_freq = cat::getVfoFreq();
+            drag_current_x = evt.x;
+            drag_vfo_dirty = false;
         }
         else if (evt.action == pal::TouchEvent::MOVE && dragging) {
             drag_current_x = evt.x;
             drag_vfo_dirty = true;
         }
-        else if (evt.action == pal::TouchEvent::UP) {
-            if (dragging && drag_vfo_dirty) {
+        else if (evt.action == pal::TouchEvent::UP && dragging) {
+            int total_drag = drag_current_x - drag_start_x;
+            if (total_drag < 0) total_drag = -total_drag;
+
+            if (total_drag < TAP_THRESHOLD && drag_start_freq > 0) {
+                // Tap-to-tune: jump VFO to tapped frequency (on release)
+                int delta_px = evt.x - g_vfo_x;
+                int delta_hz = delta_px * SAMPLE_RATE / log_w;
+                uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
+                if (new_freq > 0) {
+                    cat::setVfoFreq(new_freq);
+                    snprintf(touch_text, sizeof(touch_text),
+                             "%+dHz -> %d.%03d.%03d",
+                             delta_hz,
+                             (int)(new_freq / 1000000),
+                             (int)((new_freq % 1000000) / 1000),
+                             (int)(new_freq % 1000));
+                }
+            } else if (drag_vfo_dirty && drag_start_freq > 0) {
                 // Final drag update
                 int delta_px = drag_current_x - drag_start_x;
                 int delta_hz = -delta_px * SAMPLE_RATE / log_w;
@@ -322,7 +331,7 @@ void app::tick()
     }
 
     // Sync drag VFO update with FFT (throttle to FFT rate, not touch rate)
-    if (dragging && drag_vfo_dirty && new_spectrum) {
+    if (dragging && drag_vfo_dirty && new_spectrum && drag_start_freq > 0) {
         int delta_px = drag_current_x - drag_start_x;
         int delta_hz = -delta_px * SAMPLE_RATE / log_w;
         uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
