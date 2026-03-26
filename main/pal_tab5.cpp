@@ -80,7 +80,8 @@ void commitFrame()
                     ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
 }
 
-bool pollEvent(TouchEvent &evt)
+// Call once per frame to read touch hardware and queue events
+static void updateTouch()
 {
     M5.update();
 
@@ -98,12 +99,26 @@ bool pollEvent(TouchEvent &evt)
             evt_push({lx, ly, TouchEvent::UP});
         }
     }
+}
+
+// First call per frame reads hardware; subsequent calls only drain queue
+static bool s_touch_read_this_frame = false;
+
+bool pollEvent(TouchEvent &evt)
+{
+    if (!s_touch_read_this_frame) {
+        updateTouch();
+        s_touch_read_this_frame = true;
+    }
 
     if (evt_head != evt_tail) {
         evt = evt_queue[evt_tail];
         evt_tail = (evt_tail + 1) % EVT_QUEUE_SIZE;
         return true;
     }
+
+    // Queue drained — reset flag for next frame
+    s_touch_read_this_frame = false;
     return false;
 }
 

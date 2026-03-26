@@ -16,6 +16,7 @@ static int  s_rx_pos = 0;
 // Polling timer
 static int64_t s_last_poll = 0;
 static constexpr int64_t POLL_INTERVAL_US = 1000000; // 1 second
+static bool s_polling_suppressed = false;
 
 static void process_response(const char *resp, int len)
 {
@@ -64,8 +65,8 @@ void cat::poll()
 {
     int64_t now = pal::micros();
 
-    // Periodic polling
-    if (now - s_last_poll >= POLL_INTERVAL_US) {
+    // Periodic polling (suppressed during drag-to-tune)
+    if (!s_polling_suppressed && now - s_last_poll >= POLL_INTERVAL_US) {
         s_last_poll = now;
         if (pal::catIsConnected()) {
             // Query CW offset once when mode is CW and offset is unknown
@@ -110,6 +111,8 @@ const char* cat::getModeStr()
         default: return "---";
     }
 }
+
+void cat::suppressPolling(bool suppress) { s_polling_suppressed = suppress; }
 
 void cat::setVfoFreq(uint64_t freq_hz)
 {

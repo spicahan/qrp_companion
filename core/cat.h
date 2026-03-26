@@ -15,4 +15,7 @@ const char* getModeStr(); // "LSB", "USB", "CW", "DIGI", or "---"
 // Set VFO frequency (sends FA command)
 void setVfoFreq(uint64_t freq_hz);
 
+// Suppress periodic polling (e.g. during drag-to-tune)
+void suppressPolling(bool suppress);
+
 } // namespace cat

@@ -138,7 +138,7 @@ int cat_host_is_connected(void)
 int cat_host_send(const char *data, int len)
 {
     if (!s_cdc_handle) return -1;
-    esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_handle, (const uint8_t *)data, len, 500);
+    esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_handle, (const uint8_t *)data, len, 10);
     return (err == ESP_OK) ? len : -1;
 }
 

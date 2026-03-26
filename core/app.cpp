@@ -288,12 +288,12 @@ void app::tick()
         touch_time = t0;
 
         if (evt.action == pal::TouchEvent::DOWN) {
-            // Just record start — don't tune yet
             dragging = true;
             drag_start_x = evt.x;
             drag_start_freq = cat::getVfoFreq();
             drag_current_x = evt.x;
             drag_vfo_dirty = false;
+            cat::suppressPolling(true);
         }
         else if (evt.action == pal::TouchEvent::MOVE && dragging) {
             drag_current_x = evt.x;
@@ -327,6 +327,7 @@ void app::tick()
             }
             dragging = false;
             drag_vfo_dirty = false;
+            cat::suppressPolling(false);
         }
     }
 
