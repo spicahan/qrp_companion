@@ -9,32 +9,98 @@
 
 static int    g_sample_rate;
 static int    g_fft_size;
-static int    g_num_bins;       // = fft_size (full complex spectrum)
-static float *g_fft_data;       // 2 * fft_size interleaved complex
-static float *g_magnitude_db;   // fft_size elements (after fftshift)
+static int    g_num_bins;
+static float *g_fft_data;
+static float *g_magnitude_db;
 
 // Double-buffer for I/Q input (lock-free SPSC)
-// Each buffer holds fft_size frames × 2 floats (interleaved I/Q)
 static float *g_input_buf[2];
 static volatile int g_write_buf;
-static int          g_write_pos;    // in frames (not floats)
+static int          g_write_pos;
 static volatile int g_ready_buf;
 
-// fs/4 down-conversion mixer phase (persists across buffers)
+// fs/4 down-conversion mixer phase
 static int g_mix_phase;
+
+// --- FIR decimation: 48kHz → 6kHz ---
+static constexpr int DECIM_FACTOR = 8;
+static constexpr int FIR_TAPS = 65;
+static constexpr float FIR_CUTOFF_HZ = 2400.0f; // anti-aliasing for 6kHz output
+
+static float g_fir_coeffs[FIR_TAPS];
+static float g_fir_delay_i[FIR_TAPS]; // delay line for I channel
+static float g_fir_delay_q[FIR_TAPS]; // delay line for Q channel
+static int   g_fir_pos = 0;           // circular delay line position
+static int   g_decim_counter = 0;
+
+// Audio output buffer
+static constexpr int AUDIO_OUT_BUF_SIZE = 128;
+static float g_audio_out_buf[AUDIO_OUT_BUF_SIZE];
+static int   g_audio_out_pos = 0;
+static dsp::AudioOutCallback g_audio_out_cb = nullptr;
+
+// Design Hamming-windowed sinc lowpass FIR
+static void design_fir_lowpass(float *h, int N, float cutoff_hz, float sample_rate)
+{
+    float fc = cutoff_hz / sample_rate;
+    int M = (N - 1) / 2;
+    for (int n = 0; n < N; n++) {
+        float w = 0.54f - 0.46f * cosf(2.0f * (float)M_PI * n / (N - 1)); // Hamming
+        if (n == M) {
+            h[n] = 2.0f * fc * w;
+        } else {
+            float x = (float)(n - M);
+            h[n] = sinf(2.0f * (float)M_PI * fc * x) / ((float)M_PI * x) * w;
+        }
+    }
+    // Normalize for unity gain at DC
+    float sum = 0;
+    for (int n = 0; n < N; n++) sum += h[n];
+    if (sum > 0) for (int n = 0; n < N; n++) h[n] /= sum;
+}
+
+// Process one sample through FIR decimator, returns true if output is ready
+static bool fir_decimate_sample(float in_i, float in_q, float &out_i, float &out_q)
+{
+    // Insert into circular delay line
+    g_fir_delay_i[g_fir_pos] = in_i;
+    g_fir_delay_q[g_fir_pos] = in_q;
+    g_fir_pos = (g_fir_pos + 1) % FIR_TAPS;
+
+    g_decim_counter++;
+    if (g_decim_counter < DECIM_FACTOR)
+        return false;
+    g_decim_counter = 0;
+
+    // Compute FIR output (dot product with delay line)
+    float acc_i = 0, acc_q = 0;
+    int idx = g_fir_pos; // oldest sample
+    for (int k = 0; k < FIR_TAPS; k++) {
+        acc_i += g_fir_delay_i[idx] * g_fir_coeffs[k];
+        acc_q += g_fir_delay_q[idx] * g_fir_coeffs[k];
+        idx = (idx + 1) % FIR_TAPS;
+    }
+    out_i = acc_i;
+    out_q = acc_q;
+    return true;
+}
+
+static void flush_audio_out()
+{
+    if (g_audio_out_pos > 0 && g_audio_out_cb) {
+        g_audio_out_cb(g_audio_out_buf, g_audio_out_pos);
+        g_audio_out_pos = 0;
+    }
+}
 
 static void compute_spectrum()
 {
     dsps_fft2r_fc32(g_fft_data, g_fft_size);
     dsps_bit_rev_fc32(g_fft_data, g_fft_size);
 
-    // Compute magnitude in dB with fftshift:
-    // FFT output: bins [0..N/2-1] = DC to +fs/2, [N/2..N-1] = -fs/2 to DC
-    // After shift: output[0] = -fs/2, output[N/2] = DC, output[N-1] ≈ +fs/2
     const float scale = 1.0f / g_fft_size;
     int half = g_fft_size / 2;
     for (int i = 0; i < g_fft_size; i++) {
-        // fftshift: map output index i to FFT bin
         int bin = (i + half) % g_fft_size;
         float re = g_fft_data[2 * bin];
         float im = g_fft_data[2 * bin + 1];
@@ -47,11 +113,10 @@ void dsp::init(int sample_rate, int fft_size)
 {
     g_sample_rate  = sample_rate;
     g_fft_size     = fft_size;
-    g_num_bins     = fft_size;  // full complex spectrum
+    g_num_bins     = fft_size;
     g_fft_data     = new float[2 * fft_size];
     g_magnitude_db = new float[fft_size];
 
-    // Each input buffer holds fft_size I/Q frames = 2*fft_size floats
     g_input_buf[0] = new float[2 * fft_size];
     g_input_buf[1] = new float[2 * fft_size];
     memset(g_input_buf[0], 0, 2 * fft_size * sizeof(float));
@@ -61,11 +126,22 @@ void dsp::init(int sample_rate, int fft_size)
     g_ready_buf = -1;
     g_mix_phase = 0;
 
+    // Design anti-aliasing FIR for decimation
+    design_fir_lowpass(g_fir_coeffs, FIR_TAPS, FIR_CUTOFF_HZ, (float)sample_rate);
+    memset(g_fir_delay_i, 0, sizeof(g_fir_delay_i));
+    memset(g_fir_delay_q, 0, sizeof(g_fir_delay_q));
+    g_fir_pos = 0;
+    g_decim_counter = 0;
+    g_audio_out_pos = 0;
+
     dsps_fft2r_init_fc32(nullptr, fft_size);
 
     for (int i = 0; i < g_num_bins; i++)
         g_magnitude_db[i] = -120.0f;
 }
+
+void dsp::setAudioOutCallback(AudioOutCallback cb) { g_audio_out_cb = cb; }
+int  dsp::getDecimatedRate() { return g_sample_rate / DECIM_FACTOR; }
 
 void dsp::pushIQ(const float *iq, int num_frames)
 {
@@ -75,8 +151,7 @@ void dsp::pushIQ(const float *iq, int num_frames)
         float I = iq[2 * i];
         float Q = iq[2 * i + 1];
 
-        // fs/4 complex down-conversion: multiply by exp(-j*pi*n/2)
-        // Shifts +12kHz (VFO) to DC for downstream DSP processing
+        // fs/4 complex down-conversion
         float oI, oQ;
         switch (g_mix_phase) {
             case 0: oI =  I; oQ =  Q; break;
@@ -86,6 +161,7 @@ void dsp::pushIQ(const float *iq, int num_frames)
         }
         g_mix_phase = (g_mix_phase + 1) & 3;
 
+        // Feed to FFT buffer (full 48kHz rate)
         int pos = g_write_pos;
         buf[2 * pos]     = oI;
         buf[2 * pos + 1] = oQ;
@@ -98,6 +174,14 @@ void dsp::pushIQ(const float *iq, int num_frames)
             buf = g_input_buf[g_write_buf];
             g_write_pos = 0;
         }
+
+        // FIR decimate: 48kHz → 6kHz, output I stream to audio
+        float dec_i, dec_q;
+        if (fir_decimate_sample(oI, oQ, dec_i, dec_q)) {
+            g_audio_out_buf[g_audio_out_pos++] = dec_i;
+            if (g_audio_out_pos >= AUDIO_OUT_BUF_SIZE)
+                flush_audio_out();
+        }
     }
 }
 
@@ -108,9 +192,7 @@ bool dsp::processIfReady()
     g_ready_buf = -1;
     __sync_synchronize();
 
-    // Copy I/Q data directly to FFT buffer (already interleaved complex)
     memcpy(g_fft_data, g_input_buf[rb], 2 * g_fft_size * sizeof(float));
-
     compute_spectrum();
     return true;
 }
@@ -120,6 +202,5 @@ const float* dsp::getMagnitudeDb() { return g_magnitude_db; }
 
 int dsp::displayBin(int display_idx)
 {
-    // Virtual rotation: shift by 3N/4 to re-center from VFO to LO
     return (display_idx + 3 * g_fft_size / 4) % g_fft_size;
 }

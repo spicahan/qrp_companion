@@ -185,6 +185,12 @@ static void draw_waterfall()
     }
 }
 
+// Audio output callback — receives decimated mono samples from DSP, forwards to PAL
+static void audio_output_cb(const float *samples, int count)
+{
+    pal::audioOutputWrite(samples, count);
+}
+
 // Audio input callback — called from audio thread, pushes I/Q to DSP
 static void audio_input_cb(const float *iq_samples, int num_frames)
 {
@@ -232,6 +238,10 @@ void app::init()
     precompute_pixel_bin_map();
 
     // Open audio input (UAC on Tab5, PortAudio on desktop)
+    // Audio output (decimated 6kHz mono from DSP)
+    pal::audioOutputOpen(dsp::getDecimatedRate());
+    dsp::setAudioOutCallback(audio_output_cb);
+
     pal::audioInputOpen(audio_input_cb);
     cat::init();
 

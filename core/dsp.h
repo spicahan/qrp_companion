@@ -4,6 +4,12 @@ namespace dsp {
 
 void init(int sample_rate, int fft_size);
 
+// Audio output callback — receives decimated mono float samples at decimated_rate
+using AudioOutCallback = void(*)(const float *samples, int count);
+void setAudioOutCallback(AudioOutCallback cb);
+
+int getDecimatedRate();  // returns sample_rate / DECIM_FACTOR
+
 // Push I/Q sample pairs. iq is interleaved [I0,Q0,I1,Q1,...], num_frames pairs.
 // Thread-safe: can be called from a different task/thread than processIfReady().
 void pushIQ(const float *iq, int num_frames);

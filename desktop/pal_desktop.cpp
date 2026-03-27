@@ -268,6 +268,91 @@ void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
     }
 }
 
+// --- Audio output via PortAudio ---
+static PaStream *s_pa_out_stream = nullptr;
+static int s_audio_out_rate = 0;
+static constexpr int PA_OUT_RATE = 48000;
+
+// Ring buffer for audio output (6kHz input → 48kHz PortAudio output)
+static constexpr int AOUT_RING_SIZE = 8192;
+static float s_aout_ring[AOUT_RING_SIZE];
+static std::atomic<int> s_aout_head{0};
+static std::atomic<int> s_aout_tail{0};
+
+static int pa_output_callback(const void *, void *output,
+                              unsigned long frameCount,
+                              const PaStreamCallbackTimeInfo *,
+                              PaStreamCallbackFlags, void *)
+{
+    float *out = (float *)output;
+    int upsample = (s_audio_out_rate > 0) ? (PA_OUT_RATE / s_audio_out_rate) : 1;
+    int head = s_aout_head.load(std::memory_order_acquire);
+    int tail = s_aout_tail.load(std::memory_order_relaxed);
+
+    for (unsigned long i = 0; i < frameCount; i++) {
+        if ((i % upsample) == 0 && head != tail) {
+            // Advance to next input sample
+            tail = (tail + 1) % AOUT_RING_SIZE;
+        }
+        int idx = (tail == 0) ? AOUT_RING_SIZE - 1 : tail - 1;
+        if (idx < 0) idx = 0;
+        out[i] = (head != tail || i > 0) ? s_aout_ring[idx] : 0.0f;
+    }
+    s_aout_tail.store(tail, std::memory_order_release);
+    return paContinue;
+}
+
+bool audioOutputOpen(int sample_rate)
+{
+    s_audio_out_rate = sample_rate;
+    s_aout_head.store(0);
+    s_aout_tail.store(0);
+
+    PaStreamParameters params = {};
+    PaDeviceIndex dev = Pa_GetDefaultOutputDevice();
+    if (dev == paNoDevice) return false;
+
+    const PaDeviceInfo *info = Pa_GetDeviceInfo(dev);
+    params.device = dev;
+    params.channelCount = 1;
+    params.sampleFormat = paFloat32;
+    params.suggestedLatency = info->defaultLowOutputLatency;
+
+    PaError err = Pa_OpenStream(&s_pa_out_stream, nullptr, &params,
+                                PA_OUT_RATE, 256, paClipOff,
+                                pa_output_callback, nullptr);
+    if (err != paNoError) {
+        fprintf(stderr, "Pa_OpenStream (out) failed: %s\n", Pa_GetErrorText(err));
+        return false;
+    }
+    Pa_StartStream(s_pa_out_stream);
+    fprintf(stderr, "Audio output started: %dHz -> %dHz\n", sample_rate, PA_OUT_RATE);
+    return true;
+}
+
+void audioOutputWrite(const float *samples, int num_frames)
+{
+    int head = s_aout_head.load(std::memory_order_relaxed);
+    for (int i = 0; i < num_frames; i++) {
+        int next = (head + 1) % AOUT_RING_SIZE;
+        if (next == s_aout_tail.load(std::memory_order_acquire))
+            break; // ring full, drop
+        s_aout_ring[head] = samples[i];
+        head = next;
+    }
+    s_aout_head.store(head, std::memory_order_release);
+}
+
+void audioOutputClose()
+{
+    if (s_pa_out_stream) {
+        Pa_StopStream(s_pa_out_stream);
+        Pa_CloseStream(s_pa_out_stream);
+        s_pa_out_stream = nullptr;
+    }
+    s_audio_out_rate = 0;
+}
+
 // --- Audio input via PortAudio ---
 static PaStream *s_pa_stream = nullptr;
 static AudioInputCallback s_audio_cb = nullptr;

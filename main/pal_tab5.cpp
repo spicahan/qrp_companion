@@ -191,6 +191,43 @@ void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
     }
 }
 
+// Audio output via M5.Speaker
+static int s_audio_out_rate = 0;
+
+bool audioOutputOpen(int sample_rate)
+{
+    s_audio_out_rate = sample_rate;
+    M5.Speaker.setVolume(128);
+    return true;
+}
+
+void audioOutputWrite(const float *samples, int num_frames)
+{
+    if (s_audio_out_rate == 0 || num_frames <= 0) return;
+    // Convert float [-1,1] to int16 for playRaw
+    static int16_t buf[256];
+    int remaining = num_frames;
+    const float *p = samples;
+    while (remaining > 0) {
+        int chunk = remaining > 256 ? 256 : remaining;
+        for (int i = 0; i < chunk; i++) {
+            float s = p[i];
+            if (s > 1.0f) s = 1.0f;
+            if (s < -1.0f) s = -1.0f;
+            buf[i] = (int16_t)(s * 32767.0f);
+        }
+        M5.Speaker.playRaw(buf, chunk, s_audio_out_rate, false, 1, 0, false);
+        p += chunk;
+        remaining -= chunk;
+    }
+}
+
+void audioOutputClose()
+{
+    M5.Speaker.stop();
+    s_audio_out_rate = 0;
+}
+
 // Audio input via UAC host
 static AudioInputCallback s_audio_cb = nullptr;
 

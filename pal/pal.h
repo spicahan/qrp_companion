@@ -57,4 +57,9 @@ using AudioInputCallback = void(*)(const float *iq_samples, int num_frames);
 bool audioInputOpen(AudioInputCallback cb);
 void audioInputClose();
 
+// Audio output (mono, 24-bit quality, configurable sample rate)
+bool audioOutputOpen(int sample_rate);
+void audioOutputWrite(const float *samples, int num_frames); // mono float [-1,1]
+void audioOutputClose();
+
 } // namespace pal
