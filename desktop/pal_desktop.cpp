@@ -320,22 +320,28 @@ bool audioOutputOpen(int sample_rate)
     s_aout_head.store(0);
     s_aout_tail.store(0);
 
-    // Find a non-USB output device (avoid sending audio back to QMX)
+    // Find output device: prefer "Mac*", then first non-USB
     PaDeviceIndex dev = paNoDevice;
+    PaDeviceIndex fallback_dev = paNoDevice;
     int num_devices = Pa_GetDeviceCount();
     for (int i = 0; i < num_devices; i++) {
         const PaDeviceInfo *d = Pa_GetDeviceInfo(i);
         if (d && d->maxOutputChannels > 0) {
-            // Skip USB devices (likely QMX or other USB audio)
             const char *name = d->name;
             bool is_usb = (strstr(name, "USB") || strstr(name, "QMX") ||
                            strstr(name, "uac") || strstr(name, "UAC"));
-            fprintf(stderr, "Audio out device [%d]: %s (%d ch)%s\n",
-                    i, name, d->maxOutputChannels, is_usb ? " [USB-skip]" : "");
-            if (!is_usb && dev == paNoDevice)
+            bool is_mac = (strstr(name, "Mac") != nullptr);
+            fprintf(stderr, "Audio out device [%d]: %s (%d ch)%s%s\n",
+                    i, name, d->maxOutputChannels,
+                    is_usb ? " [USB-skip]" : "",
+                    is_mac ? " [preferred]" : "");
+            if (is_mac && dev == paNoDevice)
                 dev = i;
+            if (!is_usb && fallback_dev == paNoDevice)
+                fallback_dev = i;
         }
     }
+    if (dev == paNoDevice) dev = fallback_dev;
     if (dev == paNoDevice) {
         // Fallback to system default
         dev = Pa_GetDefaultOutputDevice();
