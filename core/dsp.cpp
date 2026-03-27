@@ -26,6 +26,16 @@ static int g_mix_phase;
 // CW offset NCO (shifts CW sidetone offset to DC after fs/4 mixer)
 static NcoState g_cw_nco;
 static bool g_cw_nco_active = false;
+static float g_cw_offset_hz = 0;
+
+// CW audio filter (300Hz complex LPF at decimated rate) + sidetone NCO
+static constexpr int CW_FIR_TAPS = 65;
+static constexpr float CW_FIR_CUTOFF_HZ = 150.0f; // ±150Hz = 300Hz BW
+static float g_cw_fir_coeffs[CW_FIR_TAPS];
+static float g_cw_fir_delay_i[CW_FIR_TAPS];
+static float g_cw_fir_delay_q[CW_FIR_TAPS];
+static int   g_cw_fir_pos = 0;
+static NcoState g_sidetone_nco;
 
 // --- FIR decimation: 48kHz → 6kHz ---
 static constexpr int DECIM_FACTOR = 8;
@@ -91,6 +101,24 @@ static bool fir_decimate_sample(float in_i, float in_q, float &out_i, float &out
     return true;
 }
 
+// Apply CW complex FIR to one I/Q sample (runs at decimated 6kHz rate)
+static void cw_fir_sample(float in_i, float in_q, float &out_i, float &out_q)
+{
+    g_cw_fir_delay_i[g_cw_fir_pos] = in_i;
+    g_cw_fir_delay_q[g_cw_fir_pos] = in_q;
+    g_cw_fir_pos = (g_cw_fir_pos + 1) % CW_FIR_TAPS;
+
+    float acc_i = 0, acc_q = 0;
+    int idx = g_cw_fir_pos;
+    for (int k = 0; k < CW_FIR_TAPS; k++) {
+        acc_i += g_cw_fir_delay_i[idx] * g_cw_fir_coeffs[k];
+        acc_q += g_cw_fir_delay_q[idx] * g_cw_fir_coeffs[k];
+        idx = (idx + 1) % CW_FIR_TAPS;
+    }
+    out_i = acc_i;
+    out_q = acc_q;
+}
+
 static void flush_audio_out()
 {
     if (g_audio_out_pos > 0 && g_audio_out_cb) {
@@ -145,6 +173,18 @@ void dsp::init(int sample_rate, int fft_size)
     g_cw_nco.phase = 0;
     g_cw_nco.inc = 0;
     g_cw_nco_active = false;
+    g_cw_offset_hz = 0;
+
+    // CW audio filter (runs at decimated rate)
+    float dec_rate = (float)sample_rate / DECIM_FACTOR;
+    design_fir_lowpass(g_cw_fir_coeffs, CW_FIR_TAPS, CW_FIR_CUTOFF_HZ, dec_rate);
+    memset(g_cw_fir_delay_i, 0, sizeof(g_cw_fir_delay_i));
+    memset(g_cw_fir_delay_q, 0, sizeof(g_cw_fir_delay_q));
+    g_cw_fir_pos = 0;
+
+    // Sidetone NCO (mix UP at decimated rate — set when CW offset is known)
+    g_sidetone_nco.phase = 0;
+    g_sidetone_nco.inc = 0;
 
     dsps_fft2r_init_fc32(nullptr, fft_size);
 
@@ -161,8 +201,15 @@ void dsp::setCwOffset(float offset_hz)
     if (offset_hz == 0.0f) {
         g_cw_nco_active = false;
         g_cw_nco.inc = 0;
+        g_sidetone_nco.inc = 0;
+        g_cw_offset_hz = 0;
     } else {
+        // Down-conversion NCO at 48kHz rate
         nco::setFreq(g_cw_nco, offset_hz, (float)g_sample_rate);
+        // Sidetone NCO at decimated rate (mix UP to create audible tone)
+        float dec_rate = (float)g_sample_rate / DECIM_FACTOR;
+        nco::setFreq(g_sidetone_nco, offset_hz, dec_rate);
+        g_cw_offset_hz = offset_hz;
         g_cw_nco_active = true;
     }
 }
@@ -207,14 +254,26 @@ void dsp::pushIQ(const float *iq, int num_frames)
             g_write_pos = 0;
         }
 
-        // FIR decimate: 48kHz → 6kHz, output I stream to audio with gain
+        // FIR decimate: 48kHz → 6kHz
         float dec_i, dec_q;
         if (fir_decimate_sample(oI, oQ, dec_i, dec_q)) {
-            float out = dec_i * g_audio_gain;
-            // Soft clip to [-1, 1]
-            if (out > 1.0f) out = 1.0f;
-            if (out < -1.0f) out = -1.0f;
-            g_audio_out_buf[g_audio_out_pos++] = out;
+            float audio;
+            if (g_cw_nco_active) {
+                // CW mode: 300Hz complex bandpass + sidetone NCO
+                float filt_i, filt_q;
+                cw_fir_sample(dec_i, dec_q, filt_i, filt_q);
+                // Mix UP by CW offset to create audible sidetone, take real part
+                float tone_i, tone_q;
+                nco::mixUp(g_sidetone_nco, filt_i, filt_q, tone_i, tone_q);
+                audio = tone_i;
+            } else {
+                // Non-CW: raw I stream
+                audio = dec_i;
+            }
+            audio *= g_audio_gain;
+            if (audio > 1.0f) audio = 1.0f;
+            if (audio < -1.0f) audio = -1.0f;
+            g_audio_out_buf[g_audio_out_pos++] = audio;
             if (g_audio_out_pos >= AUDIO_OUT_BUF_SIZE)
                 flush_audio_out();
         }

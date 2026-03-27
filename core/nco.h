@@ -20,6 +20,10 @@ void setFreq(NcoState &s, float freq_hz, float sample_rate);
 // Shifts frequency DOWN by freq_hz. Advances phase by one sample.
 void mixDown(NcoState &s, float in_i, float in_q, float &out_i, float &out_q);
 
+// Complex mix: multiply (in_i + j*in_q) by exp(+j*2π*f*n/fs)
+// Shifts frequency UP by freq_hz. Advances phase by one sample.
+void mixUp(NcoState &s, float in_i, float in_q, float &out_i, float &out_q);
+
 // Get sin/cos pair at current phase (for external use). Advances phase.
 void sincos(NcoState &s, float &sin_val, float &cos_val);
 

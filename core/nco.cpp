@@ -84,6 +84,20 @@ void nco::mixDown(NcoState &s, float in_i, float in_q, float &out_i, float &out_
     s.phase += s.inc;
 }
 
+void nco::mixUp(NcoState &s, float in_i, float in_q, float &out_i, float &out_q)
+{
+    float sin_val = sin_from_phase(s.phase);
+    float cos_val = sin_from_phase(s.phase + (1ULL << 62));
+
+    // Complex multiply by exp(+j*phase): (I + jQ) * (cos + j*sin)
+    //   out_I = I*cos - Q*sin
+    //   out_Q = I*sin + Q*cos
+    out_i = in_i * cos_val - in_q * sin_val;
+    out_q = in_i * sin_val + in_q * cos_val;
+
+    s.phase += s.inc;
+}
+
 void nco::sincos(NcoState &s, float &sin_val, float &cos_val)
 {
     sin_val = sin_from_phase(s.phase);
