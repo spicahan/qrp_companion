@@ -451,8 +451,8 @@ void dsp::pushIQ(const float *iq, int num_frames)
                         audio = di;
                     }
                     audio *= g_audio_gain;
-                    if (audio > 1.0f) audio = 1.0f;
-                    if (audio < -1.0f) audio = -1.0f;
+                    // Soft saturation (tanh) instead of hard clip
+                    audio = tanhf(audio);
                     g_audio_out_buf[g_audio_out_pos++] = audio;
                     if (g_audio_out_pos >= AUDIO_OUT_BUF_SIZE)
                         flush_audio_out();

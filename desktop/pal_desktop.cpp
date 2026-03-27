@@ -291,30 +291,31 @@ static int pa_output_callback(const void *, void *output,
     int upsample = (s_audio_out_rate > 0) ? (PA_OUT_RATE / s_audio_out_rate) : 8;
     int head = s_aout_head.load(std::memory_order_acquire);
     int tail = s_aout_tail.load(std::memory_order_relaxed);
-    static float last_sample = 0.0f;
+    static float prev_sample = 0.0f;
+    static float cur_sample = 0.0f;
     static int phase = 0;
-    bool had_data = false;
 
     for (unsigned long i = 0; i < frameCount; i++) {
         if (phase == 0) {
+            prev_sample = cur_sample;
             if (head != tail) {
-                last_sample = s_aout_ring[tail];
+                cur_sample = s_aout_ring[tail];
                 tail = (tail + 1) % AOUT_RING_SIZE;
-                had_data = true;
             } else {
                 s_cb_underrun++;
             }
         }
-        out[i] = last_sample;
+        // Linear interpolation between prev and current sample
+        float t = (float)phase / (float)upsample;
+        out[i] = prev_sample + (cur_sample - prev_sample) * t;
         phase = (phase + 1) % upsample;
     }
     s_aout_tail.store(tail, std::memory_order_release);
     s_cb_call_count++;
 
-    // Debug: print every ~1s (48000/256 = 187 callbacks/sec)
     if ((s_cb_call_count % 187) == 0) {
-        fprintf(stderr, "PA-CB: calls=%d underrun=%d last=%.6f\n",
-                s_cb_call_count, s_cb_underrun, last_sample);
+        fprintf(stderr, "PA-CB: calls=%d underrun=%d\n",
+                s_cb_call_count, s_cb_underrun);
     }
     return paContinue;
 }
@@ -346,7 +347,7 @@ bool audioOutputOpen(int sample_rate)
             const char *name = d->name;
             bool is_usb = (strstr(name, "USB") || strstr(name, "QMX") ||
                            strstr(name, "uac") || strstr(name, "UAC"));
-            bool is_mac = (strstr(name, "Mac") != nullptr);
+            bool is_mac = (strstr(name, "Ext") != nullptr);
             fprintf(stderr, "Audio out device [%d]: %s (%d ch)%s%s\n",
                     i, name, d->maxOutputChannels,
                     is_usb ? " [USB-skip]" : "",
