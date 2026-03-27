@@ -174,9 +174,10 @@ void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
         esp_err_t err = ppa_do_scale_rotate_mirror(s_ppa_srm_client, &srm_cfg);
         if (err == ESP_OK) {
             // Invalidate destination cache so CPU sees PPA's DMA writes
+            // Note: M2C direction doesn't allow UNALIGNED flag on ESP32-P4
             esp_cache_msync((void *)&dst[dst_y * dst_stride],
                             (size_t)height * dst_stride * sizeof(uint16_t),
-                            ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+                            ESP_CACHE_MSYNC_FLAG_DIR_M2C);
             return;
         }
         // Fall through to CPU copy on error

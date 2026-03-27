@@ -28,10 +28,10 @@ void nco::init()
 
 void nco::setFreq(NcoState &s, float freq_hz, float sample_rate)
 {
-    // phase_inc = round((f / fs) * 2^64)
-    long double num = (long double)freq_hz * (long double)(1ULL << 63) * 2.0L;
-    long double den = (long double)sample_rate;
-    s.inc = (uint64_t)llroundl(num / den);
+    // phase_inc = (f / fs) * 2^64, using double (not long double — RISC-V has
+    // no hardware long double, causing stack overflow from software emulation)
+    double ratio = (double)freq_hz / (double)sample_rate;
+    s.inc = (uint64_t)(ratio * 18446744073709551616.0);  // 2^64 is exact in double
 }
 
 // Quarter-wave LUT + LERP: returns sin(phase) as float [-1, 1]
