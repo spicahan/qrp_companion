@@ -43,8 +43,11 @@ static constexpr float GOERTZEL_BIN_HZ = 10.0f; // 10Hz per bin
 static constexpr float GOERTZEL_DURATION_S = 3.0f;
 
 struct GoertzelBin {
-    float coeff;  // 2*cos(2*pi*f/fs)
-    float s1, s2;
+    float coeff;    // 2*cos(2*pi*f/fs)
+    float cos_k;    // cos(2*pi*f/fs) — needed for final power calculation
+    float sin_k;    // sin(2*pi*f/fs) — needed for complex power
+    float s1_re, s1_im;  // complex state
+    float s2_re, s2_im;
 };
 
 static GoertzelBin g_goertzel[GOERTZEL_BINS];
@@ -249,9 +252,12 @@ void dsp::startGoertzel()
     // Initialize 31 bins: -150, -140, ..., 0, ..., +140, +150 Hz
     for (int i = 0; i < GOERTZEL_BINS; i++) {
         float freq = (i - GOERTZEL_BINS / 2) * GOERTZEL_BIN_HZ;
-        g_goertzel[i].coeff = 2.0f * cosf(2.0f * (float)M_PI * freq / dec_rate);
-        g_goertzel[i].s1 = 0;
-        g_goertzel[i].s2 = 0;
+        float w = 2.0f * (float)M_PI * freq / dec_rate;
+        g_goertzel[i].coeff = 2.0f * cosf(w);
+        g_goertzel[i].cos_k = cosf(w);
+        g_goertzel[i].sin_k = sinf(w);
+        g_goertzel[i].s1_re = g_goertzel[i].s1_im = 0;
+        g_goertzel[i].s2_re = g_goertzel[i].s2_im = 0;
     }
     g_goertzel_running = true;
 }
@@ -347,27 +353,30 @@ void dsp::pushIQ(const float *iq, int num_frames)
                         float filt_i, filt_q;
                         cw_fir_sample(di, dq, filt_i, filt_q);
 
-                        // Feed CW-filtered I/Q to Goertzel detector
+                        // Feed CW-filtered complex I/Q to Goertzel detector
                         if (g_goertzel_running) {
                             for (int b = 0; b < GOERTZEL_BINS; b++) {
-                                // Goertzel on complex input: use magnitude
-                                // Feed real part of complex signal rotated to bin freq
-                                // Simplified: run Goertzel on I, sufficient for energy detection
-                                float s0 = filt_i + g_goertzel[b].coeff * g_goertzel[b].s1
-                                           - g_goertzel[b].s2;
-                                g_goertzel[b].s2 = g_goertzel[b].s1;
-                                g_goertzel[b].s1 = s0;
+                                // Complex Goertzel: same recursion on I and Q independently
+                                float c = g_goertzel[b].coeff;
+                                float s0_re = filt_i + c * g_goertzel[b].s1_re - g_goertzel[b].s2_re;
+                                float s0_im = filt_q + c * g_goertzel[b].s1_im - g_goertzel[b].s2_im;
+                                g_goertzel[b].s2_re = g_goertzel[b].s1_re;
+                                g_goertzel[b].s2_im = g_goertzel[b].s1_im;
+                                g_goertzel[b].s1_re = s0_re;
+                                g_goertzel[b].s1_im = s0_im;
                             }
                             g_goertzel_count++;
                             if (g_goertzel_count >= g_goertzel_target) {
-                                // Find peak bin
+                                // Compute complex DFT power per bin, find peak
                                 float max_power = -1;
-                                int max_bin = GOERTZEL_BINS / 2; // default: DC
+                                int max_bin = GOERTZEL_BINS / 2;
                                 for (int b = 0; b < GOERTZEL_BINS; b++) {
-                                    float s1 = g_goertzel[b].s1;
-                                    float s2 = g_goertzel[b].s2;
-                                    float c  = g_goertzel[b].coeff;
-                                    float power = s1*s1 + s2*s2 - c*s1*s2;
+                                    float ck = g_goertzel[b].cos_k;
+                                    float sk = g_goertzel[b].sin_k;
+                                    // X = s1 - s2 * exp(-j*w) for both re/im
+                                    float xr = g_goertzel[b].s1_re - g_goertzel[b].s2_re*ck + g_goertzel[b].s2_im*sk;
+                                    float xi = g_goertzel[b].s1_im - g_goertzel[b].s2_im*ck - g_goertzel[b].s2_re*sk;
+                                    float power = xr*xr + xi*xi;
                                     if (power > max_power) {
                                         max_power = power;
                                         max_bin = b;
