@@ -37,6 +37,22 @@ static float g_cw_fir_delay_q[CW_FIR_TAPS];
 static int   g_cw_fir_pos = 0;
 static NcoState g_sidetone_nco;
 
+// Goertzel fine-tune detector
+static constexpr int GOERTZEL_BINS = 31;       // -150Hz to +150Hz
+static constexpr float GOERTZEL_BIN_HZ = 10.0f; // 10Hz per bin
+static constexpr float GOERTZEL_DURATION_S = 3.0f;
+
+struct GoertzelBin {
+    float coeff;  // 2*cos(2*pi*f/fs)
+    float s1, s2;
+};
+
+static GoertzelBin g_goertzel[GOERTZEL_BINS];
+static int g_goertzel_count = 0;    // samples collected
+static int g_goertzel_target = 0;   // total samples to collect
+static bool g_goertzel_running = false;
+static float g_goertzel_result = 0; // peak freq offset in Hz
+
 // --- FIR decimation stages ---
 static constexpr int FIR_TAPS = 65;
 
@@ -223,6 +239,27 @@ void dsp::setAudioOutCallback(AudioOutCallback cb) { g_audio_out_cb = cb; }
 int  dsp::getDecimatedRate() { return g_sample_rate / 8; }  // audio always at ↓8
 void dsp::setAudioGain(float gain) { g_audio_gain = gain; }
 
+void dsp::startGoertzel()
+{
+    float dec_rate = (float)g_sample_rate / 8;  // 6kHz
+    g_goertzel_target = (int)(dec_rate * GOERTZEL_DURATION_S);
+    g_goertzel_count = 0;
+    g_goertzel_result = 0;
+
+    // Initialize 31 bins: -150, -140, ..., 0, ..., +140, +150 Hz
+    for (int i = 0; i < GOERTZEL_BINS; i++) {
+        float freq = (i - GOERTZEL_BINS / 2) * GOERTZEL_BIN_HZ;
+        g_goertzel[i].coeff = 2.0f * cosf(2.0f * (float)M_PI * freq / dec_rate);
+        g_goertzel[i].s1 = 0;
+        g_goertzel[i].s2 = 0;
+    }
+    g_goertzel_running = true;
+}
+
+bool dsp::isGoertzelRunning() { return g_goertzel_running; }
+float dsp::getGoertzelResult() { return g_goertzel_result; }
+void dsp::clearGoertzelResult() { g_goertzel_result = 0; }
+
 void dsp::setCwOffset(float offset_hz)
 {
     if (offset_hz == 0.0f) {
@@ -309,6 +346,38 @@ void dsp::pushIQ(const float *iq, int num_frames)
                     if (g_cw_nco_active) {
                         float filt_i, filt_q;
                         cw_fir_sample(di, dq, filt_i, filt_q);
+
+                        // Feed CW-filtered I/Q to Goertzel detector
+                        if (g_goertzel_running) {
+                            for (int b = 0; b < GOERTZEL_BINS; b++) {
+                                // Goertzel on complex input: use magnitude
+                                // Feed real part of complex signal rotated to bin freq
+                                // Simplified: run Goertzel on I, sufficient for energy detection
+                                float s0 = filt_i + g_goertzel[b].coeff * g_goertzel[b].s1
+                                           - g_goertzel[b].s2;
+                                g_goertzel[b].s2 = g_goertzel[b].s1;
+                                g_goertzel[b].s1 = s0;
+                            }
+                            g_goertzel_count++;
+                            if (g_goertzel_count >= g_goertzel_target) {
+                                // Find peak bin
+                                float max_power = -1;
+                                int max_bin = GOERTZEL_BINS / 2; // default: DC
+                                for (int b = 0; b < GOERTZEL_BINS; b++) {
+                                    float s1 = g_goertzel[b].s1;
+                                    float s2 = g_goertzel[b].s2;
+                                    float c  = g_goertzel[b].coeff;
+                                    float power = s1*s1 + s2*s2 - c*s1*s2;
+                                    if (power > max_power) {
+                                        max_power = power;
+                                        max_bin = b;
+                                    }
+                                }
+                                g_goertzel_result = (max_bin - GOERTZEL_BINS / 2) * GOERTZEL_BIN_HZ;
+                                g_goertzel_running = false;
+                            }
+                        }
+
                         float tone_i, tone_q;
                         nco::mixUp(g_sidetone_nco, filt_i, filt_q, tone_i, tone_q);
                         audio = tone_i;

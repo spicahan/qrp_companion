@@ -293,6 +293,27 @@ void app::tick()
     }
     if (g_vfo_x >= log_w) g_vfo_x = log_w - 1;
 
+    // --- Goertzel fine-tune result ---
+    if (!dsp::isGoertzelRunning() && dsp::getGoertzelResult() != 0) {
+        float offset = dsp::getGoertzelResult();
+        dsp::clearGoertzelResult();
+        uint64_t vfo = cat::getVfoFreq();
+        if (vfo > 0) {
+            int delta = ((int)offset / 10) * 10;  // round to 10Hz
+            if (delta != 0) {
+                uint64_t new_freq = (int64_t)vfo + delta;
+                cat::setVfoFreq(new_freq);
+                snprintf(touch_text, sizeof(touch_text),
+                         "Fine %+dHz -> %d.%03d.%02d",
+                         delta,
+                         (int)(new_freq / 1000000),
+                         (int)((new_freq % 1000000) / 1000),
+                         (int)((new_freq % 1000) / 10));
+                touch_time = t0;
+            }
+        }
+    }
+
     // --- DSP ---
     bool new_spectrum = dsp::processIfReady();
     if (new_spectrum) {
@@ -348,7 +369,7 @@ void app::tick()
             if (total_drag < 0) total_drag = -total_drag;
 
             if (total_drag < TAP_THRESHOLD && drag_start_freq > 0) {
-                // Tap-to-tune: jump VFO to tapped frequency (on release)
+                // Tap-to-tune: coarse jump VFO to tapped frequency
                 int delta_px = evt.x - g_vfo_x;
                 int delta_hz = delta_px * dsp::getSpanRate() / log_w;
                 uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
@@ -360,6 +381,9 @@ void app::tick()
                              (int)(new_freq / 1000000),
                              (int)((new_freq % 1000000) / 1000),
                              (int)((new_freq % 1000) / 10));
+                    // In CW mode, start Goertzel fine-tune
+                    if (cat::getMode() == 3)
+                        dsp::startGoertzel();
                 }
             } else if (drag_vfo_dirty && drag_start_freq > 0) {
                 // Final drag update
