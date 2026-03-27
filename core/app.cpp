@@ -281,6 +281,18 @@ void app::tick()
         last_cw_offset = cur_cw_offset;
     }
 
+    // Update VFO marker position based on span
+    if (dsp::getSpan() == 0) {
+        // 48kHz span: VFO at 3/4 (+ CW offset shift)
+        g_vfo_x = log_w * 3 / 4;
+        if (cur_mode == 3 && cur_cw_offset > 0)
+            g_vfo_x += cur_cw_offset * log_w / SAMPLE_RATE;
+    } else {
+        // Narrow spans: VFO at center (DC after all NCOs)
+        g_vfo_x = log_w / 2;
+    }
+    if (g_vfo_x >= log_w) g_vfo_x = log_w - 1;
+
     // --- DSP ---
     bool new_spectrum = dsp::processIfReady();
     if (new_spectrum) {
@@ -313,6 +325,13 @@ void app::tick()
         touch_time = t0;
 
         if (evt.action == pal::TouchEvent::DOWN) {
+            // Check if tap is in header area (span button)
+            if (evt.y < HEADER_H && evt.x < 120) {
+                // Toggle span
+                dsp::setSpan((dsp::getSpan() + 1) % dsp::NUM_SPANS);
+                precompute_pixel_bin_map();  // remap bins for new span
+                continue;
+            }
             dragging = true;
             drag_start_x = evt.x;
             drag_start_freq = cat::getVfoFreq();
@@ -331,7 +350,7 @@ void app::tick()
             if (total_drag < TAP_THRESHOLD && drag_start_freq > 0) {
                 // Tap-to-tune: jump VFO to tapped frequency (on release)
                 int delta_px = evt.x - g_vfo_x;
-                int delta_hz = delta_px * SAMPLE_RATE / log_w;
+                int delta_hz = delta_px * dsp::getSpanRate() / log_w;
                 uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
                 if (new_freq > 0) {
                     cat::setVfoFreq(new_freq);
@@ -345,7 +364,7 @@ void app::tick()
             } else if (drag_vfo_dirty && drag_start_freq > 0) {
                 // Final drag update
                 int delta_px = drag_current_x - drag_start_x;
-                int delta_hz = -delta_px * SAMPLE_RATE / log_w;
+                int delta_hz = -delta_px * dsp::getSpanRate() / log_w;
                 uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
                 if (new_freq > 0)
                     cat::setVfoFreq(new_freq);
@@ -359,7 +378,7 @@ void app::tick()
     // Sync drag VFO update with FFT (throttle to FFT rate, not touch rate)
     if (dragging && drag_vfo_dirty && new_spectrum && drag_start_freq > 0) {
         int delta_px = drag_current_x - drag_start_x;
-        int delta_hz = -delta_px * SAMPLE_RATE / log_w;
+        int delta_hz = -delta_px * dsp::getSpanRate() / log_w;
         uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
         if (new_freq > 0) {
             cat::setVfoFreq(new_freq);
@@ -393,8 +412,10 @@ void app::tick()
     draw_waterfall();
     int64_t t_wf = pal::micros();
 
-    // HUD text
-    draw::drawText(fb, 8, 6, "QRP", COL_WHITE, COL_NAVY, 2);
+    // HUD text — span button on left (fixed width to avoid residuals)
+    char span_btn[16];
+    snprintf(span_btn, sizeof(span_btn), "%-9s", dsp::getSpanLabel());
+    draw::drawText(fb, 8, 6, span_btn, COL_CYAN, COL_NAVY, 2);
 
     // Mode + VFO frequency centered in header (fixed width to avoid residuals)
     char buf[80];

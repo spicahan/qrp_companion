@@ -37,16 +37,39 @@ static float g_cw_fir_delay_q[CW_FIR_TAPS];
 static int   g_cw_fir_pos = 0;
 static NcoState g_sidetone_nco;
 
-// --- FIR decimation: 48kHz → 6kHz ---
-static constexpr int DECIM_FACTOR = 8;
+// --- FIR decimation stages ---
 static constexpr int FIR_TAPS = 65;
-static constexpr float FIR_CUTOFF_HZ = 2400.0f; // anti-aliasing for 6kHz output
 
-static float g_fir_coeffs[FIR_TAPS];
-static float g_fir_delay_i[FIR_TAPS]; // delay line for I channel
-static float g_fir_delay_q[FIR_TAPS]; // delay line for Q channel
-static int   g_fir_pos = 0;           // circular delay line position
-static int   g_decim_counter = 0;
+// Span configurations: decim factor, FIR cutoff, label
+struct SpanDef {
+    int decim;
+    float cutoff_hz;
+    const char *label;
+    int display_rotation;  // displayBin rotation (in bins, relative to N)
+};
+static const SpanDef g_spans[dsp::NUM_SPANS] = {
+    { 1,     0, "48k",  0 },   // no extra decimation, use 48kHz stream directly
+    { 2, 10000, "+/-12k", 0 },
+    { 4,  5000, "+/-6k",  0 },
+    { 8,  2400, "+/-3k",  0 },
+};
+static int g_cur_span = 0;
+
+// Per-stage FIR decimator state (stages for ↓2, ↓4, ↓8)
+// Index 0=↓2, 1=↓4, 2=↓8. Stage 0 (48k) has no FIR.
+static constexpr int NUM_DECIM_STAGES = 3;
+struct FirDecimState {
+    float coeffs[FIR_TAPS];
+    float delay_i[FIR_TAPS];
+    float delay_q[FIR_TAPS];
+    int pos;
+    int counter;
+    int decim;
+};
+static FirDecimState g_decim[NUM_DECIM_STAGES];
+
+// Audio output uses the ↓8 stage (index 2) regardless of display span
+static constexpr int AUDIO_DECIM_IDX = 2;
 
 // Audio output buffer
 static constexpr int AUDIO_OUT_BUF_SIZE = 128;
@@ -75,25 +98,23 @@ static void design_fir_lowpass(float *h, int N, float cutoff_hz, float sample_ra
     if (sum > 0) for (int n = 0; n < N; n++) h[n] /= sum;
 }
 
-// Process one sample through FIR decimator, returns true if output is ready
-static bool fir_decimate_sample(float in_i, float in_q, float &out_i, float &out_q)
+// Process one sample through a FIR decimator stage, returns true if output ready
+static bool fir_decimate_sample(FirDecimState &s, float in_i, float in_q,
+                                float &out_i, float &out_q)
 {
-    // Insert into circular delay line
-    g_fir_delay_i[g_fir_pos] = in_i;
-    g_fir_delay_q[g_fir_pos] = in_q;
-    g_fir_pos = (g_fir_pos + 1) % FIR_TAPS;
+    s.delay_i[s.pos] = in_i;
+    s.delay_q[s.pos] = in_q;
+    s.pos = (s.pos + 1) % FIR_TAPS;
 
-    g_decim_counter++;
-    if (g_decim_counter < DECIM_FACTOR)
-        return false;
-    g_decim_counter = 0;
+    s.counter++;
+    if (s.counter < s.decim) return false;
+    s.counter = 0;
 
-    // Compute FIR output (dot product with delay line)
     float acc_i = 0, acc_q = 0;
-    int idx = g_fir_pos; // oldest sample
+    int idx = s.pos;
     for (int k = 0; k < FIR_TAPS; k++) {
-        acc_i += g_fir_delay_i[idx] * g_fir_coeffs[k];
-        acc_q += g_fir_delay_q[idx] * g_fir_coeffs[k];
+        acc_i += s.delay_i[idx] * s.coeffs[k];
+        acc_q += s.delay_q[idx] * s.coeffs[k];
         idx = (idx + 1) % FIR_TAPS;
     }
     out_i = acc_i;
@@ -160,12 +181,18 @@ void dsp::init(int sample_rate, int fft_size)
     g_ready_buf = -1;
     g_mix_phase = 0;
 
-    // Design anti-aliasing FIR for decimation
-    design_fir_lowpass(g_fir_coeffs, FIR_TAPS, FIR_CUTOFF_HZ, (float)sample_rate);
-    memset(g_fir_delay_i, 0, sizeof(g_fir_delay_i));
-    memset(g_fir_delay_q, 0, sizeof(g_fir_delay_q));
-    g_fir_pos = 0;
-    g_decim_counter = 0;
+    // Initialize FIR decimation stages: ↓2, ↓4, ↓8
+    int decim_factors[NUM_DECIM_STAGES] = {2, 4, 8};
+    float cutoffs[NUM_DECIM_STAGES] = {10000.0f, 5000.0f, 2400.0f};
+    for (int i = 0; i < NUM_DECIM_STAGES; i++) {
+        g_decim[i].decim = decim_factors[i];
+        g_decim[i].pos = 0;
+        g_decim[i].counter = 0;
+        memset(g_decim[i].delay_i, 0, sizeof(g_decim[i].delay_i));
+        memset(g_decim[i].delay_q, 0, sizeof(g_decim[i].delay_q));
+        design_fir_lowpass(g_decim[i].coeffs, FIR_TAPS, cutoffs[i], (float)sample_rate);
+    }
+    g_cur_span = 0;
     g_audio_out_pos = 0;
 
     // NCO init
@@ -176,7 +203,7 @@ void dsp::init(int sample_rate, int fft_size)
     g_cw_offset_hz = 0;
 
     // CW audio filter (runs at decimated rate)
-    float dec_rate = (float)sample_rate / DECIM_FACTOR;
+    float dec_rate = (float)sample_rate / 8;
     design_fir_lowpass(g_cw_fir_coeffs, CW_FIR_TAPS, CW_FIR_CUTOFF_HZ, dec_rate);
     memset(g_cw_fir_delay_i, 0, sizeof(g_cw_fir_delay_i));
     memset(g_cw_fir_delay_q, 0, sizeof(g_cw_fir_delay_q));
@@ -193,7 +220,7 @@ void dsp::init(int sample_rate, int fft_size)
 }
 
 void dsp::setAudioOutCallback(AudioOutCallback cb) { g_audio_out_cb = cb; }
-int  dsp::getDecimatedRate() { return g_sample_rate / DECIM_FACTOR; }
+int  dsp::getDecimatedRate() { return g_sample_rate / 8; }  // audio always at ↓8
 void dsp::setAudioGain(float gain) { g_audio_gain = gain; }
 
 void dsp::setCwOffset(float offset_hz)
@@ -207,7 +234,7 @@ void dsp::setCwOffset(float offset_hz)
         // Down-conversion NCO at 48kHz rate
         nco::setFreq(g_cw_nco, offset_hz, (float)g_sample_rate);
         // Sidetone NCO at decimated rate (mix UP to create audible tone)
-        float dec_rate = (float)g_sample_rate / DECIM_FACTOR;
+        float dec_rate = (float)g_sample_rate / 8;
         nco::setFreq(g_sidetone_nco, offset_hz, dec_rate);
         g_cw_offset_hz = offset_hz;
         g_cw_nco_active = true;
@@ -240,42 +267,62 @@ void dsp::pushIQ(const float *iq, int num_frames)
             oQ = nQ;
         }
 
-        // Feed to FFT buffer (full 48kHz rate)
-        int pos = g_write_pos;
-        buf[2 * pos]     = oI;
-        buf[2 * pos + 1] = oQ;
-        g_write_pos = pos + 1;
-
-        if (g_write_pos >= g_fft_size) {
-            __sync_synchronize();
-            g_ready_buf = g_write_buf;
-            g_write_buf = 1 - g_write_buf;
-            buf = g_input_buf[g_write_buf];
-            g_write_pos = 0;
+        // Feed to FFT buffer — either direct (48k) or via decimator
+        if (g_cur_span == 0) {
+            // 48kHz span: feed every sample directly
+            int pos = g_write_pos;
+            buf[2 * pos]     = oI;
+            buf[2 * pos + 1] = oQ;
+            g_write_pos = pos + 1;
+            if (g_write_pos >= g_fft_size) {
+                __sync_synchronize();
+                g_ready_buf = g_write_buf;
+                g_write_buf = 1 - g_write_buf;
+                buf = g_input_buf[g_write_buf];
+                g_write_pos = 0;
+            }
         }
 
-        // FIR decimate: 48kHz → 6kHz
-        float dec_i, dec_q;
-        if (fir_decimate_sample(oI, oQ, dec_i, dec_q)) {
-            float audio;
-            if (g_cw_nco_active) {
-                // CW mode: 300Hz complex bandpass + sidetone NCO
-                float filt_i, filt_q;
-                cw_fir_sample(dec_i, dec_q, filt_i, filt_q);
-                // Mix UP by CW offset to create audible sidetone, take real part
-                float tone_i, tone_q;
-                nco::mixUp(g_sidetone_nco, filt_i, filt_q, tone_i, tone_q);
-                audio = tone_i;
-            } else {
-                // Non-CW: raw I stream
-                audio = dec_i;
+        // Run all decimation stages (each independently from 48kHz)
+        for (int si = 0; si < NUM_DECIM_STAGES; si++) {
+            float di, dq;
+            if (fir_decimate_sample(g_decim[si], oI, oQ, di, dq)) {
+                // Feed to FFT if this is the selected span's decimator
+                // span 1=↓2(idx 0), span 2=↓4(idx 1), span 3=↓8(idx 2)
+                if (g_cur_span == si + 1) {
+                    int pos = g_write_pos;
+                    buf[2 * pos]     = di;
+                    buf[2 * pos + 1] = dq;
+                    g_write_pos = pos + 1;
+                    if (g_write_pos >= g_fft_size) {
+                        __sync_synchronize();
+                        g_ready_buf = g_write_buf;
+                        g_write_buf = 1 - g_write_buf;
+                        buf = g_input_buf[g_write_buf];
+                        g_write_pos = 0;
+                    }
+                }
+
+                // ↓8 stage (idx 2) always feeds audio output
+                if (si == AUDIO_DECIM_IDX) {
+                    float audio;
+                    if (g_cw_nco_active) {
+                        float filt_i, filt_q;
+                        cw_fir_sample(di, dq, filt_i, filt_q);
+                        float tone_i, tone_q;
+                        nco::mixUp(g_sidetone_nco, filt_i, filt_q, tone_i, tone_q);
+                        audio = tone_i;
+                    } else {
+                        audio = di;
+                    }
+                    audio *= g_audio_gain;
+                    if (audio > 1.0f) audio = 1.0f;
+                    if (audio < -1.0f) audio = -1.0f;
+                    g_audio_out_buf[g_audio_out_pos++] = audio;
+                    if (g_audio_out_pos >= AUDIO_OUT_BUF_SIZE)
+                        flush_audio_out();
+                }
             }
-            audio *= g_audio_gain;
-            if (audio > 1.0f) audio = 1.0f;
-            if (audio < -1.0f) audio = -1.0f;
-            g_audio_out_buf[g_audio_out_pos++] = audio;
-            if (g_audio_out_pos >= AUDIO_OUT_BUF_SIZE)
-                flush_audio_out();
         }
     }
 }
@@ -297,5 +344,33 @@ const float* dsp::getMagnitudeDb() { return g_magnitude_db; }
 
 int dsp::displayBin(int display_idx)
 {
-    return (display_idx + 3 * g_fft_size / 4) % g_fft_size;
+    if (g_cur_span == 0) {
+        // 48kHz span: virtual rotation to center LO (shift by 3N/4 = 12kHz)
+        return (display_idx + 3 * g_fft_size / 4) % g_fft_size;
+    }
+    // Narrow spans: DC (=VFO) already at center after fftshift, no rotation
+    return display_idx;
+}
+
+void dsp::setSpan(int span_idx)
+{
+    if (span_idx < 0 || span_idx >= NUM_SPANS) return;
+    if (span_idx == g_cur_span) return;
+    g_cur_span = span_idx;
+    // Reset FFT buffer to avoid mixing rates
+    g_write_pos = 0;
+    g_ready_buf = -1;
+}
+
+int dsp::getSpan() { return g_cur_span; }
+
+int dsp::getSpanRate()
+{
+    if (g_cur_span == 0) return g_sample_rate;
+    return g_sample_rate / g_spans[g_cur_span].decim;
+}
+
+const char* dsp::getSpanLabel()
+{
+    return g_spans[g_cur_span].label;
 }

@@ -21,11 +21,16 @@ void pushIQ(const float *iq, int num_frames);
 bool processIfReady();
 
 int          getNumBins();           // fft_size (full complex spectrum)
-const float* getMagnitudeDb();       // dB values after fftshift, centered at VFO (DC)
+const float* getMagnitudeDb();       // dB values after fftshift
 
-// For display: virtual rotation to show LO-centered spectrum.
-// Use displayBin(i) to map display position i to magnitude_db index.
-// Display: 0 = LO-24k, N/4 = LO-12k, N/2 = LO, 3N/4 = VFO, N-1 = LO+24k
-int  displayBin(int display_idx);    // returns (display_idx + 3*N/4) % N
+// Display bin mapping (depends on span — includes virtual rotation for 48k span)
+int  displayBin(int display_idx);
+
+// Span control
+static constexpr int NUM_SPANS = 4;
+void setSpan(int span_idx);          // 0=48k, 1=±12k, 2=±6k, 3=±3k
+int  getSpan();
+int  getSpanRate();                  // effective sample rate of current span
+const char* getSpanLabel();
 
 } // namespace dsp
