@@ -27,6 +27,7 @@ static int g_mix_phase;
 static NcoState g_cw_nco;
 static bool g_cw_nco_active = false;
 static float g_cw_offset_hz = 0;
+static float g_soft_nco_hz = 0;  // sub-10Hz fine correction
 
 // CW audio filter (300Hz complex LPF at decimated rate) + sidetone NCO
 static constexpr int CW_FIR_TAPS = 65;
@@ -38,8 +39,8 @@ static int   g_cw_fir_pos = 0;
 static NcoState g_sidetone_nco;
 
 // Goertzel fine-tune detector
-static constexpr int GOERTZEL_BINS = 31;       // -150Hz to +150Hz
-static constexpr float GOERTZEL_BIN_HZ = 10.0f; // 10Hz per bin
+static constexpr int GOERTZEL_BINS = 301;      // -150Hz to +150Hz at 1Hz resolution
+static constexpr float GOERTZEL_BIN_HZ = 1.0f;  // 1Hz per bin
 static constexpr float GOERTZEL_DURATION_S = 3.0f;
 
 struct GoertzelBin {
@@ -266,23 +267,37 @@ bool dsp::isGoertzelRunning() { return g_goertzel_running; }
 float dsp::getGoertzelResult() { return g_goertzel_result; }
 void dsp::clearGoertzelResult() { g_goertzel_result = 0; }
 
-void dsp::setCwOffset(float offset_hz)
+static void update_cw_ncos()
 {
-    if (offset_hz == 0.0f) {
+    if (g_cw_offset_hz == 0.0f) {
         g_cw_nco_active = false;
         g_cw_nco.inc = 0;
         g_sidetone_nco.inc = 0;
-        g_cw_offset_hz = 0;
-    } else {
-        // Down-conversion NCO at 48kHz rate
-        nco::setFreq(g_cw_nco, offset_hz, (float)g_sample_rate);
-        // Sidetone NCO at decimated rate (mix UP to create audible tone)
-        float dec_rate = (float)g_sample_rate / 8;
-        nco::setFreq(g_sidetone_nco, offset_hz, dec_rate);
-        g_cw_offset_hz = offset_hz;
-        g_cw_nco_active = true;
+        return;
     }
+    // CW down-conversion NCO includes soft correction
+    float total_shift = g_cw_offset_hz + g_soft_nco_hz;
+    nco::setFreq(g_cw_nco, total_shift, (float)g_sample_rate);
+    // Sidetone NCO at decimated rate — also includes correction so
+    // the audible tone stays at the nominal CW offset pitch
+    float dec_rate = (float)g_sample_rate / 8;
+    nco::setFreq(g_sidetone_nco, g_cw_offset_hz, dec_rate);
+    g_cw_nco_active = true;
 }
+
+void dsp::setCwOffset(float offset_hz)
+{
+    g_cw_offset_hz = offset_hz;
+    update_cw_ncos();
+}
+
+void dsp::setSoftNcoCorrection(float hz)
+{
+    g_soft_nco_hz = hz;
+    if (g_cw_nco_active) update_cw_ncos();
+}
+
+float dsp::getSoftNcoCorrection() { return g_soft_nco_hz; }
 
 void dsp::pushIQ(const float *iq, int num_frames)
 {

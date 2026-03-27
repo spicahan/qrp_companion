@@ -272,6 +272,7 @@ void app::tick()
     int cur_mode = cat::getMode();
     int cur_cw_offset = cat::getCwOffset();
     if (cur_mode != last_mode || cur_cw_offset != last_cw_offset) {
+        dsp::setSoftNcoCorrection(0);  // reset on mode/offset change
         if (cur_mode == 3 && cur_cw_offset > 0) {
             dsp::setCwOffset((float)cur_cw_offset);
         } else {
@@ -291,22 +292,26 @@ void app::tick()
 
     // --- Goertzel fine-tune result ---
     if (!dsp::isGoertzelRunning() && dsp::getGoertzelResult() != 0) {
-        float offset = dsp::getGoertzelResult();
+        float g_offset = dsp::getGoertzelResult();
         dsp::clearGoertzelResult();
         uint64_t vfo = cat::getVfoFreq();
         if (vfo > 0) {
-            int delta = -(((int)offset / 10) * 10);  // negate + round to 10Hz
-            if (delta != 0) {
-                uint64_t new_freq = (int64_t)vfo + delta;
+            // Round to nearest 10Hz for VFO CAT command
+            int rounded = ((int)(g_offset + (g_offset >= 0 ? 5.0f : -5.0f))) / 10 * 10;
+            int vfo_delta = -rounded;
+            // Soft NCO correction = the sub-10Hz residual
+            float soft_hz = -(g_offset - (float)rounded);
+
+            if (vfo_delta != 0) {
+                uint64_t new_freq = (int64_t)vfo + vfo_delta;
                 cat::setVfoFreq(new_freq);
-                snprintf(touch_text, sizeof(touch_text),
-                         "Fine %+dHz -> %d.%03d.%02d",
-                         delta,
-                         (int)(new_freq / 1000000),
-                         (int)((new_freq % 1000000) / 1000),
-                         (int)((new_freq % 1000) / 10));
-                touch_time = t0;
             }
+            dsp::setSoftNcoCorrection(soft_hz);
+
+            snprintf(touch_text, sizeof(touch_text),
+                     "Fine %+.0fHz VFO%+d NCO%+.1f",
+                     g_offset, vfo_delta, soft_hz);
+            touch_time = t0;
         }
     }
 
@@ -443,14 +448,21 @@ void app::tick()
     if (vfo > 0) {
         int mhz  = (int)(vfo / 1000000);
         int khz  = (int)((vfo % 1000000) / 1000);
-        int hz10 = (int)((vfo % 1000) / 10);  // 10 Hz resolution
-        snprintf(buf, sizeof(buf), "%-4s %d.%03d.%02d", cat::getModeStr(), mhz, khz, hz10);
+        int hz10 = (int)((vfo % 1000) / 10);
+        float soft = dsp::getSoftNcoCorrection();
+        if (soft != 0.0f && cat::getMode() == 3) {
+            snprintf(buf, sizeof(buf), "%-4s %d.%03d.%02d%+.1f",
+                     cat::getModeStr(), mhz, khz, hz10, soft);
+        } else {
+            snprintf(buf, sizeof(buf), "%-4s %d.%03d.%02d",
+                     cat::getModeStr(), mhz, khz, hz10);
+        }
     } else {
         snprintf(buf, sizeof(buf), "%-4s ---.---.--", cat::getModeStr());
     }
-    // Pad to fixed 20 chars to overwrite any residuals
+    // Pad to fixed 24 chars to overwrite any residuals
     int blen = strlen(buf);
-    while (blen < 20) buf[blen++] = ' ';
+    while (blen < 24) buf[blen++] = ' ';
     buf[blen] = '\0';
     int freq_tw = draw::textWidth(buf, 2);
     draw::drawText(fb, (log_w - freq_tw) / 2, 6, buf, COL_GREEN, COL_NAVY, 2);
