@@ -282,16 +282,12 @@ void app::tick()
     }
 
     // Update VFO marker position based on span
+    // NCO already shifts CW offset to DC, so no visual compensation needed
     if (dsp::getSpan() == 0) {
-        // 48kHz span: VFO at 3/4 (+ CW offset shift)
-        g_vfo_x = log_w * 3 / 4;
-        if (cur_mode == 3 && cur_cw_offset > 0)
-            g_vfo_x += cur_cw_offset * log_w / SAMPLE_RATE;
+        g_vfo_x = log_w * 3 / 4;  // 48kHz span: VFO at 3/4 (displayBin rotation)
     } else {
-        // Narrow spans: VFO at center (DC after all NCOs)
-        g_vfo_x = log_w / 2;
+        g_vfo_x = log_w / 2;      // narrow spans: VFO at center (DC)
     }
-    if (g_vfo_x >= log_w) g_vfo_x = log_w - 1;
 
     // --- Goertzel fine-tune result ---
     if (!dsp::isGoertzelRunning() && dsp::getGoertzelResult() != 0) {
