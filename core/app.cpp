@@ -15,6 +15,7 @@ static constexpr int INFO_H   = 28;
 
 static int log_w, log_h;
 static int spec_w;        // spectrum/waterfall width (1024 to match FFT)
+static int spec_x;        // spectrum/waterfall left offset (centered)
 static int slider_x;      // gain slider left edge
 static constexpr int SLIDER_W = 128;
 static int wf_y, wf_h;
@@ -95,10 +96,13 @@ static void draw_spectrum(const float *mag_db)
 {
     int spec_y = HEADER_H + GAP;
 
-    // Clear spectrum area (only spec_w, not full log_w)
-    draw::fillRect(fb, 0, spec_y, spec_w, SPEC_H, COL_BLACK);
+    // Clear spectrum area
+    draw::fillRect(fb, spec_x, spec_y, spec_w, SPEC_H, COL_BLACK);
 
-    // Draw spectrum bars with VFO marker
+    // VFO marker FIRST (so signal bars draw on top of it, not hidden)
+    draw::drawVLine(fb, spec_x + g_vfo_x, spec_y, SPEC_H, COL_MARKER);
+
+    // Draw spectrum bars
     for (int di = 0; di < num_bins; di++) {
         int x0 = bin_to_x(di);
         int x1 = bin_to_x(di + 1);
@@ -114,15 +118,11 @@ static void draw_spectrum(const float *mag_db)
         if (bar_h < 1) bar_h = 1;
 
         int bar_w = x1 - x0;
-        if (x0 + bar_w > log_w) bar_w = log_w - x0;
+        if (x0 + bar_w > spec_w) bar_w = spec_w - x0;
 
         uint16_t color = spectrum_color(norm);
-        draw::fillRect(fb, x0, spec_y + SPEC_H - bar_h, bar_w, bar_h, color);
+        draw::fillRect(fb, spec_x + x0, spec_y + SPEC_H - bar_h, bar_w, bar_h, color);
     }
-
-    // VFO marker (single column overwrite — fast, minimal flicker)
-    draw::drawVLine(fb, g_vfo_x, spec_y, SPEC_H, COL_MARKER);
-
 }
 
 // Pre-computed bin index for each logical x pixel (avoids repeated bin_to_x + displayBin)
@@ -152,26 +152,27 @@ static void draw_waterfall()
         // Ring buffer: forward from wf_head = newest first.
         // PPA blitBlock with mirror_y handles the Y-flip in hardware.
 
+        // In rotated mode, logical spec_x maps to physical dst_y offset
+        int phys_dy = fb.rotated ? (fb.log_w - spec_x - spec_w) : 0;
+
         int start = wf_head;
         if (start + n <= WF_MAX_LINES) {
-            // Single contiguous region — one blitBlock call
             pal::blitBlock(wf_pixels_t, WF_MAX_LINES, start, 0,
-                           fb.buf, fb.phys_w, wf_y, 0,
+                           fb.buf, fb.phys_w, wf_y, phys_dy,
                            n, spec_w, true);
         } else {
-            // Wrap around: two blitBlock calls
             int first = WF_MAX_LINES - start;
             int second = n - first;
             pal::blitBlock(wf_pixels_t, WF_MAX_LINES, start, 0,
-                           fb.buf, fb.phys_w, wf_y, 0,
+                           fb.buf, fb.phys_w, wf_y, phys_dy,
                            first, spec_w, true);
             pal::blitBlock(wf_pixels_t, WF_MAX_LINES, 0, 0,
-                           fb.buf, fb.phys_w, wf_y + first, 0,
+                           fb.buf, fb.phys_w, wf_y + first, phys_dy,
                            second, spec_w, true);
         }
 
         if (n < wf_h) {
-            for (int py = 0; py < spec_w; py++)
+            for (int py = phys_dy; py < phys_dy + spec_w; py++)
                 memset(&fb.buf[py * fb.phys_w + wf_y + n], 0, (wf_h - n) * sizeof(uint16_t));
         }
     } else {
@@ -179,12 +180,12 @@ static void draw_waterfall()
         for (int row = 0; row < n; row++) {
             int fy = wf_y + row;
             int time_idx = (wf_head + row) % WF_MAX_LINES;
-            uint16_t *dst = &fb.buf[fy * fb.phys_w];
+            uint16_t *dst = &fb.buf[fy * fb.phys_w + spec_x];
             for (int x = 0; x < spec_w; x++)
                 dst[x] = wf_pixels_t[x * WF_MAX_LINES + time_idx];
         }
         if (n < wf_h)
-            draw::fillRect(fb, 0, wf_y + n, log_w, wf_h - n, COL_BLACK);
+            draw::fillRect(fb, spec_x, wf_y + n, spec_w, wf_h - n, COL_BLACK);
     }
 }
 
@@ -250,7 +251,8 @@ void app::init()
     log_h = info.height;
 
     spec_w = 1024;  // match FFT size for 1:1 bin-to-pixel
-    slider_x = log_w - SLIDER_W;
+    spec_x = (log_w - spec_w) / 2;  // centered (128px margins)
+    slider_x = log_w - SLIDER_W;    // gain slider on far right
 
     wf_y = HEADER_H + GAP + SPEC_H + GAP;
     wf_y = (wf_y + 31) & ~31;
@@ -374,9 +376,7 @@ void app::tick()
         // Pre-render into transposed pixel cache [lx][WF_MAX_LINES]
         for (int lx = 0; lx < spec_w; lx++) {
             int fft_bin = g_pixel_to_fftbin[lx];
-            uint16_t color = (lx == g_vfo_x) ? COL_MARKER
-                           : waterfall_color_from_db(mag[fft_bin]);
-            wf_pixels_t[lx * WF_MAX_LINES + wf_head] = color;
+            wf_pixels_t[lx * WF_MAX_LINES + wf_head] = waterfall_color_from_db(mag[fft_bin]);
         }
 
         if (wf_count < WF_MAX_LINES) wf_count++;
@@ -438,7 +438,7 @@ void app::tick()
 
             if (total_drag < TAP_THRESHOLD && drag_start_freq > 0) {
                 // Tap-to-tune: coarse jump VFO to tapped frequency
-                int delta_px = evt.x - g_vfo_x;
+                int delta_px = evt.x - spec_x - g_vfo_x;
                 int delta_hz = delta_px * dsp::getSpanRate() / spec_w;
                 uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
                 if (new_freq > 0) {
@@ -500,7 +500,7 @@ void app::tick()
     int64_t t_spec = pal::micros();
 
     // Gap + Waterfall (includes VFO marker per-row)
-    draw::fillRect(fb, 0, HEADER_H + GAP + SPEC_H, spec_w, GAP, COL_BLACK);
+    draw::fillRect(fb, spec_x, HEADER_H + GAP + SPEC_H, spec_w, GAP, COL_BLACK);
     draw_waterfall();
 
     // Gain slider (right side)
@@ -549,18 +549,6 @@ void app::tick()
     int tw = draw::textWidth(buf, 2);
     draw::drawText(fb, log_w - tw - 8, 6, buf, fps_col, COL_NAVY, 2);
 
-
-    if (touch_time > 0 && (t0 - touch_time) < 1000000) {
-        int ttw = draw::textWidth(touch_text) + 8;
-        int tx = touch_x - ttw / 2;
-        int ty = touch_y - 20;
-        if (tx < 0) tx = 0;
-        if (tx + ttw > log_w) tx = log_w - ttw;
-        if (ty < 0) ty = touch_y + 8;
-        draw::fillRect(fb, tx, ty, ttw, 14, COL_DGREY);
-        draw::drawRect(fb, tx, ty, ttw, 14, COL_WHITE);
-        draw::drawText(fb, tx + 4, ty + 3, touch_text, COL_YELLOW, COL_DGREY);
-    }
 
     // Info bar text — pad to fixed width, bg overwrites old text
     int info_y = log_h - INFO_H;
