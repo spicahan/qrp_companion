@@ -206,15 +206,22 @@ bool audioOutputOpen(int sample_rate)
     return M5.Speaker.isEnabled();
 }
 
+// M5.Speaker.playRaw stores a POINTER to the data — the buffer must remain
+// valid until the Speaker finishes reading it. Use 3 rotating buffers:
+// one being played, one queued, one being written.
+static constexpr int SPKR_BUF_SIZE = 256;
+static constexpr int SPKR_NUM_BUFS = 3;
+static int16_t s_spkr_bufs[SPKR_NUM_BUFS][SPKR_BUF_SIZE];
+static int s_spkr_buf_idx = 0;
+
 void audioOutputWrite(const float *samples, int num_frames)
 {
     if (s_audio_out_rate == 0 || num_frames <= 0) return;
-    // Convert float [-1,1] to int16 for playRaw
-    static int16_t buf[256];
     int remaining = num_frames;
     const float *p = samples;
     while (remaining > 0) {
-        int chunk = remaining > 256 ? 256 : remaining;
+        int chunk = remaining > SPKR_BUF_SIZE ? SPKR_BUF_SIZE : remaining;
+        int16_t *buf = s_spkr_bufs[s_spkr_buf_idx];
         for (int i = 0; i < chunk; i++) {
             float s = p[i];
             if (s > 1.0f) s = 1.0f;
@@ -222,6 +229,7 @@ void audioOutputWrite(const float *samples, int num_frames)
             buf[i] = (int16_t)(s * 32767.0f);
         }
         M5.Speaker.playRaw(buf, chunk, s_audio_out_rate, false, 1, 0, false);
+        s_spkr_buf_idx = (s_spkr_buf_idx + 1) % SPKR_NUM_BUFS;
         p += chunk;
         remaining -= chunk;
     }
