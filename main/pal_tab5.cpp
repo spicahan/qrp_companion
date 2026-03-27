@@ -197,8 +197,12 @@ static int s_audio_out_rate = 0;
 bool audioOutputOpen(int sample_rate)
 {
     s_audio_out_rate = sample_rate;
+    auto spk_cfg = M5.Speaker.config();
+    spk_cfg.sample_rate = 48000;
+    M5.Speaker.config(spk_cfg);
+    M5.Speaker.begin();
     M5.Speaker.setVolume(128);
-    return true;
+    return M5.Speaker.isEnabled();
 }
 
 void audioOutputWrite(const float *samples, int num_frames)

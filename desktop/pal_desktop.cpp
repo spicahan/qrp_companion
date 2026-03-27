@@ -285,18 +285,19 @@ static int pa_output_callback(const void *, void *output,
                               PaStreamCallbackFlags, void *)
 {
     float *out = (float *)output;
-    int upsample = (s_audio_out_rate > 0) ? (PA_OUT_RATE / s_audio_out_rate) : 1;
+    int upsample = (s_audio_out_rate > 0) ? (PA_OUT_RATE / s_audio_out_rate) : 8;
     int head = s_aout_head.load(std::memory_order_acquire);
     int tail = s_aout_tail.load(std::memory_order_relaxed);
+    static float last_sample = 0.0f;
+    static int phase = 0;
 
     for (unsigned long i = 0; i < frameCount; i++) {
-        if ((i % upsample) == 0 && head != tail) {
-            // Advance to next input sample
+        if (phase == 0 && head != tail) {
+            last_sample = s_aout_ring[tail];
             tail = (tail + 1) % AOUT_RING_SIZE;
         }
-        int idx = (tail == 0) ? AOUT_RING_SIZE - 1 : tail - 1;
-        if (idx < 0) idx = 0;
-        out[i] = (head != tail || i > 0) ? s_aout_ring[idx] : 0.0f;
+        out[i] = last_sample;
+        phase = (phase + 1) % upsample;
     }
     s_aout_tail.store(tail, std::memory_order_release);
     return paContinue;
@@ -304,6 +305,17 @@ static int pa_output_callback(const void *, void *output,
 
 bool audioOutputOpen(int sample_rate)
 {
+    // Ensure PortAudio is initialized (may be called before audioInputOpen)
+    static bool pa_inited = false;
+    if (!pa_inited) {
+        PaError err = Pa_Initialize();
+        if (err != paNoError) {
+            fprintf(stderr, "Pa_Initialize failed: %s\n", Pa_GetErrorText(err));
+            return false;
+        }
+        pa_inited = true;
+    }
+
     s_audio_out_rate = sample_rate;
     s_aout_head.store(0);
     s_aout_tail.store(0);
@@ -372,10 +384,16 @@ static int pa_input_callback(const void *input, void * /*output*/,
 
 bool audioInputOpen(AudioInputCallback cb)
 {
-    PaError err = Pa_Initialize();
-    if (err != paNoError) {
-        fprintf(stderr, "PortAudio init failed: %s\n", Pa_GetErrorText(err));
-        return false;
+    // Ensure PA is initialized (may already be done by audioOutputOpen)
+    static bool pa_input_inited = false;
+    if (!pa_input_inited) {
+        // Pa_Initialize is safe to call multiple times (refcounted)
+        PaError err = Pa_Initialize();
+        if (err != paNoError) {
+            fprintf(stderr, "PortAudio init failed: %s\n", Pa_GetErrorText(err));
+            return false;
+        }
+        pa_input_inited = true;
     }
 
     // Find default input device
@@ -398,7 +416,7 @@ bool audioInputOpen(AudioInputCallback cb)
 
     s_audio_cb = cb;
 
-    err = Pa_OpenStream(&s_pa_stream, &params, nullptr,
+    PaError err = Pa_OpenStream(&s_pa_stream, &params, nullptr,
                         48000.0, 1024, paClipOff,
                         pa_input_callback, nullptr);
     if (err != paNoError) {
