@@ -320,11 +320,33 @@ bool audioOutputOpen(int sample_rate)
     s_aout_head.store(0);
     s_aout_tail.store(0);
 
-    PaStreamParameters params = {};
-    PaDeviceIndex dev = Pa_GetDefaultOutputDevice();
+    // Find a non-USB output device (avoid sending audio back to QMX)
+    PaDeviceIndex dev = paNoDevice;
+    int num_devices = Pa_GetDeviceCount();
+    for (int i = 0; i < num_devices; i++) {
+        const PaDeviceInfo *d = Pa_GetDeviceInfo(i);
+        if (d && d->maxOutputChannels > 0) {
+            // Skip USB devices (likely QMX or other USB audio)
+            const char *name = d->name;
+            bool is_usb = (strstr(name, "USB") || strstr(name, "QMX") ||
+                           strstr(name, "uac") || strstr(name, "UAC"));
+            fprintf(stderr, "Audio out device [%d]: %s (%d ch)%s\n",
+                    i, name, d->maxOutputChannels, is_usb ? " [USB-skip]" : "");
+            if (!is_usb && dev == paNoDevice)
+                dev = i;
+        }
+    }
+    if (dev == paNoDevice) {
+        // Fallback to system default
+        dev = Pa_GetDefaultOutputDevice();
+        fprintf(stderr, "No non-USB output found, using default\n");
+    }
     if (dev == paNoDevice) return false;
 
     const PaDeviceInfo *info = Pa_GetDeviceInfo(dev);
+    fprintf(stderr, "Audio output using: %s\n", info->name);
+
+    PaStreamParameters params = {};
     params.device = dev;
     params.channelCount = 1;
     params.sampleFormat = paFloat32;
