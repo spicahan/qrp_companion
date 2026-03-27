@@ -295,7 +295,7 @@ void app::tick()
         dsp::clearGoertzelResult();
         uint64_t vfo = cat::getVfoFreq();
         if (vfo > 0) {
-            int delta = ((int)offset / 10) * 10;  // round to 10Hz
+            int delta = -(((int)offset / 10) * 10);  // negate + round to 10Hz
             if (delta != 0) {
                 uint64_t new_freq = (int64_t)vfo + delta;
                 cat::setVfoFreq(new_freq);
