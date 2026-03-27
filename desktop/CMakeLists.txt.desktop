@@ -21,6 +21,7 @@ add_executable(qrp_companion_desktop
     ../core/app.cpp
     ../core/dsp.cpp
     ../core/cat.cpp
+    ../core/nco.cpp
     fft_shim/fft.cpp
 )
 

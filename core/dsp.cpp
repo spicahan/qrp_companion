@@ -1,4 +1,5 @@
 #include "dsp.h"
+#include "nco.h"
 #include "dsps_fft2r.h"
 #include <cmath>
 #include <cstring>
@@ -21,6 +22,10 @@ static volatile int g_ready_buf;
 
 // fs/4 down-conversion mixer phase
 static int g_mix_phase;
+
+// CW offset NCO (shifts CW sidetone offset to DC after fs/4 mixer)
+static NcoState g_cw_nco;
+static bool g_cw_nco_active = false;
 
 // --- FIR decimation: 48kHz → 6kHz ---
 static constexpr int DECIM_FACTOR = 8;
@@ -135,6 +140,12 @@ void dsp::init(int sample_rate, int fft_size)
     g_decim_counter = 0;
     g_audio_out_pos = 0;
 
+    // NCO init
+    nco::init();
+    g_cw_nco.phase = 0;
+    g_cw_nco.inc = 0;
+    g_cw_nco_active = false;
+
     dsps_fft2r_init_fc32(nullptr, fft_size);
 
     for (int i = 0; i < g_num_bins; i++)
@@ -144,6 +155,17 @@ void dsp::init(int sample_rate, int fft_size)
 void dsp::setAudioOutCallback(AudioOutCallback cb) { g_audio_out_cb = cb; }
 int  dsp::getDecimatedRate() { return g_sample_rate / DECIM_FACTOR; }
 void dsp::setAudioGain(float gain) { g_audio_gain = gain; }
+
+void dsp::setCwOffset(float offset_hz)
+{
+    if (offset_hz == 0.0f) {
+        g_cw_nco_active = false;
+        g_cw_nco.inc = 0;
+    } else {
+        nco::setFreq(g_cw_nco, offset_hz, (float)g_sample_rate);
+        g_cw_nco_active = true;
+    }
+}
 
 void dsp::pushIQ(const float *iq, int num_frames)
 {
@@ -162,6 +184,14 @@ void dsp::pushIQ(const float *iq, int num_frames)
             case 3: oI = -Q; oQ =  I; break;
         }
         g_mix_phase = (g_mix_phase + 1) & 3;
+
+        // CW offset NCO: shift CW sidetone offset to DC
+        if (g_cw_nco_active) {
+            float nI, nQ;
+            nco::mixDown(g_cw_nco, oI, oQ, nI, nQ);
+            oI = nI;
+            oQ = nQ;
+        }
 
         // Feed to FFT buffer (full 48kHz rate)
         int pos = g_write_pos;

@@ -266,6 +266,21 @@ void app::tick()
     // --- CAT ---
     cat::poll();
 
+    // Update CW offset NCO when mode/offset changes
+    static int last_mode = 0;
+    static int last_cw_offset = 0;
+    int cur_mode = cat::getMode();
+    int cur_cw_offset = cat::getCwOffset();
+    if (cur_mode != last_mode || cur_cw_offset != last_cw_offset) {
+        if (cur_mode == 3 && cur_cw_offset > 0) {
+            dsp::setCwOffset((float)cur_cw_offset);
+        } else {
+            dsp::setCwOffset(0);
+        }
+        last_mode = cur_mode;
+        last_cw_offset = cur_cw_offset;
+    }
+
     // --- DSP ---
     bool new_spectrum = dsp::processIfReady();
     if (new_spectrum) {
