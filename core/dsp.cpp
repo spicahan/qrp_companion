@@ -38,6 +38,15 @@ static float g_cw_fir_delay_q[CW_FIR_TAPS];
 static int   g_cw_fir_pos = 0;
 static NcoState g_sidetone_nco;
 
+// APF (Audio Peaking Filter) — very narrow LPF at DC (±20Hz = 40Hz BW)
+static constexpr int APF_FIR_TAPS = 257;
+static constexpr float APF_FIR_CUTOFF_HZ = 20.0f;
+static float g_apf_fir_coeffs[APF_FIR_TAPS];
+static float g_apf_fir_delay_i[APF_FIR_TAPS];
+static float g_apf_fir_delay_q[APF_FIR_TAPS];
+static int   g_apf_fir_pos = 0;
+static bool  g_apf_enabled = false;
+
 // Goertzel fine-tune detector
 static constexpr int GOERTZEL_BINS = 301;      // -150Hz to +150Hz at 1Hz resolution
 static constexpr float GOERTZEL_BIN_HZ = 1.0f;  // 1Hz per bin
@@ -160,6 +169,24 @@ static void cw_fir_sample(float in_i, float in_q, float &out_i, float &out_q)
     out_q = acc_q;
 }
 
+// Apply APF complex FIR to one I/Q sample (runs at decimated 6kHz rate)
+static void apf_fir_sample(float in_i, float in_q, float &out_i, float &out_q)
+{
+    g_apf_fir_delay_i[g_apf_fir_pos] = in_i;
+    g_apf_fir_delay_q[g_apf_fir_pos] = in_q;
+    g_apf_fir_pos = (g_apf_fir_pos + 1) % APF_FIR_TAPS;
+
+    float acc_i = 0, acc_q = 0;
+    int idx = g_apf_fir_pos;
+    for (int k = 0; k < APF_FIR_TAPS; k++) {
+        acc_i += g_apf_fir_delay_i[idx] * g_apf_fir_coeffs[k];
+        acc_q += g_apf_fir_delay_q[idx] * g_apf_fir_coeffs[k];
+        idx = (idx + 1) % APF_FIR_TAPS;
+    }
+    out_i = acc_i;
+    out_q = acc_q;
+}
+
 static void flush_audio_out()
 {
     if (g_audio_out_pos > 0 && g_audio_out_cb) {
@@ -233,6 +260,13 @@ void dsp::init(int sample_rate, int fft_size)
     g_sidetone_nco.phase = 0;
     g_sidetone_nco.inc = 0;
 
+    // APF (very narrow CW filter)
+    design_fir_lowpass(g_apf_fir_coeffs, APF_FIR_TAPS, APF_FIR_CUTOFF_HZ, dec_rate);
+    memset(g_apf_fir_delay_i, 0, sizeof(g_apf_fir_delay_i));
+    memset(g_apf_fir_delay_q, 0, sizeof(g_apf_fir_delay_q));
+    g_apf_fir_pos = 0;
+    g_apf_enabled = false;
+
     dsps_fft2r_init_fc32(nullptr, fft_size);
 
     for (int i = 0; i < g_num_bins; i++)
@@ -298,6 +332,9 @@ void dsp::setSoftNcoCorrection(float hz)
 }
 
 float dsp::getSoftNcoCorrection() { return g_soft_nco_hz; }
+
+void dsp::setApfEnabled(bool enabled) { g_apf_enabled = enabled; }
+bool dsp::isApfEnabled() { return g_apf_enabled; }
 
 void dsp::pushIQ(const float *iq, int num_frames)
 {
@@ -366,7 +403,11 @@ void dsp::pushIQ(const float *iq, int num_frames)
                     float audio;
                     if (g_cw_nco_active) {
                         float filt_i, filt_q;
-                        cw_fir_sample(di, dq, filt_i, filt_q);
+                        // Use APF (40Hz BW) or standard CW filter (300Hz BW)
+                        if (g_apf_enabled)
+                            apf_fir_sample(di, dq, filt_i, filt_q);
+                        else
+                            cw_fir_sample(di, dq, filt_i, filt_q);
 
                         // Feed CW-filtered complex I/Q to Goertzel detector
                         if (g_goertzel_running) {

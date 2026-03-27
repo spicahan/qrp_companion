@@ -14,6 +14,10 @@ void setCwOffset(float offset_hz); // set CW offset NCO frequency (0 to disable)
 void setSoftNcoCorrection(float hz); // sub-10Hz fine correction added to CW NCO
 float getSoftNcoCorrection();
 
+// APF (Audio Peaking Filter) — very narrow CW filter, toggle with 300Hz filter
+void setApfEnabled(bool enabled);
+bool isApfEnabled();
+
 // Goertzel fine-tune: start 3-second energy collection across 31 bins (10Hz apart)
 // centered at DC. Call after coarse touch-to-tune. When done, returns the
 // peak bin offset in Hz via getGoertzelResult(). Returns 0 while collecting.

@@ -347,13 +347,22 @@ void app::tick()
         touch_time = t0;
 
         if (evt.action == pal::TouchEvent::DOWN) {
-            // Check if tap is in header area (span button)
-            if (evt.y < HEADER_H && evt.x < 120) {
-                // Toggle span
-                dsp::setSpan((dsp::getSpan() + 1) % dsp::NUM_SPANS);
-                precompute_pixel_bin_map();  // remap bins for new span
-                continue;
+            // Check header buttons
+            if (evt.y < HEADER_H) {
+                if (evt.x < 120) {
+                    // Span toggle button
+                    dsp::setSpan((dsp::getSpan() + 1) % dsp::NUM_SPANS);
+                    precompute_pixel_bin_map();
+                    continue;
+                }
+                // APF toggle button (right side of header, CW mode only)
+                if (evt.x > log_w - 80 && cat::getMode() == 3) {
+                    dsp::setApfEnabled(!dsp::isApfEnabled());
+                    continue;
+                }
             }
+            // Reset soft NCO correction on new tune action
+            dsp::setSoftNcoCorrection(0);
             dragging = true;
             drag_start_x = evt.x;
             drag_start_freq = cat::getVfoFreq();
@@ -467,8 +476,14 @@ void app::tick()
     int freq_tw = draw::textWidth(buf, 2);
     draw::drawText(fb, (log_w - freq_tw) / 2, 6, buf, COL_GREEN, COL_NAVY, 2);
 
-    // FPS right-aligned
-    snprintf(buf, sizeof(buf), "%5.1f FPS", fps);
+    // APF indicator + FPS right-aligned
+    if (cat::getMode() == 3) {
+        const char *filt_label = dsp::isApfEnabled() ? "APF" : "CW ";
+        uint16_t filt_col = dsp::isApfEnabled() ? COL_YELLOW : COL_DGREY;
+        snprintf(buf, sizeof(buf), "%s %4.0fFPS", filt_label, fps);
+    } else {
+        snprintf(buf, sizeof(buf), "%4.0fFPS", fps);
+    }
     uint16_t fps_col = (fps >= 24) ? COL_GREEN : (fps >= 10) ? COL_YELLOW : COL_RED;
     int tw = draw::textWidth(buf, 2);
     draw::drawText(fb, log_w - tw - 8, 6, buf, fps_col, COL_NAVY, 2);
