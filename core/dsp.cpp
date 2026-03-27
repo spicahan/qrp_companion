@@ -38,6 +38,7 @@ static constexpr int AUDIO_OUT_BUF_SIZE = 128;
 static float g_audio_out_buf[AUDIO_OUT_BUF_SIZE];
 static int   g_audio_out_pos = 0;
 static dsp::AudioOutCallback g_audio_out_cb = nullptr;
+static float g_audio_gain = 1000.0f;  // ~70 dB gain to bring noise floor to audible
 
 // Design Hamming-windowed sinc lowpass FIR
 static void design_fir_lowpass(float *h, int N, float cutoff_hz, float sample_rate)
@@ -142,6 +143,7 @@ void dsp::init(int sample_rate, int fft_size)
 
 void dsp::setAudioOutCallback(AudioOutCallback cb) { g_audio_out_cb = cb; }
 int  dsp::getDecimatedRate() { return g_sample_rate / DECIM_FACTOR; }
+void dsp::setAudioGain(float gain) { g_audio_gain = gain; }
 
 void dsp::pushIQ(const float *iq, int num_frames)
 {
@@ -175,10 +177,14 @@ void dsp::pushIQ(const float *iq, int num_frames)
             g_write_pos = 0;
         }
 
-        // FIR decimate: 48kHz → 6kHz, output I stream to audio
+        // FIR decimate: 48kHz → 6kHz, output I stream to audio with gain
         float dec_i, dec_q;
         if (fir_decimate_sample(oI, oQ, dec_i, dec_q)) {
-            g_audio_out_buf[g_audio_out_pos++] = dec_i;
+            float out = dec_i * g_audio_gain;
+            // Soft clip to [-1, 1]
+            if (out > 1.0f) out = 1.0f;
+            if (out < -1.0f) out = -1.0f;
+            g_audio_out_buf[g_audio_out_pos++] = out;
             if (g_audio_out_pos >= AUDIO_OUT_BUF_SIZE)
                 flush_audio_out();
         }

@@ -279,6 +279,9 @@ static float s_aout_ring[AOUT_RING_SIZE];
 static std::atomic<int> s_aout_head{0};
 static std::atomic<int> s_aout_tail{0};
 
+static int s_cb_call_count = 0;
+static int s_cb_underrun = 0;
+
 static int pa_output_callback(const void *, void *output,
                               unsigned long frameCount,
                               const PaStreamCallbackTimeInfo *,
@@ -290,16 +293,29 @@ static int pa_output_callback(const void *, void *output,
     int tail = s_aout_tail.load(std::memory_order_relaxed);
     static float last_sample = 0.0f;
     static int phase = 0;
+    bool had_data = false;
 
     for (unsigned long i = 0; i < frameCount; i++) {
-        if (phase == 0 && head != tail) {
-            last_sample = s_aout_ring[tail];
-            tail = (tail + 1) % AOUT_RING_SIZE;
+        if (phase == 0) {
+            if (head != tail) {
+                last_sample = s_aout_ring[tail];
+                tail = (tail + 1) % AOUT_RING_SIZE;
+                had_data = true;
+            } else {
+                s_cb_underrun++;
+            }
         }
         out[i] = last_sample;
         phase = (phase + 1) % upsample;
     }
     s_aout_tail.store(tail, std::memory_order_release);
+    s_cb_call_count++;
+
+    // Debug: print every ~1s (48000/256 = 187 callbacks/sec)
+    if ((s_cb_call_count % 187) == 0) {
+        fprintf(stderr, "PA-CB: calls=%d underrun=%d last=%.6f\n",
+                s_cb_call_count, s_cb_underrun, last_sample);
+    }
     return paContinue;
 }
 
@@ -370,17 +386,43 @@ bool audioOutputOpen(int sample_rate)
     return true;
 }
 
+static int s_aout_write_count = 0;
+static int s_aout_drop_count = 0;
+static float s_aout_peak = 0;
+
 void audioOutputWrite(const float *samples, int num_frames)
 {
     int head = s_aout_head.load(std::memory_order_relaxed);
+    int written = 0;
     for (int i = 0; i < num_frames; i++) {
         int next = (head + 1) % AOUT_RING_SIZE;
-        if (next == s_aout_tail.load(std::memory_order_acquire))
-            break; // ring full, drop
-        s_aout_ring[head] = samples[i];
+        if (next == s_aout_tail.load(std::memory_order_acquire)) {
+            s_aout_drop_count++;
+            break;
+        }
+        float s = samples[i];
+        if (s > s_aout_peak) s_aout_peak = s;
+        if (-s > s_aout_peak) s_aout_peak = -s;
+        s_aout_ring[head] = s;
         head = next;
+        written++;
     }
     s_aout_head.store(head, std::memory_order_release);
+    s_aout_write_count += written;
+
+    // Debug: print stats every ~1 second (6000 samples at 6kHz)
+    static int s_debug_acc = 0;
+    s_debug_acc += written;
+    if (s_debug_acc >= 6000) {
+        int avail = (s_aout_head.load() - s_aout_tail.load() + AOUT_RING_SIZE) % AOUT_RING_SIZE;
+        fprintf(stderr, "AOut: wrote=%d dropped=%d peak=%.6f ring=%d/%d\n",
+                s_aout_write_count, s_aout_drop_count, s_aout_peak,
+                avail, AOUT_RING_SIZE);
+        s_aout_write_count = 0;
+        s_aout_drop_count = 0;
+        s_aout_peak = 0;
+        s_debug_acc = 0;
+    }
 }
 
 void audioOutputClose()
