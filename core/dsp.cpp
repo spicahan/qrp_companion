@@ -276,6 +276,7 @@ void dsp::init(int sample_rate, int fft_size)
 void dsp::setAudioOutCallback(AudioOutCallback cb) { g_audio_out_cb = cb; }
 int  dsp::getDecimatedRate() { return g_sample_rate / 8; }  // audio always at ↓8
 void dsp::setAudioGain(float gain) { g_audio_gain = gain; }
+float dsp::getAudioGain() { return g_audio_gain; }
 
 void dsp::startGoertzel()
 {

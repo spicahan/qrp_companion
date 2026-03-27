@@ -14,6 +14,9 @@ static constexpr int GAP      = 2;
 static constexpr int INFO_H   = 28;
 
 static int log_w, log_h;
+static int spec_w;        // spectrum/waterfall width (1024 to match FFT)
+static int slider_x;      // gain slider left edge
+static constexpr int SLIDER_W = 128;
 static int wf_y, wf_h;
 static draw::Framebuf fb;
 
@@ -82,7 +85,7 @@ static uint16_t waterfall_color_from_db(float db)
 // Map FFT bin index to display x coordinate
 static int bin_to_x(int bin)
 {
-    return bin * log_w / num_bins;
+    return bin * spec_w / num_bins;
 }
 
 static int g_vfo_x;  // VFO marker x position
@@ -92,15 +95,15 @@ static void draw_spectrum(const float *mag_db)
 {
     int spec_y = HEADER_H + GAP;
 
-    // Clear entire spectrum area first to avoid residuals
-    draw::fillRect(fb, 0, spec_y, log_w, SPEC_H, COL_BLACK);
+    // Clear spectrum area (only spec_w, not full log_w)
+    draw::fillRect(fb, 0, spec_y, spec_w, SPEC_H, COL_BLACK);
 
     // Draw spectrum bars with VFO marker
     for (int di = 0; di < num_bins; di++) {
         int x0 = bin_to_x(di);
         int x1 = bin_to_x(di + 1);
         if (x1 <= x0) x1 = x0 + 1;
-        if (x0 >= log_w) break;
+        if (x0 >= spec_w) break;
 
         int fft_bin = dsp::displayBin(di);
         float norm = (mag_db[fft_bin] - DB_MIN) / (DB_MAX - DB_MIN);
@@ -127,10 +130,10 @@ static int *g_pixel_to_fftbin = nullptr;
 
 static void precompute_pixel_bin_map()
 {
-    g_pixel_to_fftbin = new int[log_w];
-    for (int x = 0; x < log_w; x++) {
-        // Which display bin does this pixel belong to?
-        int di = x * num_bins / log_w;
+    if (g_pixel_to_fftbin) delete[] g_pixel_to_fftbin;
+    g_pixel_to_fftbin = new int[spec_w];
+    for (int x = 0; x < spec_w; x++) {
+        int di = x * num_bins / spec_w;
         if (di >= num_bins) di = num_bins - 1;
         g_pixel_to_fftbin[x] = dsp::displayBin(di);
     }
@@ -154,21 +157,21 @@ static void draw_waterfall()
             // Single contiguous region — one blitBlock call
             pal::blitBlock(wf_pixels_t, WF_MAX_LINES, start, 0,
                            fb.buf, fb.phys_w, wf_y, 0,
-                           n, log_w, true);
+                           n, spec_w, true);
         } else {
             // Wrap around: two blitBlock calls
             int first = WF_MAX_LINES - start;
             int second = n - first;
             pal::blitBlock(wf_pixels_t, WF_MAX_LINES, start, 0,
                            fb.buf, fb.phys_w, wf_y, 0,
-                           first, log_w, true);
+                           first, spec_w, true);
             pal::blitBlock(wf_pixels_t, WF_MAX_LINES, 0, 0,
                            fb.buf, fb.phys_w, wf_y + first, 0,
-                           second, log_w, true);
+                           second, spec_w, true);
         }
 
         if (n < wf_h) {
-            for (int py = 0; py < log_w; py++)
+            for (int py = 0; py < spec_w; py++)
                 memset(&fb.buf[py * fb.phys_w + wf_y + n], 0, (wf_h - n) * sizeof(uint16_t));
         }
     } else {
@@ -177,12 +180,55 @@ static void draw_waterfall()
             int fy = wf_y + row;
             int time_idx = (wf_head + row) % WF_MAX_LINES;
             uint16_t *dst = &fb.buf[fy * fb.phys_w];
-            for (int x = 0; x < log_w; x++)
+            for (int x = 0; x < spec_w; x++)
                 dst[x] = wf_pixels_t[x * WF_MAX_LINES + time_idx];
         }
         if (n < wf_h)
             draw::fillRect(fb, 0, wf_y + n, log_w, wf_h - n, COL_BLACK);
     }
+}
+
+// Gain slider
+static constexpr float GAIN_MIN = 100.0f;
+static constexpr float GAIN_MAX = 10000.0f;
+static bool gain_dragging = false;
+
+static float gain_from_y(int y)
+{
+    int sy = HEADER_H + GAP;
+    int sh = SPEC_H + GAP + (log_h - (HEADER_H + GAP + SPEC_H + GAP) - INFO_H);
+    float norm = 1.0f - (float)(y - sy) / sh;
+    if (norm < 0) norm = 0;
+    if (norm > 1) norm = 1;
+    float log_min = log10f(GAIN_MIN);
+    float log_max = log10f(GAIN_MAX);
+    return powf(10.0f, log_min + norm * (log_max - log_min));
+}
+
+static void draw_gain_slider()
+{
+    int sy = HEADER_H + GAP;
+    int sh = SPEC_H + GAP + wf_h;
+    int sx = slider_x;
+
+    draw::fillRect(fb, sx, sy, SLIDER_W, sh, COL_DGREY);
+    draw::drawVLine(fb, sx + SLIDER_W / 2, sy + 4, sh - 8, COL_BLACK);
+
+    float gain = dsp::getAudioGain();
+    float log_min = log10f(GAIN_MIN);
+    float log_max = log10f(GAIN_MAX);
+    float log_gain = log10f(gain > GAIN_MIN ? gain : GAIN_MIN);
+    float norm = (log_gain - log_min) / (log_max - log_min);
+    if (norm < 0) norm = 0;
+    if (norm > 1) norm = 1;
+
+    int bar_y = sy + (int)((1.0f - norm) * (sh - 10));
+    draw::fillRect(fb, sx + 8, bar_y, SLIDER_W - 16, 6, COL_WHITE);
+
+    char lbl[16];
+    int gain_db = (int)(20.0f * log10f(gain) + 0.5f);
+    snprintf(lbl, sizeof(lbl), "%ddB", gain_db);
+    draw::drawText(fb, sx + 4, bar_y - 12, lbl, COL_GREEN, COL_DGREY);
 }
 
 // Audio output callback — receives decimated mono samples from DSP, forwards to PAL
@@ -203,9 +249,10 @@ void app::init()
     log_w = info.width;
     log_h = info.height;
 
+    spec_w = 1024;  // match FFT size for 1:1 bin-to-pixel
+    slider_x = log_w - SLIDER_W;
+
     wf_y = HEADER_H + GAP + SPEC_H + GAP;
-    // Align wf_y to 32-pixel (cache line) boundary to prevent PPA DMA
-    // cache invalidation from clobbering CPU-written spectrum data
     wf_y = (wf_y + 31) & ~31;
     wf_h = log_h - wf_y - INFO_H;
 
@@ -230,7 +277,7 @@ void app::init()
     dsp::init(SAMPLE_RATE, FFT_SIZE);
     num_bins = dsp::getNumBins();
     wf_db = new float[WF_MAX_LINES * num_bins]();
-    wf_pixels_t = new uint16_t[log_w * WF_MAX_LINES]();  // transposed pixel cache
+    wf_pixels_t = new uint16_t[spec_w * WF_MAX_LINES]();  // transposed pixel cache
     last_dsp_time = pal::micros();
 
     g_vfo_x = log_w * 3 / 4;
@@ -282,12 +329,11 @@ void app::tick()
         last_cw_offset = cur_cw_offset;
     }
 
-    // Update VFO marker position based on span
-    // NCO already shifts CW offset to DC, so no visual compensation needed
+    // Update VFO marker position based on span (within spec_w area)
     if (dsp::getSpan() == 0) {
-        g_vfo_x = log_w * 3 / 4;  // 48kHz span: VFO at 3/4 (displayBin rotation)
+        g_vfo_x = spec_w * 3 / 4;  // 48kHz span: VFO at 3/4
     } else {
-        g_vfo_x = log_w / 2;      // narrow spans: VFO at center (DC)
+        g_vfo_x = spec_w / 2;      // narrow spans: VFO at center
     }
 
     // --- Goertzel fine-tune result ---
@@ -326,7 +372,7 @@ void app::tick()
         wf_head = (wf_head - 1 + WF_MAX_LINES) % WF_MAX_LINES;
 
         // Pre-render into transposed pixel cache [lx][WF_MAX_LINES]
-        for (int lx = 0; lx < log_w; lx++) {
+        for (int lx = 0; lx < spec_w; lx++) {
             int fft_bin = g_pixel_to_fftbin[lx];
             uint16_t color = (lx == g_vfo_x) ? COL_MARKER
                            : waterfall_color_from_db(mag[fft_bin]);
@@ -361,6 +407,12 @@ void app::tick()
                     continue;
                 }
             }
+            // Gain slider area
+            if (evt.x >= slider_x) {
+                gain_dragging = true;
+                dsp::setAudioGain(gain_from_y(evt.y));
+                continue;
+            }
             // Reset soft NCO correction on new tune action
             dsp::setSoftNcoCorrection(0);
             dragging = true;
@@ -370,9 +422,15 @@ void app::tick()
             drag_vfo_dirty = false;
             cat::suppressPolling(true);
         }
+        else if (evt.action == pal::TouchEvent::MOVE && gain_dragging) {
+            dsp::setAudioGain(gain_from_y(evt.y));
+        }
         else if (evt.action == pal::TouchEvent::MOVE && dragging) {
             drag_current_x = evt.x;
             drag_vfo_dirty = true;
+        }
+        else if (evt.action == pal::TouchEvent::UP && gain_dragging) {
+            gain_dragging = false;
         }
         else if (evt.action == pal::TouchEvent::UP && dragging) {
             int total_drag = drag_current_x - drag_start_x;
@@ -381,7 +439,7 @@ void app::tick()
             if (total_drag < TAP_THRESHOLD && drag_start_freq > 0) {
                 // Tap-to-tune: coarse jump VFO to tapped frequency
                 int delta_px = evt.x - g_vfo_x;
-                int delta_hz = delta_px * dsp::getSpanRate() / log_w;
+                int delta_hz = delta_px * dsp::getSpanRate() / spec_w;
                 uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
                 if (new_freq > 0) {
                     cat::setVfoFreq(new_freq);
@@ -398,7 +456,7 @@ void app::tick()
             } else if (drag_vfo_dirty && drag_start_freq > 0) {
                 // Final drag update
                 int delta_px = drag_current_x - drag_start_x;
-                int delta_hz = -delta_px * dsp::getSpanRate() / log_w;
+                int delta_hz = -delta_px * dsp::getSpanRate() / spec_w;
                 uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
                 if (new_freq > 0)
                     cat::setVfoFreq(new_freq);
@@ -412,7 +470,7 @@ void app::tick()
     // Sync drag VFO update with FFT (throttle to FFT rate, not touch rate)
     if (dragging && drag_vfo_dirty && new_spectrum && drag_start_freq > 0) {
         int delta_px = drag_current_x - drag_start_x;
-        int delta_hz = -delta_px * dsp::getSpanRate() / log_w;
+        int delta_hz = -delta_px * dsp::getSpanRate() / spec_w;
         uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
         if (new_freq > 0) {
             cat::setVfoFreq(new_freq);
@@ -442,8 +500,11 @@ void app::tick()
     int64_t t_spec = pal::micros();
 
     // Gap + Waterfall (includes VFO marker per-row)
-    draw::fillRect(fb, 0, HEADER_H + GAP + SPEC_H, log_w, GAP, COL_BLACK);
+    draw::fillRect(fb, 0, HEADER_H + GAP + SPEC_H, spec_w, GAP, COL_BLACK);
     draw_waterfall();
+
+    // Gain slider (right side)
+    draw_gain_slider();
     int64_t t_wf = pal::micros();
 
     // HUD text — span button on left (fixed width to avoid residuals)

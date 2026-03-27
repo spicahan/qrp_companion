@@ -9,7 +9,8 @@ using AudioOutCallback = void(*)(const float *samples, int count);
 void setAudioOutCallback(AudioOutCallback cb);
 
 int getDecimatedRate();  // returns sample_rate / DECIM_FACTOR
-void setAudioGain(float gain);  // linear gain for audio output (default 1.0)
+void setAudioGain(float gain);  // linear gain for audio output
+float getAudioGain();
 void setCwOffset(float offset_hz); // set CW offset NCO frequency (0 to disable)
 void setSoftNcoCorrection(float hz); // sub-10Hz fine correction added to CW NCO
 float getSoftNcoCorrection();
