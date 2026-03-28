@@ -56,9 +56,11 @@ static int wf_head = 0;
 static int wf_count = 0;
 static int num_bins;
 
-// Spectrum dB range for display mapping
-static constexpr float DB_MIN = -100.0f;
-static constexpr float DB_MAX = 0.0f;
+// Spectrum dB range for display mapping — tweak these to match your environment
+#define SPEC_DB_FLOOR  -110.0f   // noise floor (bottom of display)
+#define SPEC_DB_CEIL    -30.0f   // full scale (top of display)
+static constexpr float DB_MIN = SPEC_DB_FLOOR;
+static constexpr float DB_MAX = SPEC_DB_CEIL;
 
 static uint16_t spectrum_color(float norm)
 {
