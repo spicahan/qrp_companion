@@ -324,15 +324,18 @@ void app::tick()
     int cur_mode = cat::getMode();
     int cur_cw_offset = cat::getCwOffset();
     if (cur_mode != last_mode || cur_cw_offset != last_cw_offset) {
-        if (cur_mode > 0 && !last_mode) {
-            // First time mode is known — enable audio
-            dsp::setModeKnown(true);
-        }
         dsp::setSoftNcoCorrection(0);
-        if (cur_mode == 3 && cur_cw_offset > 0) {
-            dsp::setCwOffset((float)cur_cw_offset);
-        } else {
+        if (cur_mode == 3) {
+            // CW mode: wait for both mode AND offset before enabling audio
+            if (cur_cw_offset > 0) {
+                dsp::setCwOffset((float)cur_cw_offset);
+                dsp::setModeKnown(true);
+            }
+            // else: stay muted until offset is queried
+        } else if (cur_mode > 0) {
+            // Non-CW: enable audio immediately (no offset needed)
             dsp::setCwOffset(0);
+            dsp::setModeKnown(true);
         }
         last_mode = cur_mode;
         last_cw_offset = cur_cw_offset;
