@@ -47,6 +47,16 @@ static float g_apf_fir_delay_q[APF_FIR_TAPS];
 static int   g_apf_fir_pos = 0;
 static bool  g_apf_enabled = false;
 
+// SSB/DIGI audio filter (3kHz LPF for non-CW modes, at decimated rate)
+static constexpr int SSB_FIR_TAPS = 65;
+static constexpr float SSB_FIR_CUTOFF_HZ = 2800.0f; // 3kHz passband
+static float g_ssb_fir_coeffs[SSB_FIR_TAPS];
+static float g_ssb_fir_delay[SSB_FIR_TAPS]; // real-only (I stream)
+static int   g_ssb_fir_pos = 0;
+
+// Mode-gated audio: mute until mode info is available
+static bool  g_mode_known = false;
+
 // Goertzel fine-tune detector
 static constexpr int GOERTZEL_BINS = 301;      // -150Hz to +150Hz at 1Hz resolution
 static constexpr float GOERTZEL_BIN_HZ = 1.0f;  // 1Hz per bin
@@ -187,6 +197,21 @@ static void apf_fir_sample(float in_i, float in_q, float &out_i, float &out_q)
     out_q = acc_q;
 }
 
+// Apply SSB audio FIR (real-only, I stream) at decimated rate
+static float ssb_fir_sample(float in)
+{
+    g_ssb_fir_delay[g_ssb_fir_pos] = in;
+    g_ssb_fir_pos = (g_ssb_fir_pos + 1) % SSB_FIR_TAPS;
+
+    float acc = 0;
+    int idx = g_ssb_fir_pos;
+    for (int k = 0; k < SSB_FIR_TAPS; k++) {
+        acc += g_ssb_fir_delay[idx] * g_ssb_fir_coeffs[k];
+        idx = (idx + 1) % SSB_FIR_TAPS;
+    }
+    return acc;
+}
+
 static void flush_audio_out()
 {
     if (g_audio_out_pos > 0 && g_audio_out_cb) {
@@ -267,6 +292,12 @@ void dsp::init(int sample_rate, int fft_size)
     g_apf_fir_pos = 0;
     g_apf_enabled = false;
 
+    // SSB/DIGI audio filter (3kHz LPF)
+    design_fir_lowpass(g_ssb_fir_coeffs, SSB_FIR_TAPS, SSB_FIR_CUTOFF_HZ, dec_rate);
+    memset(g_ssb_fir_delay, 0, sizeof(g_ssb_fir_delay));
+    g_ssb_fir_pos = 0;
+    g_mode_known = false;
+
     dsps_fft2r_init_fc32(nullptr, fft_size);
 
     for (int i = 0; i < g_num_bins; i++)
@@ -334,6 +365,7 @@ void dsp::setSoftNcoCorrection(float hz)
 
 float dsp::getSoftNcoCorrection() { return g_soft_nco_hz; }
 
+void dsp::setModeKnown(bool known) { g_mode_known = known; }
 void dsp::setApfEnabled(bool enabled) { g_apf_enabled = enabled; }
 bool dsp::isApfEnabled() { return g_apf_enabled; }
 
@@ -401,10 +433,11 @@ void dsp::pushIQ(const float *iq, int num_frames)
 
                 // ↓8 stage (idx 2) always feeds audio output
                 if (si == AUDIO_DECIM_IDX) {
-                    float audio;
-                    if (g_cw_nco_active) {
+                    float audio = 0;
+                    if (!g_mode_known) {
+                        // Mute until mode is determined
+                    } else if (g_cw_nco_active) {
                         float filt_i, filt_q;
-                        // Use APF (40Hz BW) or standard CW filter (300Hz BW)
                         if (g_apf_enabled)
                             apf_fir_sample(di, dq, filt_i, filt_q);
                         else
@@ -448,7 +481,8 @@ void dsp::pushIQ(const float *iq, int num_frames)
                         nco::mixUp(g_sidetone_nco, filt_i, filt_q, tone_i, tone_q);
                         audio = tone_i;
                     } else {
-                        audio = di;
+                        // Non-CW: 3kHz LPF on I stream
+                        audio = ssb_fir_sample(di);
                     }
                     audio *= g_audio_gain;
                     // Soft saturation (tanh) instead of hard clip

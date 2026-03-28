@@ -284,8 +284,9 @@ void app::init()
     wf_pixels_t = new uint16_t[spec_w * WF_MAX_LINES]();  // transposed pixel cache
     last_dsp_time = pal::micros();
 
-    g_vfo_x = log_w * 3 / 4;
     COL_MARKER = draw::rgb565(255, 255, 255);
+    dsp::setSpan(1);  // start with ±12k span
+    g_vfo_x = spec_w / 2;
     precompute_pixel_bin_map();
 
     // Open audio input (UAC on Tab5, PortAudio on desktop)
@@ -323,7 +324,11 @@ void app::tick()
     int cur_mode = cat::getMode();
     int cur_cw_offset = cat::getCwOffset();
     if (cur_mode != last_mode || cur_cw_offset != last_cw_offset) {
-        dsp::setSoftNcoCorrection(0);  // reset on mode/offset change
+        if (cur_mode > 0 && !last_mode) {
+            // First time mode is known — enable audio
+            dsp::setModeKnown(true);
+        }
+        dsp::setSoftNcoCorrection(0);
         if (cur_mode == 3 && cur_cw_offset > 0) {
             dsp::setCwOffset((float)cur_cw_offset);
         } else {
