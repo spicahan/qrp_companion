@@ -60,7 +60,7 @@ static bool  g_mode_known = false;
 // Goertzel fine-tune detector
 static constexpr int GOERTZEL_BINS = 301;      // -150Hz to +150Hz at 1Hz resolution
 static constexpr float GOERTZEL_BIN_HZ = 1.0f;  // 1Hz per bin
-static constexpr float GOERTZEL_DURATION_S = 3.0f;
+static constexpr float GOERTZEL_DURATION_S = 1.0f;
 
 struct GoertzelBin {
     float coeff;    // 2*cos(2*pi*f/fs)
