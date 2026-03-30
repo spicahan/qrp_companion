@@ -9,13 +9,15 @@
 
 // Layout constants (logical landscape)
 static constexpr int HEADER_H = 28;
-static constexpr int SPEC_H   = 180;
-static constexpr int GAP      = 2;
+static constexpr int SPEC_H   = 254;  // 256 - GAP
+static constexpr int GAP      = 2;    // green separator between spectrum and waterfall
+static constexpr int WF_H_FIXED = 256;
 static constexpr int INFO_H   = 28;
 
 static int log_w, log_h;
 static int spec_w;        // spectrum/waterfall width (1024 to match FFT)
-static int spec_x;        // spectrum/waterfall left offset (centered)
+static int spec_x;        // spectrum/waterfall left offset (centered horizontally)
+static int spec_y;        // spectrum top (centered vertically)
 static int slider_x;      // gain slider left edge
 static constexpr int SLIDER_W = 128;
 static int wf_y, wf_h;
@@ -96,8 +98,6 @@ static uint16_t COL_MARKER;
 
 static void draw_spectrum(const float *mag_db)
 {
-    int spec_y = HEADER_H + GAP;
-
     // Clear spectrum area
     draw::fillRect(fb, spec_x, spec_y, spec_w, SPEC_H, COL_BLACK);
 
@@ -198,8 +198,8 @@ static bool gain_dragging = false;
 
 static float gain_from_y(int y)
 {
-    int sy = HEADER_H + GAP;
-    int sh = SPEC_H + GAP + (log_h - (HEADER_H + GAP + SPEC_H + GAP) - INFO_H);
+    int sy = spec_y;
+    int sh = SPEC_H + GAP + wf_h;
     float norm = 1.0f - (float)(y - sy) / sh;
     if (norm < 0) norm = 0;
     if (norm > 1) norm = 1;
@@ -210,7 +210,7 @@ static float gain_from_y(int y)
 
 static void draw_gain_slider()
 {
-    int sy = HEADER_H + GAP;
+    int sy = spec_y;
     int sh = SPEC_H + GAP + wf_h;
     int sx = slider_x;
 
@@ -252,13 +252,19 @@ void app::init()
     log_w = info.width;
     log_h = info.height;
 
-    spec_w = 1024;  // match FFT size for 1:1 bin-to-pixel
-    spec_x = (log_w - spec_w) / 2;  // centered (128px margins)
-    slider_x = log_w - SLIDER_W;    // gain slider on far right
+    spec_w = 1024;
+    spec_x = (log_w - spec_w) / 2;  // centered horizontally
+    slider_x = log_w - SLIDER_W;
 
-    wf_y = HEADER_H + GAP + SPEC_H + GAP;
-    wf_y = (wf_y + 31) & ~31;
-    wf_h = log_h - wf_y - INFO_H;
+    // Center the 1024x512 block vertically between header and info bar
+    int block_h = SPEC_H + GAP + WF_H_FIXED;  // 254 + 2 + 256 = 512
+    int avail_h = log_h - HEADER_H - INFO_H;
+    int block_y = HEADER_H + (avail_h - block_h) / 2;
+
+    spec_y = block_y;
+    wf_y = block_y + SPEC_H + GAP;
+    wf_y = (wf_y + 31) & ~31;  // cache-line align for PPA
+    wf_h = WF_H_FIXED;
 
     // Set up framebuffer context
     fb.buf    = pal::getFramebuffer();
@@ -510,7 +516,8 @@ void app::tick()
     int64_t t_spec = pal::micros();
 
     // Gap + Waterfall (includes VFO marker per-row)
-    draw::fillRect(fb, spec_x, HEADER_H + GAP + SPEC_H, spec_w, GAP, COL_BLACK);
+    // Green separator between spectrum and waterfall
+    draw::fillRect(fb, spec_x, spec_y + SPEC_H, spec_w, GAP, COL_GREEN);
     draw_waterfall();
 
     // Gain slider (right side)
