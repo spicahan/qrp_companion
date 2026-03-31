@@ -40,10 +40,10 @@ void Button::draw(const draw::Framebuf &fb)
 
 bool Button::onTouch(int tx, int ty, int action)
 {
-    if (action != 2 && contains(tx, ty)) {  // action 2 = UP
-        return false;  // wait for release
-    }
-    if (action == 2 && contains(tx, ty)) {
+    if (!contains(tx, ty)) return false;
+    if (action == 0) return true;   // DOWN: consume to prevent fall-through
+    if (action == 1) return true;   // MOVE: consume
+    if (action == 2) {              // UP: fire action
         if (on_press) on_press(*this);
         return true;
     }
