@@ -120,6 +120,12 @@ void cat::setVfoFreq(uint64_t freq_hz)
     freq_hz = (freq_hz / 10) * 10;  // round to 10 Hz
     char cmd[24];
     snprintf(cmd, sizeof(cmd), "FA%011llu;", (unsigned long long)freq_hz);
+    // Flush rx buffer before sending to avoid response interleaving
+    s_rx_pos = 0;
+    char discard[64];
+    while (pal::catRecv(discard, sizeof(discard)) > 0) {}
     send_cmd(cmd);
-    s_vfo_freq = freq_hz;  // optimistic update for immediate display
+    s_vfo_freq = freq_hz;  // optimistic update
+    // Reset poll timer to give QMX time to process before next poll
+    s_last_poll = pal::micros();
 }

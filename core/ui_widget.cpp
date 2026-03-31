@@ -153,6 +153,8 @@ void Band::setLayout(const char *panel_id)
 
 void Band::draw(const draw::Framebuf &fb)
 {
+    // Clear the full band area before drawing active panel (prevents residuals on layout switch)
+    draw::fillRect(fb, x, y, w, h, draw::rgb565(32, 32, 32));
     Panel *p = active();
     if (p) p->draw(fb);
 }
