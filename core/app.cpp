@@ -3,23 +3,24 @@
 #include "draw.h"
 #include "dsp.h"
 #include "cat.h"
+#include "ui_state.h"
+#include "ui_widget.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 
-// Layout constants (logical landscape)
-static constexpr int HEADER_H = 28;
-static constexpr int SPEC_H   = 254;  // 256 - GAP
-static constexpr int GAP      = 2;    // green separator between spectrum and waterfall
+// ═══════════════════════════════════════════════════════════════
+// Layout constants
+// ═══════════════════════════════════════════════════════════════
+static constexpr int HEADER_H   = 28;
+static constexpr int SPEC_H     = 254;
+static constexpr int GAP        = 2;
 static constexpr int WF_H_FIXED = 256;
-static constexpr int INFO_H   = 28;
+static constexpr int INFO_H     = 28;
+static constexpr int SIDE_W     = 128;
 
 static int log_w, log_h;
-static int spec_w;        // spectrum/waterfall width (1024 to match FFT)
-static int spec_x;        // spectrum/waterfall left offset (centered horizontally)
-static int spec_y;        // spectrum top (centered vertically)
-static int slider_x;      // gain slider left edge
-static constexpr int SLIDER_W = 128;
+static int spec_w, spec_x, spec_y;
 static int wf_y, wf_h;
 static draw::Framebuf fb;
 
@@ -27,43 +28,39 @@ static draw::Framebuf fb;
 static uint16_t COL_NAVY, COL_DGREY, COL_BLACK, COL_WHITE;
 static uint16_t COL_CYAN, COL_GREEN, COL_YELLOW, COL_RED;
 
-// FPS
-static uint32_t frame_count;
-static float fps;
-static int64_t fps_last_time;
-
-// Per-phase timing (ms)
-static float t_dsp_ms, t_spec_ms, t_wf_ms, t_hud_ms, t_commit_ms, t_total_ms;
-
-// Touch / drag-to-tune
-static int64_t touch_time;
-static int touch_x, touch_y;
-static char touch_text[64];
-static bool  dragging = false;
-static int   drag_start_x;          // screen X at touch DOWN
-static uint64_t drag_start_freq;    // VFO freq at touch DOWN
-static int   drag_current_x;        // latest drag X
-static bool  drag_vfo_dirty = false; // true if drag moved since last FFT sync
-
 // DSP
 static constexpr int SAMPLE_RATE = 48000;
 static constexpr int FFT_SIZE    = 1024;
 static int64_t last_dsp_time;
 
-// Waterfall ring buffer
+// Waterfall
 static constexpr int WF_MAX_LINES = 512;
-static float *wf_db = nullptr;     // WF_MAX_LINES * num_bins (dB values)
-static uint16_t *wf_pixels_t = nullptr; // transposed pixel cache: [log_w][WF_MAX_LINES]
-static int wf_head = 0;
-static int wf_count = 0;
-static int num_bins;
+static float *wf_db = nullptr;
+static uint16_t *wf_pixels_t = nullptr;
+static int wf_head = 0, wf_count = 0, num_bins;
 
-// Spectrum dB range for display mapping — tweak these to match your environment
-#define SPEC_DB_FLOOR  -110.0f   // noise floor (bottom of display)
-#define SPEC_DB_CEIL    -30.0f   // full scale (top of display)
-static constexpr float DB_MIN = SPEC_DB_FLOOR;
-static constexpr float DB_MAX = SPEC_DB_CEIL;
+// VFO marker
+static int g_vfo_x;
+static uint16_t COL_MARKER;
+static int *g_pixel_to_fftbin = nullptr;
 
+// Spectrum dB range — read from properties
+#define SPEC_DB_FLOOR  -110.0f
+#define SPEC_DB_CEIL    -30.0f
+
+// Drag-to-tune state
+static bool  dragging = false;
+static int   drag_start_x;
+static uint64_t drag_start_freq;
+static int   drag_current_x;
+static bool  drag_vfo_dirty = false;
+
+// Per-phase timing (ms)
+static float t_dsp_ms, t_spec_ms, t_wf_ms, t_hud_ms, t_commit_ms, t_total_ms;
+
+// ═══════════════════════════════════════════════════════════════
+// Spectrum / waterfall helpers (unchanged)
+// ═══════════════════════════════════════════════════════════════
 static uint16_t spectrum_color(float norm)
 {
     if (norm > 1.0f) norm = 1.0f;
@@ -76,7 +73,9 @@ static uint16_t spectrum_color(float norm)
 
 static uint16_t waterfall_color_from_db(float db)
 {
-    float norm = (db - DB_MIN) / (DB_MAX - DB_MIN);
+    float floor = ui::get_f32(ui::PROP_db_floor);
+    float ceil  = ui::get_f32(ui::PROP_db_ceil);
+    float norm = (db - floor) / (ceil - floor);
     if (norm < 0.0f) norm = 0.0f;
     if (norm > 1.0f) norm = 1.0f;
     int intensity = (int)(norm * 255);
@@ -87,48 +86,7 @@ static uint16_t waterfall_color_from_db(float db)
     return draw::rgb565(r, g, b);
 }
 
-// Map FFT bin index to display x coordinate
-static int bin_to_x(int bin)
-{
-    return bin * spec_w / num_bins;
-}
-
-static int g_vfo_x;  // VFO marker x position
-static uint16_t COL_MARKER;
-
-static void draw_spectrum(const float *mag_db)
-{
-    // Clear spectrum area
-    draw::fillRect(fb, spec_x, spec_y, spec_w, SPEC_H, COL_BLACK);
-
-    // VFO marker FIRST (so signal bars draw on top of it, not hidden)
-    draw::drawVLine(fb, spec_x + g_vfo_x, spec_y, SPEC_H, COL_MARKER);
-
-    // Draw spectrum bars
-    for (int di = 0; di < num_bins; di++) {
-        int x0 = bin_to_x(di);
-        int x1 = bin_to_x(di + 1);
-        if (x1 <= x0) x1 = x0 + 1;
-        if (x0 >= spec_w) break;
-
-        int fft_bin = dsp::displayBin(di);
-        float norm = (mag_db[fft_bin] - DB_MIN) / (DB_MAX - DB_MIN);
-        if (norm < 0.0f) norm = 0.0f;
-        if (norm > 1.0f) norm = 1.0f;
-
-        int bar_h = (int)(norm * SPEC_H);
-        if (bar_h < 1) bar_h = 1;
-
-        int bar_w = x1 - x0;
-        if (x0 + bar_w > spec_w) bar_w = spec_w - x0;
-
-        uint16_t color = spectrum_color(norm);
-        draw::fillRect(fb, spec_x + x0, spec_y + SPEC_H - bar_h, bar_w, bar_h, color);
-    }
-}
-
-// Pre-computed bin index for each logical x pixel (avoids repeated bin_to_x + displayBin)
-static int *g_pixel_to_fftbin = nullptr;
+static int bin_to_x(int bin) { return bin * spec_w / num_bins; }
 
 static void precompute_pixel_bin_map()
 {
@@ -141,44 +99,60 @@ static void precompute_pixel_bin_map()
     }
 }
 
+static void draw_spectrum(const float *mag_db)
+{
+    float floor = ui::get_f32(ui::PROP_db_floor);
+    float ceil  = ui::get_f32(ui::PROP_db_ceil);
+
+    draw::fillRect(fb, spec_x, spec_y, spec_w, SPEC_H, COL_BLACK);
+    draw::drawVLine(fb, spec_x + g_vfo_x, spec_y, SPEC_H, COL_MARKER);
+
+    for (int di = 0; di < num_bins; di++) {
+        int x0 = bin_to_x(di);
+        int x1 = bin_to_x(di + 1);
+        if (x1 <= x0) x1 = x0 + 1;
+        if (x0 >= spec_w) break;
+
+        int fft_bin = dsp::displayBin(di);
+        float norm = (mag_db[fft_bin] - floor) / (ceil - floor);
+        if (norm < 0.0f) norm = 0.0f;
+        if (norm > 1.0f) norm = 1.0f;
+
+        int bar_h = (int)(norm * SPEC_H);
+        if (bar_h < 1) bar_h = 1;
+
+        int bar_w = x1 - x0;
+        if (x0 + bar_w > spec_w) bar_w = spec_w - x0;
+
+        draw::fillRect(fb, spec_x + x0, spec_y + SPEC_H - bar_h, bar_w, bar_h, spectrum_color(norm));
+    }
+}
+
 static void draw_waterfall()
 {
     if (wf_count == 0) return;
-
     int n = wf_count;
     if (n > wf_h) n = wf_h;
 
     if (fb.rotated) {
-        // wf_pixels_t layout: [log_w rows][WF_MAX_LINES cols], one row per freq bin.
-        // Physical row py reads from src row (log_w-1-py) → need mirror_y.
-        // Ring buffer: forward from wf_head = newest first.
-        // PPA blitBlock with mirror_y handles the Y-flip in hardware.
-
-        // In rotated mode, logical spec_x maps to physical dst_y offset
-        int phys_dy = fb.rotated ? (fb.log_w - spec_x - spec_w) : 0;
-
+        int phys_dy = fb.log_w - spec_x - spec_w;
         int start = wf_head;
         if (start + n <= WF_MAX_LINES) {
             pal::blitBlock(wf_pixels_t, WF_MAX_LINES, start, 0,
-                           fb.buf, fb.phys_w, wf_y, phys_dy,
-                           n, spec_w, true);
+                           fb.buf, fb.phys_w, wf_y, phys_dy, n, spec_w, true);
         } else {
             int first = WF_MAX_LINES - start;
             int second = n - first;
             pal::blitBlock(wf_pixels_t, WF_MAX_LINES, start, 0,
-                           fb.buf, fb.phys_w, wf_y, phys_dy,
-                           first, spec_w, true);
+                           fb.buf, fb.phys_w, wf_y, phys_dy, first, spec_w, true);
             pal::blitBlock(wf_pixels_t, WF_MAX_LINES, 0, 0,
-                           fb.buf, fb.phys_w, wf_y + first, phys_dy,
-                           second, spec_w, true);
+                           fb.buf, fb.phys_w, wf_y + first, phys_dy, second, spec_w, true);
         }
-
         if (n < wf_h) {
             for (int py = phys_dy; py < phys_dy + spec_w; py++)
                 memset(&fb.buf[py * fb.phys_w + wf_y + n], 0, (wf_h - n) * sizeof(uint16_t));
         }
     } else {
-        // Non-rotated (desktop): each logical row = one time step
         for (int row = 0; row < n; row++) {
             int fy = wf_y + row;
             int time_idx = (wf_head + row) % WF_MAX_LINES;
@@ -191,61 +165,165 @@ static void draw_waterfall()
     }
 }
 
-// Gain slider
-static constexpr float GAIN_MIN = 100.0f;
-static constexpr float GAIN_MAX = 10000.0f;
-static bool gain_dragging = false;
-
-static float gain_from_y(int y)
-{
-    int sy = spec_y;
-    int sh = SPEC_H + GAP + wf_h;
-    float norm = 1.0f - (float)(y - sy) / sh;
-    if (norm < 0) norm = 0;
-    if (norm > 1) norm = 1;
-    float log_min = log10f(GAIN_MIN);
-    float log_max = log10f(GAIN_MAX);
-    return powf(10.0f, log_min + norm * (log_max - log_min));
+// ═══════════════════════════════════════════════════════════════
+// Property change callbacks (system integration)
+// ═══════════════════════════════════════════════════════════════
+static void on_vfo_change(ui::PropId, ui::Source src) {
+    if (src == ui::FROM_UI)
+        cat::setVfoFreq(ui::get_u64(ui::PROP_vfo_freq));
 }
 
-static void draw_gain_slider()
-{
-    int sy = spec_y;
-    int sh = SPEC_H + GAP + wf_h;
-    int sx = slider_x;
-
-    draw::fillRect(fb, sx, sy, SLIDER_W, sh, COL_DGREY);
-    draw::drawVLine(fb, sx + SLIDER_W / 2, sy + 4, sh - 8, COL_BLACK);
-
-    float gain = dsp::getAudioGain();
-    float log_min = log10f(GAIN_MIN);
-    float log_max = log10f(GAIN_MAX);
-    float log_gain = log10f(gain > GAIN_MIN ? gain : GAIN_MIN);
-    float norm = (log_gain - log_min) / (log_max - log_min);
-    if (norm < 0) norm = 0;
-    if (norm > 1) norm = 1;
-
-    int bar_y = sy + (int)((1.0f - norm) * (sh - 10));
-    draw::fillRect(fb, sx + 8, bar_y, SLIDER_W - 16, 6, COL_WHITE);
-
-    char lbl[16];
-    int gain_db = (int)(20.0f * log10f(gain) + 0.5f);
-    snprintf(lbl, sizeof(lbl), "%ddB", gain_db);
-    draw::drawText(fb, sx + 4, bar_y - 12, lbl, COL_GREEN, COL_DGREY);
+static void on_gain_change(ui::PropId, ui::Source) {
+    dsp::setAudioGain(ui::get_f32(ui::PROP_audio_gain));
 }
 
-// Audio output callback — receives decimated mono samples from DSP, forwards to PAL
-static void audio_output_cb(const float *samples, int count)
-{
+static void on_span_change(ui::PropId, ui::Source) {
+    dsp::setSpan(ui::get_i32(ui::PROP_span_idx));
+    precompute_pixel_bin_map();
+}
+
+static void on_apf_change(ui::PropId, ui::Source) {
+    dsp::setApfEnabled(ui::get_bool(ui::PROP_apf_enabled));
+}
+
+static void on_mode_change(ui::PropId, ui::Source src) {
+    int mode = ui::get_i32(ui::PROP_mode);
+    int offset = ui::get_i32(ui::PROP_cw_offset);
+    ui::set_f32(ui::PROP_soft_nco, 0, ui::FROM_DSP);
+    dsp::setSoftNcoCorrection(0);
+    if (mode == 3 && offset > 0) {
+        dsp::setCwOffset((float)offset);
+        dsp::setModeKnown(true);
+    } else if (mode > 0) {
+        dsp::setCwOffset(0);
+        dsp::setModeKnown(true);
+    }
+}
+
+static void on_cwofs_change(ui::PropId, ui::Source) {
+    on_mode_change(ui::PROP_mode, ui::FROM_RADIO);  // re-evaluate
+}
+
+static void on_nco_change(ui::PropId, ui::Source) {
+    dsp::setSoftNcoCorrection(ui::get_f32(ui::PROP_soft_nco));
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Widget definitions
+// ═══════════════════════════════════════════════════════════════
+
+// --- Header labels ---
+static void fmt_span(char *buf, int len) {
+    snprintf(buf, len, "%-9s", dsp::getSpanLabel());
+}
+
+static void fmt_freq(char *buf, int len) {
+    uint64_t vfo = ui::get_u64(ui::PROP_vfo_freq);
+    if (vfo > 0) {
+        int mhz  = (int)(vfo / 1000000);
+        int khz  = (int)((vfo % 1000000) / 1000);
+        int hz10 = (int)((vfo % 1000) / 10);
+        float soft = ui::get_f32(ui::PROP_soft_nco);
+        int mode = ui::get_i32(ui::PROP_mode);
+        if (soft != 0.0f && mode == 3)
+            snprintf(buf, len, "%-4s %d.%03d.%02d%+.1f", cat::getModeStr(), mhz, khz, hz10, soft);
+        else
+            snprintf(buf, len, "%-4s %d.%03d.%02d", cat::getModeStr(), mhz, khz, hz10);
+    } else {
+        snprintf(buf, len, "%-4s ---.---.--", cat::getModeStr());
+    }
+    int blen = strlen(buf);
+    while (blen < 24) buf[blen++] = ' ';
+    buf[blen] = '\0';
+}
+
+static void fmt_fps(char *buf, int len) {
+    float f = ui::get_f32(ui::PROP_fps);
+    int mode = ui::get_i32(ui::PROP_mode);
+    bool apf = ui::get_bool(ui::PROP_apf_enabled);
+    if (mode == 3)
+        snprintf(buf, len, "%s %4.0fFPS", apf ? "APF" : "CW ", f);
+    else
+        snprintf(buf, len, "%4.0fFPS", f);
+}
+
+static void fmt_info1(char *buf, int len) {
+    snprintf(buf, len, "dsp:%4.1f spec:%4.1f wf:%5.1f hud:%4.1f commit:%4.1f total:%5.1fms",
+             t_dsp_ms, t_spec_ms, t_wf_ms, t_hud_ms, t_commit_ms, t_total_ms);
+}
+
+static void fmt_info2(char *buf, int len) {
+    snprintf(buf, len, "%dx%d  heap:%dK  psram:%dK   ",
+             log_w, log_h, pal::freeHeapKb(), pal::freePsramKb());
+}
+
+static ui::Label lbl_span, lbl_freq, lbl_fps, lbl_info1, lbl_info2;
+
+// --- Bottom band buttons ---
+static ui::Band bottom_band;
+
+static void btn_span_press(ui::Button &) {
+    int cur = ui::get_i32(ui::PROP_span_idx);
+    ui::set_i32(ui::PROP_span_idx, (cur + 1) % dsp::NUM_SPANS);
+}
+
+static void btn_filter_press(ui::Button &) {
+    if (ui::get_i32(ui::PROP_mode) == 3)
+        ui::set_bool(ui::PROP_apf_enabled, !ui::get_bool(ui::PROP_apf_enabled));
+}
+
+static void btn_zerobeat_press(ui::Button &) {
+    if (ui::get_i32(ui::PROP_mode) == 3)
+        dsp::startGoertzel();
+}
+
+static void btn_band_press(ui::Button &) {
+    bottom_band.setLayout("band_select");
+}
+
+static void btn_back_press(ui::Button &) {
+    bottom_band.setLayout("default");
+}
+
+// Band selection helpers
+static void tune_band(uint64_t freq) {
+    ui::set_u64(ui::PROP_vfo_freq, freq);
+    bottom_band.setLayout("default");
+}
+static void btn_80_press(ui::Button &) { tune_band(3573000); }
+static void btn_40_press(ui::Button &) { tune_band(7074000); }
+static void btn_20_press(ui::Button &) { tune_band(14070000); }
+static void btn_15_press(ui::Button &) { tune_band(21074000); }
+static void btn_10_press(ui::Button &) { tune_band(28074000); }
+
+static ui::Button btn_span, btn_filter, btn_zerobeat, btn_band;
+static ui::Button btn_80, btn_40, btn_20, btn_15, btn_10, btn_back;
+
+static ui::Panel panel_bottom_default = { "default" };
+static ui::Panel panel_band_select    = { "band_select" };
+
+// --- Right band slider ---
+static ui::Slider slider_gain;
+static ui::Panel panel_right_default = { "default" };
+
+// --- Bands ---
+static ui::Band header_band, right_band, info_band;
+static ui::Panel panel_header = { "default" };
+static ui::Panel panel_info   = { "default" };
+
+// ═══════════════════════════════════════════════════════════════
+// Audio callbacks
+// ═══════════════════════════════════════════════════════════════
+static void audio_output_cb(const float *samples, int count) {
     pal::audioOutputWrite(samples, count);
 }
-
-// Audio input callback — called from audio thread, pushes I/Q to DSP
-static void audio_input_cb(const float *iq_samples, int num_frames)
-{
+static void audio_input_cb(const float *iq_samples, int num_frames) {
     dsp::pushIQ(iq_samples, num_frames);
 }
 
+// ═══════════════════════════════════════════════════════════════
+// Init
+// ═══════════════════════════════════════════════════════════════
 void app::init()
 {
     auto info = pal::getDisplayInfo();
@@ -253,23 +331,20 @@ void app::init()
     log_h = info.height;
 
     spec_w = 1024;
-    spec_x = (log_w - spec_w) / 2;  // centered horizontally
-    slider_x = log_w - SLIDER_W;
+    spec_x = (log_w - spec_w) / 2;
 
-    // Center the 1024x512 block vertically between header and info bar
-    int block_h = SPEC_H + GAP + WF_H_FIXED;  // 254 + 2 + 256 = 512
+    int block_h = SPEC_H + GAP + WF_H_FIXED;
     int avail_h = log_h - HEADER_H - INFO_H;
     int block_y = HEADER_H + (avail_h - block_h) / 2;
 
     spec_y = block_y;
     wf_y = block_y + SPEC_H + GAP;
-    wf_y = (wf_y + 31) & ~31;  // cache-line align for PPA
+    wf_y = (wf_y + 31) & ~31;
     wf_h = WF_H_FIXED;
 
-    // Set up framebuffer context
     fb.buf    = pal::getFramebuffer();
     fb.phys_w = pal::getFramebufferStride();
-    fb.phys_h = pal::isRotated() ? log_w : log_h;  // physical height
+    fb.phys_h = pal::isRotated() ? log_w : log_h;
     fb.log_w  = log_w;
     fb.log_h  = log_h;
     fb.rotated = pal::isRotated();
@@ -282,100 +357,172 @@ void app::init()
     COL_GREEN  = draw::rgb565(0, 255, 0);
     COL_YELLOW = draw::rgb565(255, 255, 0);
     COL_RED    = draw::rgb565(255, 0, 0);
+    COL_MARKER = COL_WHITE;
 
-    // DSP init
+    // --- UI property system ---
+    ui::init();
+    ui::set_f32(ui::PROP_audio_gain, 1000.0f, ui::FROM_INIT);
+    ui::set_f32(ui::PROP_db_floor, SPEC_DB_FLOOR, ui::FROM_INIT);
+    ui::set_f32(ui::PROP_db_ceil, SPEC_DB_CEIL, ui::FROM_INIT);
+    ui::set_i32(ui::PROP_span_idx, 1, ui::FROM_INIT);
+
+    ui::on_change(ui::PROP_vfo_freq,    on_vfo_change);
+    ui::on_change(ui::PROP_audio_gain,  on_gain_change);
+    ui::on_change(ui::PROP_span_idx,    on_span_change);
+    ui::on_change(ui::PROP_apf_enabled, on_apf_change);
+    ui::on_change(ui::PROP_mode,        on_mode_change);
+    ui::on_change(ui::PROP_cw_offset,   on_cwofs_change);
+    ui::on_change(ui::PROP_soft_nco,    on_nco_change);
+
+    // --- DSP ---
     dsp::init(SAMPLE_RATE, FFT_SIZE);
     num_bins = dsp::getNumBins();
     wf_db = new float[WF_MAX_LINES * num_bins]();
-    wf_pixels_t = new uint16_t[spec_w * WF_MAX_LINES]();  // transposed pixel cache
+    wf_pixels_t = new uint16_t[spec_w * WF_MAX_LINES]();
     last_dsp_time = pal::micros();
 
-    COL_MARKER = draw::rgb565(255, 255, 255);
-    dsp::setSpan(1);  // start with ±12k span
+    dsp::setSpan(1);
     g_vfo_x = spec_w / 2;
     precompute_pixel_bin_map();
 
-    // Open audio input (UAC on Tab5, PortAudio on desktop)
-    // Audio output (decimated 6kHz mono from DSP)
+    // --- Init widgets ---
+    auto make_label = [](ui::Label &l, int x, int y, ui::Label::FormatFunc fmt,
+                         uint16_t col, uint16_t bg, int scale, int pad) {
+        l.type = ui::W_LABEL; l.x = x; l.y = y; l.w = 0; l.h = 0;
+        l.format = fmt; l.color = col; l.bg = bg; l.scale = scale; l.pad_chars = pad;
+    };
+    auto make_button = [](ui::Button &b, const char *label, uint16_t col, uint16_t bg,
+                          ui::Button::PressFunc press, ui::PropId bind = ui::PROP_COUNT, bool toggle = false) {
+        b.type = ui::W_BUTTON; b.label = label; b.color = col; b.bg = bg;
+        b.scale = 1; b.on_press = press; b.bind = bind; b.show_as_toggle = toggle;
+    };
+
+    make_label(lbl_span,  8, 6, fmt_span, COL_CYAN, COL_NAVY, 2, 9);
+    make_label(lbl_fps,   log_w - 200, 6, fmt_fps, COL_GREEN, COL_NAVY, 2, 12);
+    make_label(lbl_info1, 8, log_h - INFO_H + 4, fmt_info1, COL_WHITE, COL_DGREY, 1, 80);
+    make_label(lbl_info2, 8, log_h - INFO_H + 16, fmt_info2, COL_WHITE, COL_DGREY, 1, 40);
+
+    int freq_tw = draw::textWidth("CW  14.070.02+3.0       ", 2);
+    make_label(lbl_freq, (log_w - freq_tw) / 2, 6, fmt_freq, COL_GREEN, COL_NAVY, 2, 24);
+
+    panel_header.add(&lbl_span);
+    panel_header.add(&lbl_freq);
+    panel_header.add(&lbl_fps);
+    header_band.x = 0; header_band.y = 0; header_band.w = log_w; header_band.h = HEADER_H;
+    header_band.addPanel(&panel_header);
+
+    // Init buttons
+    make_button(btn_span,     "Span",   COL_CYAN,   COL_DGREY, btn_span_press);
+    make_button(btn_filter,   "Filter", COL_YELLOW, COL_DGREY, btn_filter_press, ui::PROP_apf_enabled, true);
+    make_button(btn_zerobeat, "ZeroBt", COL_GREEN,  COL_DGREY, btn_zerobeat_press);
+    make_button(btn_band,     "Band",   COL_WHITE,  COL_DGREY, btn_band_press);
+    make_button(btn_80,  "80",   COL_WHITE, COL_NAVY, btn_80_press);
+    make_button(btn_40,  "40",   COL_WHITE, COL_NAVY, btn_40_press);
+    make_button(btn_20,  "20",   COL_WHITE, COL_NAVY, btn_20_press);
+    make_button(btn_15,  "15",   COL_WHITE, COL_NAVY, btn_15_press);
+    make_button(btn_10,  "10",   COL_WHITE, COL_NAVY, btn_10_press);
+    make_button(btn_back,"Back", COL_RED,   COL_DGREY, btn_back_press);
+
+    // Init slider
+    slider_gain.type = ui::W_SLIDER;
+    slider_gain.bind = ui::PROP_audio_gain;
+    slider_gain.min_val = 100.0f; slider_gain.max_val = 10000.0f;
+    slider_gain.logarithmic = true; slider_gain.unit = "dB";
+
+    // --- Layout: Right band (slider) ---
+    int slider_x = log_w - SIDE_W;
+    slider_gain.x = slider_x; slider_gain.y = spec_y;
+    slider_gain.w = SIDE_W; slider_gain.h = SPEC_H + GAP + wf_h;
+    panel_right_default.add(&slider_gain);
+    right_band.x = slider_x; right_band.y = spec_y;
+    right_band.w = SIDE_W; right_band.h = SPEC_H + GAP + wf_h;
+    right_band.addPanel(&panel_right_default);
+
+    // --- Layout: Bottom band (buttons) ---
+    int bot_y = log_h - INFO_H;
+    int bw = log_w / 5;
+    int bh = INFO_H;
+
+    btn_span.x = 0;    btn_span.y = bot_y;   btn_span.w = bw; btn_span.h = bh;
+    btn_filter.x = bw;  btn_filter.y = bot_y; btn_filter.w = bw; btn_filter.h = bh;
+    btn_zerobeat.x = 2*bw; btn_zerobeat.y = bot_y; btn_zerobeat.w = bw; btn_zerobeat.h = bh;
+    btn_band.x = 3*bw; btn_band.y = bot_y;   btn_band.w = bw; btn_band.h = bh;
+
+    panel_bottom_default.add(&btn_span);
+    panel_bottom_default.add(&btn_filter);
+    panel_bottom_default.add(&btn_zerobeat);
+    panel_bottom_default.add(&btn_band);
+
+    // Band select panel
+    int bbw = log_w / 6;
+    btn_80.x = 0;     btn_80.y = bot_y; btn_80.w = bbw; btn_80.h = bh;
+    btn_40.x = bbw;   btn_40.y = bot_y; btn_40.w = bbw; btn_40.h = bh;
+    btn_20.x = 2*bbw; btn_20.y = bot_y; btn_20.w = bbw; btn_20.h = bh;
+    btn_15.x = 3*bbw; btn_15.y = bot_y; btn_15.w = bbw; btn_15.h = bh;
+    btn_10.x = 4*bbw; btn_10.y = bot_y; btn_10.w = bbw; btn_10.h = bh;
+    btn_back.x = 5*bbw; btn_back.y = bot_y; btn_back.w = bbw; btn_back.h = bh;
+
+    panel_band_select.add(&btn_80);
+    panel_band_select.add(&btn_40);
+    panel_band_select.add(&btn_20);
+    panel_band_select.add(&btn_15);
+    panel_band_select.add(&btn_10);
+    panel_band_select.add(&btn_back);
+
+    bottom_band.x = 0; bottom_band.y = bot_y; bottom_band.w = log_w; bottom_band.h = bh;
+    bottom_band.addPanel(&panel_bottom_default);
+    bottom_band.addPanel(&panel_band_select);
+
+    // --- Layout: Info band (replaced by bottom band — info goes to header/bottom) ---
+    // Info labels are part of a simple overlay, not a band
+    lbl_info1.x = 8; lbl_info1.y = log_h - INFO_H + 4; lbl_info1.color = COL_WHITE; lbl_info1.bg = COL_DGREY;
+    lbl_info2.x = 8; lbl_info2.y = log_h - INFO_H + 16; lbl_info2.color = COL_WHITE; lbl_info2.bg = COL_DGREY;
+
+    // --- Audio ---
     pal::audioOutputOpen(dsp::getDecimatedRate());
     dsp::setAudioOutCallback(audio_output_cb);
-
     pal::audioInputOpen(audio_input_cb);
     cat::init();
-
-    fps = 0;
-    frame_count = 0;
-    fps_last_time = pal::micros();
-    touch_time = 0;
 }
 
+// ═══════════════════════════════════════════════════════════════
+// Tick
+// ═══════════════════════════════════════════════════════════════
 void app::tick()
 {
     int64_t t0 = pal::micros();
 
     // FPS
+    static uint32_t frame_count = 0;
+    static int64_t fps_last_time = 0;
     frame_count++;
     if (t0 - fps_last_time >= 1000000) {
-        fps = (float)frame_count * 1000000.0f / (t0 - fps_last_time);
+        ui::set_f32(ui::PROP_fps, (float)frame_count * 1000000.0f / (t0 - fps_last_time), ui::FROM_DSP);
         frame_count = 0;
         fps_last_time = t0;
     }
 
-    // --- CAT ---
+    // --- CAT → properties ---
     cat::poll();
+    ui::set_i32(ui::PROP_mode, cat::getMode(), ui::FROM_RADIO);
+    ui::set_u64(ui::PROP_vfo_freq, cat::getVfoFreq(), ui::FROM_RADIO);
+    ui::set_i32(ui::PROP_cw_offset, cat::getCwOffset(), ui::FROM_RADIO);
 
-    // Update CW offset NCO when mode/offset changes
-    static int last_mode = 0;
-    static int last_cw_offset = 0;
-    int cur_mode = cat::getMode();
-    int cur_cw_offset = cat::getCwOffset();
-    if (cur_mode != last_mode || cur_cw_offset != last_cw_offset) {
-        dsp::setSoftNcoCorrection(0);
-        if (cur_mode == 3) {
-            // CW mode: wait for both mode AND offset before enabling audio
-            if (cur_cw_offset > 0) {
-                dsp::setCwOffset((float)cur_cw_offset);
-                dsp::setModeKnown(true);
-            }
-            // else: stay muted until offset is queried
-        } else if (cur_mode > 0) {
-            // Non-CW: enable audio immediately (no offset needed)
-            dsp::setCwOffset(0);
-            dsp::setModeKnown(true);
-        }
-        last_mode = cur_mode;
-        last_cw_offset = cur_cw_offset;
-    }
+    // VFO marker position
+    g_vfo_x = (dsp::getSpan() == 0) ? spec_w * 3 / 4 : spec_w / 2;
 
-    // Update VFO marker position based on span (within spec_w area)
-    if (dsp::getSpan() == 0) {
-        g_vfo_x = spec_w * 3 / 4;  // 48kHz span: VFO at 3/4
-    } else {
-        g_vfo_x = spec_w / 2;      // narrow spans: VFO at center
-    }
-
-    // --- Goertzel fine-tune result ---
+    // --- Goertzel result → properties ---
     if (!dsp::isGoertzelRunning() && dsp::getGoertzelResult() != 0) {
         float g_offset = dsp::getGoertzelResult();
         dsp::clearGoertzelResult();
-        uint64_t vfo = cat::getVfoFreq();
+        uint64_t vfo = ui::get_u64(ui::PROP_vfo_freq);
         if (vfo > 0) {
-            // Round to nearest 10Hz for VFO CAT command
             int rounded = ((int)(g_offset + (g_offset >= 0 ? 5.0f : -5.0f))) / 10 * 10;
             int vfo_delta = -rounded;
-            // Soft NCO correction = the sub-10Hz residual
             float soft_hz = -(g_offset - (float)rounded);
-
-            if (vfo_delta != 0) {
-                uint64_t new_freq = (int64_t)vfo + vfo_delta;
-                cat::setVfoFreq(new_freq);
-            }
-            dsp::setSoftNcoCorrection(soft_hz);
-
-            snprintf(touch_text, sizeof(touch_text),
-                     "Fine %+.0fHz VFO%+d NCO%+.1f",
-                     g_offset, vfo_delta, soft_hz);
-            touch_time = t0;
+            if (vfo_delta != 0)
+                ui::set_u64(ui::PROP_vfo_freq, (int64_t)vfo + vfo_delta, ui::FROM_UI);
+            ui::set_f32(ui::PROP_soft_nco, soft_hz, ui::FROM_DSP);
         }
     }
 
@@ -385,97 +532,60 @@ void app::tick()
         last_dsp_time = t0;
         const float *mag = dsp::getMagnitudeDb();
         memcpy(&wf_db[wf_head * num_bins], mag, num_bins * sizeof(float));
-
-        // Decrement head FIRST, then write — forward reads from head give newest-first
         wf_head = (wf_head - 1 + WF_MAX_LINES) % WF_MAX_LINES;
-
-        // Pre-render into transposed pixel cache [lx][WF_MAX_LINES]
         for (int lx = 0; lx < spec_w; lx++) {
             int fft_bin = g_pixel_to_fftbin[lx];
             wf_pixels_t[lx * WF_MAX_LINES + wf_head] = waterfall_color_from_db(mag[fft_bin]);
         }
-
         if (wf_count < WF_MAX_LINES) wf_count++;
     }
     int64_t t_dsp = pal::micros();
 
-    // Poll touch events — tap-to-tune (on release) + drag-to-tune
-    static constexpr int TAP_THRESHOLD = 5;  // pixels — below this is a tap, above is drag
-
+    // --- Touch events ---
+    static constexpr int TAP_THRESHOLD = 5;
     pal::TouchEvent evt;
     while (pal::pollEvent(evt)) {
-        touch_x = evt.x;
-        touch_y = evt.y;
-        touch_time = t0;
+        int action = (evt.action == pal::TouchEvent::DOWN) ? 0
+                   : (evt.action == pal::TouchEvent::MOVE) ? 1 : 2;
 
+        // Route to bands first
+        if (bottom_band.onTouch(evt.x, evt.y, action)) continue;
+        if (right_band.onTouch(evt.x, evt.y, action)) continue;
+
+        // Spectrum touch-to-tune / drag-to-tune
         if (evt.action == pal::TouchEvent::DOWN) {
-            // Check header buttons
-            if (evt.y < HEADER_H) {
-                if (evt.x < 120) {
-                    // Span toggle button
-                    dsp::setSpan((dsp::getSpan() + 1) % dsp::NUM_SPANS);
-                    precompute_pixel_bin_map();
-                    continue;
-                }
-                // APF toggle button (right side of header, CW mode only)
-                if (evt.x > log_w - 80 && cat::getMode() == 3) {
-                    dsp::setApfEnabled(!dsp::isApfEnabled());
-                    continue;
-                }
-            }
-            // Gain slider area
-            if (evt.x >= slider_x) {
-                gain_dragging = true;
-                dsp::setAudioGain(gain_from_y(evt.y));
-                continue;
-            }
-            // Reset soft NCO correction on new tune action
             dsp::setSoftNcoCorrection(0);
+            ui::set_f32(ui::PROP_soft_nco, 0, ui::FROM_UI);
             dragging = true;
             drag_start_x = evt.x;
-            drag_start_freq = cat::getVfoFreq();
+            drag_start_freq = ui::get_u64(ui::PROP_vfo_freq);
             drag_current_x = evt.x;
             drag_vfo_dirty = false;
             cat::suppressPolling(true);
         }
-        else if (evt.action == pal::TouchEvent::MOVE && gain_dragging) {
-            dsp::setAudioGain(gain_from_y(evt.y));
-        }
         else if (evt.action == pal::TouchEvent::MOVE && dragging) {
             drag_current_x = evt.x;
             drag_vfo_dirty = true;
-        }
-        else if (evt.action == pal::TouchEvent::UP && gain_dragging) {
-            gain_dragging = false;
         }
         else if (evt.action == pal::TouchEvent::UP && dragging) {
             int total_drag = drag_current_x - drag_start_x;
             if (total_drag < 0) total_drag = -total_drag;
 
             if (total_drag < TAP_THRESHOLD && drag_start_freq > 0) {
-                // Tap-to-tune: coarse jump VFO to tapped frequency
                 int delta_px = evt.x - spec_x - g_vfo_x;
                 int delta_hz = delta_px * dsp::getSpanRate() / spec_w;
                 uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
                 if (new_freq > 0) {
-                    cat::setVfoFreq(new_freq);
-                    snprintf(touch_text, sizeof(touch_text),
-                             "%+dHz -> %d.%03d.%02d",
-                             delta_hz,
-                             (int)(new_freq / 1000000),
-                             (int)((new_freq % 1000000) / 1000),
-                             (int)((new_freq % 1000) / 10));
-                    // In CW mode, start Goertzel fine-tune
-                    if (cat::getMode() == 3)
+                    ui::set_u64(ui::PROP_vfo_freq, new_freq, ui::FROM_UI);
+                    if (ui::get_i32(ui::PROP_mode) == 3)
                         dsp::startGoertzel();
                 }
             } else if (drag_vfo_dirty && drag_start_freq > 0) {
-                // Final drag update
                 int delta_px = drag_current_x - drag_start_x;
                 int delta_hz = -delta_px * dsp::getSpanRate() / spec_w;
                 uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
                 if (new_freq > 0)
-                    cat::setVfoFreq(new_freq);
+                    ui::set_u64(ui::PROP_vfo_freq, new_freq, ui::FROM_UI);
             }
             dragging = false;
             drag_vfo_dirty = false;
@@ -483,20 +593,13 @@ void app::tick()
         }
     }
 
-    // Sync drag VFO update with FFT (throttle to FFT rate, not touch rate)
+    // Sync drag with FFT rate
     if (dragging && drag_vfo_dirty && new_spectrum && drag_start_freq > 0) {
         int delta_px = drag_current_x - drag_start_x;
         int delta_hz = -delta_px * dsp::getSpanRate() / spec_w;
         uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
-        if (new_freq > 0) {
-            cat::setVfoFreq(new_freq);
-            snprintf(touch_text, sizeof(touch_text),
-                     "%+dHz -> %d.%03d.%03d",
-                     delta_hz,
-                     (int)(new_freq / 1000000),
-                     (int)((new_freq % 1000000) / 1000),
-                     (int)(new_freq % 1000));
-        }
+        if (new_freq > 0)
+            ui::set_u64(ui::PROP_vfo_freq, new_freq, ui::FROM_UI);
         drag_vfo_dirty = false;
     }
 
@@ -506,76 +609,20 @@ void app::tick()
         int total = fb.rotated ? (fb.phys_w * fb.phys_h) : (fb.log_w * fb.log_h);
         for (int i = 0; i < total; i++) fb.buf[i] = COL_BLACK;
         draw::fillRect(fb, 0, 0, log_w, HEADER_H, COL_NAVY);
-        draw::fillRect(fb, 0, HEADER_H, log_w, GAP, COL_BLACK);
-        draw::fillRect(fb, 0, log_h - INFO_H, log_w, INFO_H, COL_DGREY);
         first_frame = false;
     }
 
-    // Spectrum (includes black fill above bars + VFO marker)
     draw_spectrum(dsp::getMagnitudeDb());
     int64_t t_spec = pal::micros();
 
-    // Gap + Waterfall (includes VFO marker per-row)
-    // Green separator between spectrum and waterfall
     draw::fillRect(fb, spec_x, spec_y + SPEC_H, spec_w, GAP, COL_GREEN);
     draw_waterfall();
 
-    // Gain slider (right side)
-    draw_gain_slider();
+    // Draw bands
+    header_band.draw(fb);
+    right_band.draw(fb);
+    bottom_band.draw(fb);
     int64_t t_wf = pal::micros();
-
-    // HUD text — span button on left (fixed width to avoid residuals)
-    char span_btn[16];
-    snprintf(span_btn, sizeof(span_btn), "%-9s", dsp::getSpanLabel());
-    draw::drawText(fb, 8, 6, span_btn, COL_CYAN, COL_NAVY, 2);
-
-    // Mode + VFO frequency centered in header (fixed width to avoid residuals)
-    char buf[80];
-    uint64_t vfo = cat::getVfoFreq();
-    if (vfo > 0) {
-        int mhz  = (int)(vfo / 1000000);
-        int khz  = (int)((vfo % 1000000) / 1000);
-        int hz10 = (int)((vfo % 1000) / 10);
-        float soft = dsp::getSoftNcoCorrection();
-        if (soft != 0.0f && cat::getMode() == 3) {
-            snprintf(buf, sizeof(buf), "%-4s %d.%03d.%02d%+.1f",
-                     cat::getModeStr(), mhz, khz, hz10, soft);
-        } else {
-            snprintf(buf, sizeof(buf), "%-4s %d.%03d.%02d",
-                     cat::getModeStr(), mhz, khz, hz10);
-        }
-    } else {
-        snprintf(buf, sizeof(buf), "%-4s ---.---.--", cat::getModeStr());
-    }
-    // Pad to fixed 24 chars to overwrite any residuals
-    int blen = strlen(buf);
-    while (blen < 24) buf[blen++] = ' ';
-    buf[blen] = '\0';
-    int freq_tw = draw::textWidth(buf, 2);
-    draw::drawText(fb, (log_w - freq_tw) / 2, 6, buf, COL_GREEN, COL_NAVY, 2);
-
-    // APF indicator + FPS right-aligned
-    if (cat::getMode() == 3) {
-        const char *filt_label = dsp::isApfEnabled() ? "APF" : "CW ";
-        uint16_t filt_col = dsp::isApfEnabled() ? COL_YELLOW : COL_DGREY;
-        snprintf(buf, sizeof(buf), "%s %4.0fFPS", filt_label, fps);
-    } else {
-        snprintf(buf, sizeof(buf), "%4.0fFPS", fps);
-    }
-    uint16_t fps_col = (fps >= 24) ? COL_GREEN : (fps >= 10) ? COL_YELLOW : COL_RED;
-    int tw = draw::textWidth(buf, 2);
-    draw::drawText(fb, log_w - tw - 8, 6, buf, fps_col, COL_NAVY, 2);
-
-
-    // Info bar text — pad to fixed width, bg overwrites old text
-    int info_y = log_h - INFO_H;
-    snprintf(buf, sizeof(buf), "dsp:%4.1f spec:%4.1f wf:%5.1f hud:%4.1f commit:%4.1f total:%5.1fms",
-             t_dsp_ms, t_spec_ms, t_wf_ms, t_hud_ms, t_commit_ms, t_total_ms);
-    draw::drawText(fb, 8, info_y + 4, buf, COL_WHITE, COL_DGREY);
-
-    snprintf(buf, sizeof(buf), "%dx%d  heap:%dK  psram:%dK   ",
-             log_w, log_h, pal::freeHeapKb(), pal::freePsramKb());
-    draw::drawText(fb, 8, info_y + 16, buf, COL_WHITE, COL_DGREY);
 
     int64_t t_hud = pal::micros();
 
@@ -588,4 +635,6 @@ void app::tick()
     t_hud_ms    = (t_hud  - t_wf)  / 1000.0f;
     t_commit_ms = (t_end  - t_hud) / 1000.0f;
     t_total_ms  = (t_end  - t0)    / 1000.0f;
+
+    ui::clear_all_dirty();
 }
