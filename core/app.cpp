@@ -12,11 +12,11 @@
 // ═══════════════════════════════════════════════════════════════
 // Layout constants
 // ═══════════════════════════════════════════════════════════════
-static constexpr int HEADER_H   = 28;
+static constexpr int HEADER_H   = 104;
 static constexpr int SPEC_H     = 254;
 static constexpr int GAP        = 2;
 static constexpr int WF_H_FIXED = 256;
-static constexpr int INFO_H     = 28;
+static constexpr int BOTTOM_H   = 104;
 static constexpr int SIDE_W     = 128;
 
 static int log_w, log_h;
@@ -55,8 +55,7 @@ static uint64_t drag_start_freq;
 static int   drag_current_x;
 static bool  drag_vfo_dirty = false;
 
-// Per-phase timing (ms)
-static float t_dsp_ms, t_spec_ms, t_wf_ms, t_hud_ms, t_commit_ms, t_total_ms;
+
 
 // ═══════════════════════════════════════════════════════════════
 // Spectrum / waterfall helpers (unchanged)
@@ -247,24 +246,13 @@ static void fmt_fps(char *buf, int len) {
         snprintf(buf, len, "%4.0fFPS", f);
 }
 
-static void fmt_info1(char *buf, int len) {
-    snprintf(buf, len, "dsp:%4.1f spec:%4.1f wf:%5.1f hud:%4.1f commit:%4.1f total:%5.1fms",
-             t_dsp_ms, t_spec_ms, t_wf_ms, t_hud_ms, t_commit_ms, t_total_ms);
-}
-
-static void fmt_info2(char *buf, int len) {
-    snprintf(buf, len, "%dx%d  heap:%dK  psram:%dK   ",
-             log_w, log_h, pal::freeHeapKb(), pal::freePsramKb());
-}
-
-static ui::Label lbl_span, lbl_freq, lbl_fps, lbl_info1, lbl_info2;
+static ui::Label lbl_span, lbl_freq, lbl_fps;
 
 // --- Bottom band buttons ---
 static ui::Band bottom_band;
 
 static void btn_span_press(ui::Button &) {
-    int cur = ui::get_i32(ui::PROP_span_idx);
-    ui::set_i32(ui::PROP_span_idx, (cur + 1) % dsp::NUM_SPANS);
+    bottom_band.setLayout("span_select");
 }
 
 static void btn_filter_press(ui::Button &) {
@@ -285,21 +273,35 @@ static void btn_back_press(ui::Button &) {
     bottom_band.setLayout("default");
 }
 
+// Span selection helpers
+static void select_span(int idx) {
+    ui::set_i32(ui::PROP_span_idx, idx);
+    bottom_band.setLayout("default");
+}
+static void btn_48k_press(ui::Button &) { select_span(0); }
+static void btn_12k_press(ui::Button &) { select_span(1); }
+static void btn_6k_press(ui::Button &)  { select_span(2); }
+static void btn_3k_press(ui::Button &)  { select_span(3); }
+
 // Band selection helpers
 static void tune_band(uint64_t freq) {
     ui::set_u64(ui::PROP_vfo_freq, freq);
     bottom_band.setLayout("default");
 }
-static void btn_80_press(ui::Button &) { tune_band(3573000); }
 static void btn_40_press(ui::Button &) { tune_band(7074000); }
-static void btn_20_press(ui::Button &) { tune_band(14070000); }
+static void btn_30_press(ui::Button &) { tune_band(10136000); }
+static void btn_20_press(ui::Button &) { tune_band(14074000); }
+static void btn_17_press(ui::Button &) { tune_band(18100000); }
 static void btn_15_press(ui::Button &) { tune_band(21074000); }
+static void btn_12_press(ui::Button &) { tune_band(24915000); }
 static void btn_10_press(ui::Button &) { tune_band(28074000); }
 
 static ui::Button btn_span, btn_filter, btn_zerobeat, btn_band;
-static ui::Button btn_80, btn_40, btn_20, btn_15, btn_10, btn_back;
+static ui::Button btn_48k, btn_12k, btn_6k, btn_3k, btn_span_back;
+static ui::Button btn_40, btn_30, btn_20, btn_17, btn_15, btn_12, btn_10, btn_back;
 
 static ui::Panel panel_bottom_default = { "default" };
+static ui::Panel panel_span_select    = { "span_select" };
 static ui::Panel panel_band_select    = { "band_select" };
 
 // --- Right band slider ---
@@ -307,9 +309,8 @@ static ui::Slider slider_gain;
 static ui::Panel panel_right_default = { "default" };
 
 // --- Bands ---
-static ui::Band header_band, right_band, info_band;
+static ui::Band header_band, right_band;
 static ui::Panel panel_header = { "default" };
-static ui::Panel panel_info   = { "default" };
 
 // ═══════════════════════════════════════════════════════════════
 // Audio callbacks
@@ -332,14 +333,8 @@ void app::init()
 
     spec_w = 1024;
     spec_x = (log_w - spec_w) / 2;
-
-    int block_h = SPEC_H + GAP + WF_H_FIXED;
-    int avail_h = log_h - HEADER_H - INFO_H;
-    int block_y = HEADER_H + (avail_h - block_h) / 2;
-
-    spec_y = block_y;
-    wf_y = block_y + SPEC_H + GAP;
-    wf_y = (wf_y + 31) & ~31;
+    spec_y = HEADER_H;
+    wf_y = spec_y + SPEC_H + GAP;   // 32+126+2 = 160, naturally 32-byte aligned
     wf_h = WF_H_FIXED;
 
     fb.buf    = pal::getFramebuffer();
@@ -394,16 +389,15 @@ void app::init()
     auto make_button = [](ui::Button &b, const char *label, uint16_t col, uint16_t bg,
                           ui::Button::PressFunc press, ui::PropId bind = ui::PROP_COUNT, bool toggle = false) {
         b.type = ui::W_BUTTON; b.label = label; b.color = col; b.bg = bg;
-        b.scale = 1; b.on_press = press; b.bind = bind; b.show_as_toggle = toggle;
+        b.scale = 2; b.on_press = press; b.bind = bind; b.show_as_toggle = toggle;
     };
 
-    make_label(lbl_span,  8, 6, fmt_span, COL_CYAN, COL_NAVY, 2, 9);
-    make_label(lbl_fps,   log_w - 200, 6, fmt_fps, COL_GREEN, COL_NAVY, 2, 12);
-    make_label(lbl_info1, 8, log_h - INFO_H + 4, fmt_info1, COL_WHITE, COL_DGREY, 1, 80);
-    make_label(lbl_info2, 8, log_h - INFO_H + 16, fmt_info2, COL_WHITE, COL_DGREY, 1, 40);
+    int hdr_ty = (HEADER_H - 16) / 2;  // center scale-2 text (16px) in header
+    make_label(lbl_span,  8, hdr_ty, fmt_span, COL_CYAN, COL_NAVY, 2, 9);
+    make_label(lbl_fps,   log_w - 200, hdr_ty, fmt_fps, COL_GREEN, COL_NAVY, 2, 12);
 
     int freq_tw = draw::textWidth("CW  14.070.02+3.0       ", 2);
-    make_label(lbl_freq, (log_w - freq_tw) / 2, 6, fmt_freq, COL_GREEN, COL_NAVY, 2, 24);
+    make_label(lbl_freq, (log_w - freq_tw) / 2, hdr_ty, fmt_freq, COL_GREEN, COL_NAVY, 2, 24);
 
     panel_header.add(&lbl_span);
     panel_header.add(&lbl_freq);
@@ -416,10 +410,17 @@ void app::init()
     make_button(btn_filter,   "Filter", COL_YELLOW, COL_DGREY, btn_filter_press, ui::PROP_apf_enabled, true);
     make_button(btn_zerobeat, "ZeroBt", COL_GREEN,  COL_DGREY, btn_zerobeat_press);
     make_button(btn_band,     "Band",   COL_WHITE,  COL_DGREY, btn_band_press);
-    make_button(btn_80,  "80",   COL_WHITE, COL_NAVY, btn_80_press);
+    make_button(btn_48k, "48k",    COL_CYAN, COL_NAVY, btn_48k_press);
+    make_button(btn_12k, "+/-12k", COL_CYAN, COL_NAVY, btn_12k_press);
+    make_button(btn_6k,  "+/-6k",  COL_CYAN, COL_NAVY, btn_6k_press);
+    make_button(btn_3k,  "+/-3k",  COL_CYAN, COL_NAVY, btn_3k_press);
+    make_button(btn_span_back, "Back", COL_RED, COL_DGREY, btn_back_press);
     make_button(btn_40,  "40",   COL_WHITE, COL_NAVY, btn_40_press);
+    make_button(btn_30,  "30",   COL_WHITE, COL_NAVY, btn_30_press);
     make_button(btn_20,  "20",   COL_WHITE, COL_NAVY, btn_20_press);
+    make_button(btn_17,  "17",   COL_WHITE, COL_NAVY, btn_17_press);
     make_button(btn_15,  "15",   COL_WHITE, COL_NAVY, btn_15_press);
+    make_button(btn_12,  "12",   COL_WHITE, COL_NAVY, btn_12_press);
     make_button(btn_10,  "10",   COL_WHITE, COL_NAVY, btn_10_press);
     make_button(btn_back,"Back", COL_RED,   COL_DGREY, btn_back_press);
 
@@ -438,45 +439,58 @@ void app::init()
     right_band.w = SIDE_W; right_band.h = SPEC_H + GAP + wf_h;
     right_band.addPanel(&panel_right_default);
 
-    // --- Layout: Bottom band (buttons) ---
-    int bot_y = log_h - INFO_H;
-    int bw = log_w / 5;
-    int bh = INFO_H;
+    // --- Layout: Bottom band ---
+    int bot_y = log_h - BOTTOM_H;
+    int bw = log_w / 4;
 
-    btn_span.x = 0;    btn_span.y = bot_y;   btn_span.w = bw; btn_span.h = bh;
-    btn_filter.x = bw;  btn_filter.y = bot_y; btn_filter.w = bw; btn_filter.h = bh;
-    btn_zerobeat.x = 2*bw; btn_zerobeat.y = bot_y; btn_zerobeat.w = bw; btn_zerobeat.h = bh;
-    btn_band.x = 3*bw; btn_band.y = bot_y;   btn_band.w = bw; btn_band.h = bh;
+    btn_span.x = 0;       btn_span.y = bot_y;   btn_span.w = bw;            btn_span.h = BOTTOM_H;
+    btn_filter.x = bw;    btn_filter.y = bot_y;  btn_filter.w = bw;          btn_filter.h = BOTTOM_H;
+    btn_zerobeat.x = 2*bw; btn_zerobeat.y = bot_y; btn_zerobeat.w = bw;      btn_zerobeat.h = BOTTOM_H;
+    btn_band.x = 3*bw;    btn_band.y = bot_y;    btn_band.w = log_w - 3*bw;  btn_band.h = BOTTOM_H;
 
     panel_bottom_default.add(&btn_span);
     panel_bottom_default.add(&btn_filter);
     panel_bottom_default.add(&btn_zerobeat);
     panel_bottom_default.add(&btn_band);
 
-    // Band select panel
-    int bbw = log_w / 6;
-    btn_80.x = 0;     btn_80.y = bot_y; btn_80.w = bbw; btn_80.h = bh;
-    btn_40.x = bbw;   btn_40.y = bot_y; btn_40.w = bbw; btn_40.h = bh;
-    btn_20.x = 2*bbw; btn_20.y = bot_y; btn_20.w = bbw; btn_20.h = bh;
-    btn_15.x = 3*bbw; btn_15.y = bot_y; btn_15.w = bbw; btn_15.h = bh;
-    btn_10.x = 4*bbw; btn_10.y = bot_y; btn_10.w = bbw; btn_10.h = bh;
-    btn_back.x = 5*bbw; btn_back.y = bot_y; btn_back.w = bbw; btn_back.h = bh;
+    // Span select panel (5 buttons)
+    int sbw = log_w / 5;
+    btn_48k.x = 0;        btn_48k.y = bot_y;  btn_48k.w = sbw;           btn_48k.h = BOTTOM_H;
+    btn_12k.x = sbw;      btn_12k.y = bot_y;  btn_12k.w = sbw;           btn_12k.h = BOTTOM_H;
+    btn_6k.x = 2*sbw;     btn_6k.y = bot_y;   btn_6k.w = sbw;            btn_6k.h = BOTTOM_H;
+    btn_3k.x = 3*sbw;     btn_3k.y = bot_y;   btn_3k.w = sbw;            btn_3k.h = BOTTOM_H;
+    btn_span_back.x = 4*sbw; btn_span_back.y = bot_y; btn_span_back.w = log_w - 4*sbw; btn_span_back.h = BOTTOM_H;
 
-    panel_band_select.add(&btn_80);
+    panel_span_select.add(&btn_48k);
+    panel_span_select.add(&btn_12k);
+    panel_span_select.add(&btn_6k);
+    panel_span_select.add(&btn_3k);
+    panel_span_select.add(&btn_span_back);
+
+    // Band select panel (8 buttons)
+    int bbw = log_w / 8;
+    btn_40.x = 0;      btn_40.y = bot_y; btn_40.w = bbw; btn_40.h = BOTTOM_H;
+    btn_30.x = bbw;    btn_30.y = bot_y; btn_30.w = bbw; btn_30.h = BOTTOM_H;
+    btn_20.x = 2*bbw;  btn_20.y = bot_y; btn_20.w = bbw; btn_20.h = BOTTOM_H;
+    btn_17.x = 3*bbw;  btn_17.y = bot_y; btn_17.w = bbw; btn_17.h = BOTTOM_H;
+    btn_15.x = 4*bbw;  btn_15.y = bot_y; btn_15.w = bbw; btn_15.h = BOTTOM_H;
+    btn_12.x = 5*bbw;  btn_12.y = bot_y; btn_12.w = bbw; btn_12.h = BOTTOM_H;
+    btn_10.x = 6*bbw;  btn_10.y = bot_y; btn_10.w = bbw; btn_10.h = BOTTOM_H;
+    btn_back.x = 7*bbw; btn_back.y = bot_y; btn_back.w = log_w - 7*bbw; btn_back.h = BOTTOM_H;
+
     panel_band_select.add(&btn_40);
+    panel_band_select.add(&btn_30);
     panel_band_select.add(&btn_20);
+    panel_band_select.add(&btn_17);
     panel_band_select.add(&btn_15);
+    panel_band_select.add(&btn_12);
     panel_band_select.add(&btn_10);
     panel_band_select.add(&btn_back);
 
-    bottom_band.x = 0; bottom_band.y = bot_y; bottom_band.w = log_w; bottom_band.h = bh;
+    bottom_band.x = 0; bottom_band.y = bot_y; bottom_band.w = log_w; bottom_band.h = BOTTOM_H;
     bottom_band.addPanel(&panel_bottom_default);
+    bottom_band.addPanel(&panel_span_select);
     bottom_band.addPanel(&panel_band_select);
-
-    // --- Layout: Info band (replaced by bottom band — info goes to header/bottom) ---
-    // Info labels are part of a simple overlay, not a band
-    lbl_info1.x = 8; lbl_info1.y = log_h - INFO_H + 4; lbl_info1.color = COL_WHITE; lbl_info1.bg = COL_DGREY;
-    lbl_info2.x = 8; lbl_info2.y = log_h - INFO_H + 16; lbl_info2.color = COL_WHITE; lbl_info2.bg = COL_DGREY;
 
     // --- Audio ---
     pal::audioOutputOpen(dsp::getDecimatedRate());
@@ -539,8 +553,6 @@ void app::tick()
         }
         if (wf_count < WF_MAX_LINES) wf_count++;
     }
-    int64_t t_dsp = pal::micros();
-
     // --- Touch events ---
     static constexpr int TAP_THRESHOLD = 5;
     pal::TouchEvent evt;
@@ -552,8 +564,10 @@ void app::tick()
         if (bottom_band.onTouch(evt.x, evt.y, action)) continue;
         if (right_band.onTouch(evt.x, evt.y, action)) continue;
 
-        // Spectrum touch-to-tune / drag-to-tune
-        if (evt.action == pal::TouchEvent::DOWN) {
+        // Spectrum touch-to-tune / drag-to-tune (only in spectrum/WF area)
+        bool in_spec_wf = (evt.x >= spec_x && evt.x < spec_x + spec_w &&
+                           evt.y >= spec_y && evt.y < wf_y + wf_h);
+        if (evt.action == pal::TouchEvent::DOWN && in_spec_wf) {
             dsp::setSoftNcoCorrection(0);
             ui::set_f32(ui::PROP_soft_nco, 0, ui::FROM_UI);
             dragging = true;
@@ -593,8 +607,8 @@ void app::tick()
         }
     }
 
-    // Sync drag with FFT rate
-    if (dragging && drag_vfo_dirty && new_spectrum && drag_start_freq > 0) {
+    // Sync drag — update VFO every tick (not gated on spectrum frame rate)
+    if (dragging && drag_vfo_dirty && drag_start_freq > 0) {
         int delta_px = drag_current_x - drag_start_x;
         int delta_hz = -delta_px * dsp::getSpanRate() / spec_w;
         uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
@@ -613,28 +627,13 @@ void app::tick()
     }
 
     draw_spectrum(dsp::getMagnitudeDb());
-    int64_t t_spec = pal::micros();
-
     draw::fillRect(fb, spec_x, spec_y + SPEC_H, spec_w, GAP, COL_GREEN);
     draw_waterfall();
 
-    // Draw bands
     header_band.draw(fb);
     right_band.draw(fb);
     bottom_band.draw(fb);
-    int64_t t_wf = pal::micros();
-
-    int64_t t_hud = pal::micros();
 
     pal::commitFrame();
-    int64_t t_end = pal::micros();
-
-    t_dsp_ms    = (t_dsp  - t0)    / 1000.0f;
-    t_spec_ms   = (t_spec - t_dsp) / 1000.0f;
-    t_wf_ms     = (t_wf   - t_spec)/ 1000.0f;
-    t_hud_ms    = (t_hud  - t_wf)  / 1000.0f;
-    t_commit_ms = (t_end  - t_hud) / 1000.0f;
-    t_total_ms  = (t_end  - t0)    / 1000.0f;
-
     ui::clear_all_dirty();
 }

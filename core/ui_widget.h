@@ -85,6 +85,7 @@ struct Band {
     Panel *panels[8];         // all possible layouts
     int panel_count = 0;
     int active_idx = 0;       // currently shown layout
+    bool dirty = true;        // clear background on next draw (set by setLayout)
 
     void addPanel(Panel *p) { if (panel_count < 8) panels[panel_count++] = p; }
 

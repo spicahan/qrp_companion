@@ -95,7 +95,7 @@ static float g_goertzel_result = 0;
 
 // ── Span definitions ────────────────────────────────────────
 static const int g_span_rates[dsp::NUM_SPANS]  = { 48000, 24000, 12000,  6000 };
-static const int g_hop_sizes[dsp::NUM_SPANS]   = {  2048,  1024,   512,   256 };
+static const int g_hop_sizes[dsp::NUM_SPANS]   = {  2048,  1024,   512,   512 };
 static const char *g_span_labels[dsp::NUM_SPANS] = { "48k", "+/-12k", "+/-6k", "+/-3k" };
 static int g_cur_span = 0;
 

@@ -31,7 +31,7 @@ QMX I/Q (48 kHz)
       │
   half-band ↓2 ──────────── WOLA ±6k span (P=4, hop=512)
       │
-  half-band ↓2 ──────────── WOLA ±3k span (P=4, hop=256)
+  half-band ↓2 ──────────── WOLA ±3k span (P=4, hop=512)
       │                           │
       └─── audio pipeline ◄──────┘  (CW filter, APF, sidetone, SSB)
 ```
@@ -45,22 +45,22 @@ Fixed across all spans:
 - **N** = 1024 (FFT size, number of output bins)
 - **P** = 4 (polyphase segments)
 - **M** = P × N = 4096 (prototype filter / window length)
-- **FPS** = 24000/1024 ≈ 23.4375 Hz
+- **FPS** = 23.4375 Hz (±3k: 11.72 Hz to reduce temporal smoothing)
 
 Per-span:
 
-| Span  | Rate   | Hop  | Hz/bin | Overlap |
-|-------|--------|------|--------|---------|
-| 48k   | 48000  | 2048 |  46.9  |  50.0%  |
-| ±12k  | 24000  | 1024 |  23.4  |  75.0%  |
-| ±6k   | 12000  |  512 |  11.7  |  87.5%  |
-| ±3k   |  6000  |  256 |   5.9  |  93.75% |
+| Span  | Rate   | Hop  | Hz/bin | Overlap | FPS   |
+|-------|--------|------|--------|---------|-------|
+| 48k   | 48000  | 2048 |  46.9  |  50.0%  | 23.44 |
+| ±12k  | 24000  | 1024 |  23.4  |  75.0%  | 23.44 |
+| ±6k   | 12000  |  512 |  11.7  |  87.5%  | 23.44 |
+| ±3k   |  6000  |  512 |   5.9  |  87.5%  | 11.72 |
 
 FPS derivation: `FPS = rate / hop`.
 - 48000/2048 = 23.4375
 - 24000/1024 = 23.4375
 - 12000/512  = 23.4375
-- 6000/256   = 23.4375
+- 6000/512   = 11.71875
 
 ## Prototype Filter (Window)
 

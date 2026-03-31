@@ -31,6 +31,7 @@ void Button::draw(const draw::Framebuf &fb)
         }
     }
     draw::fillRect(fb, x, y, w, h, b);
+    draw::drawRect(fb, x, y, w, h, draw::rgb565(80, 80, 80));
     // Center label in button
     int tw = draw::textWidth(label, scale);
     int tx = x + (w - tw) / 2;
@@ -96,8 +97,8 @@ void Slider::draw(const draw::Framebuf &fb)
         snprintf(lbl, sizeof(lbl), "%ddB", (int)(20.0f * log10f(val) + 0.5f));
     else
         snprintf(lbl, sizeof(lbl), "%.0f", val);
-    draw::drawText(fb, x + 4, bar_y > y + 12 ? bar_y - 12 : bar_y + 10,
-                   lbl, draw::rgb565(0, 255, 0), draw::rgb565(32, 32, 32));
+    draw::drawText(fb, x + 4, bar_y > y + 20 ? bar_y - 20 : bar_y + 10,
+                   lbl, draw::rgb565(0, 255, 0), draw::rgb565(32, 32, 32), 2);
 }
 
 bool Slider::onTouch(int tx, int ty, int action)
@@ -146,6 +147,7 @@ void Band::setLayout(const char *panel_id)
     for (int i = 0; i < panel_count; i++) {
         if (strcmp(panels[i]->id, panel_id) == 0) {
             active_idx = i;
+            dirty = true;
             return;
         }
     }
@@ -153,8 +155,11 @@ void Band::setLayout(const char *panel_id)
 
 void Band::draw(const draw::Framebuf &fb)
 {
-    // Clear the full band area before drawing active panel (prevents residuals on layout switch)
-    draw::fillRect(fb, x, y, w, h, draw::rgb565(32, 32, 32));
+    // Only clear background on layout switch (dirty flag), not every frame
+    if (dirty) {
+        draw::fillRect(fb, x, y, w, h, draw::rgb565(32, 32, 32));
+        dirty = false;
+    }
     Panel *p = active();
     if (p) p->draw(fb);
 }
