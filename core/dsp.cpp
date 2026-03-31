@@ -14,31 +14,51 @@ static int    g_num_bins;
 static float *g_fft_data;
 static float *g_magnitude_db;
 
-// Double-buffer for I/Q input (lock-free SPSC)
-static float *g_input_buf[2];
-static volatile int g_write_buf;
-static int          g_write_pos;
-static volatile int g_ready_buf;
+// ── WOLA filter bank ─────────────────────────────────────────
+static constexpr int WOLA_P = 4;   // polyphase segments
 
-// fs/4 down-conversion mixer phase
+struct WolaState {
+    float *buf_i;                   // circular buffer I [wola_m]
+    float *buf_q;                   // circular buffer Q [wola_m]
+    int   write_pos;
+    volatile int hop_counter;
+    int   hop_size;
+};
+static WolaState g_wola[dsp::NUM_SPANS];
+static float *g_wola_window;       // prototype filter [wola_m]
+static int    g_wola_m;            // = WOLA_P * fft_size
+
+// ── Cascaded half-band decimation (48k → 24k → 12k → 6k) ───
+static constexpr int HB_TAPS = 65;
+
+struct CascadeStage {
+    float delay_i[HB_TAPS];
+    float delay_q[HB_TAPS];
+    int   pos;
+    int   counter;
+};
+static float g_hb_coeffs[HB_TAPS]; // shared across all 3 stages
+static CascadeStage g_cascade[3];
+
+// ── fs/4 down-conversion mixer ───────────────────────────────
 static int g_mix_phase;
 
-// CW offset NCO (shifts CW sidetone offset to DC after fs/4 mixer)
+// ── CW offset NCO ───────────────────────────────────────────
 static NcoState g_cw_nco;
-static bool g_cw_nco_active = false;
+static bool  g_cw_nco_active = false;
 static float g_cw_offset_hz = 0;
-static float g_soft_nco_hz = 0;  // sub-10Hz fine correction
+static float g_soft_nco_hz = 0;
 
-// CW audio filter (300Hz complex LPF at decimated rate) + sidetone NCO
+// ── CW audio filter (300 Hz BW at 6 kHz) + sidetone NCO ────
 static constexpr int CW_FIR_TAPS = 65;
-static constexpr float CW_FIR_CUTOFF_HZ = 150.0f; // ±150Hz = 300Hz BW
+static constexpr float CW_FIR_CUTOFF_HZ = 150.0f;
 static float g_cw_fir_coeffs[CW_FIR_TAPS];
 static float g_cw_fir_delay_i[CW_FIR_TAPS];
 static float g_cw_fir_delay_q[CW_FIR_TAPS];
 static int   g_cw_fir_pos = 0;
 static NcoState g_sidetone_nco;
 
-// APF (Audio Peaking Filter) — very narrow LPF at DC (±20Hz = 40Hz BW)
+// ── APF (40 Hz BW at 6 kHz) ─────────────────────────────────
 static constexpr int APF_FIR_TAPS = 257;
 static constexpr float APF_FIR_CUTOFF_HZ = 20.0f;
 static float g_apf_fir_coeffs[APF_FIR_TAPS];
@@ -47,77 +67,49 @@ static float g_apf_fir_delay_q[APF_FIR_TAPS];
 static int   g_apf_fir_pos = 0;
 static bool  g_apf_enabled = false;
 
-// SSB/DIGI audio filter (3kHz LPF for non-CW modes, at decimated rate)
+// ── SSB/DIGI audio filter (3 kHz LPF at 6 kHz) ─────────────
 static constexpr int SSB_FIR_TAPS = 65;
-static constexpr float SSB_FIR_CUTOFF_HZ = 2800.0f; // 3kHz passband
+static constexpr float SSB_FIR_CUTOFF_HZ = 2800.0f;
 static float g_ssb_fir_coeffs[SSB_FIR_TAPS];
-static float g_ssb_fir_delay[SSB_FIR_TAPS]; // real-only (I stream)
+static float g_ssb_fir_delay[SSB_FIR_TAPS];
 static int   g_ssb_fir_pos = 0;
 
-// Mode-gated audio: mute until mode info is available
 static bool  g_mode_known = false;
 
-// Goertzel fine-tune detector
-static constexpr int GOERTZEL_BINS = 301;      // -150Hz to +150Hz at 1Hz resolution
-static constexpr float GOERTZEL_BIN_HZ = 1.0f;  // 1Hz per bin
+// ── Goertzel fine-tune detector ─────────────────────────────
+static constexpr int GOERTZEL_BINS = 301;
+static constexpr float GOERTZEL_BIN_HZ = 1.0f;
 static constexpr float GOERTZEL_DURATION_S = 1.0f;
 
 struct GoertzelBin {
-    float coeff;    // 2*cos(2*pi*f/fs)
-    float cos_k;    // cos(2*pi*f/fs) — needed for final power calculation
-    float sin_k;    // sin(2*pi*f/fs) — needed for complex power
-    float s1_re, s1_im;  // complex state
+    float coeff;
+    float cos_k, sin_k;
+    float s1_re, s1_im;
     float s2_re, s2_im;
 };
-
 static GoertzelBin g_goertzel[GOERTZEL_BINS];
-static int g_goertzel_count = 0;    // samples collected
-static int g_goertzel_target = 0;   // total samples to collect
-static bool g_goertzel_running = false;
-static float g_goertzel_result = 0; // peak freq offset in Hz
+static int   g_goertzel_count = 0;
+static int   g_goertzel_target = 0;
+static bool  g_goertzel_running = false;
+static float g_goertzel_result = 0;
 
-// --- FIR decimation stages ---
-static constexpr int FIR_TAPS = 65;
-
-// Span configurations: decim factor, FIR cutoff, label
-struct SpanDef {
-    int decim;
-    float cutoff_hz;
-    const char *label;
-    int display_rotation;  // displayBin rotation (in bins, relative to N)
-};
-static const SpanDef g_spans[dsp::NUM_SPANS] = {
-    { 1,     0, "48k",  0 },   // no extra decimation, use 48kHz stream directly
-    { 2, 10000, "+/-12k", 0 },
-    { 4,  5000, "+/-6k",  0 },
-    { 8,  2400, "+/-3k",  0 },
-};
+// ── Span definitions ────────────────────────────────────────
+static const int g_span_rates[dsp::NUM_SPANS]  = { 48000, 24000, 12000,  6000 };
+static const int g_hop_sizes[dsp::NUM_SPANS]   = {  2048,  1024,   512,   256 };
+static const char *g_span_labels[dsp::NUM_SPANS] = { "48k", "+/-12k", "+/-6k", "+/-3k" };
 static int g_cur_span = 0;
 
-// Per-stage FIR decimator state (stages for ↓2, ↓4, ↓8)
-// Index 0=↓2, 1=↓4, 2=↓8. Stage 0 (48k) has no FIR.
-static constexpr int NUM_DECIM_STAGES = 3;
-struct FirDecimState {
-    float coeffs[FIR_TAPS];
-    float delay_i[FIR_TAPS];
-    float delay_q[FIR_TAPS];
-    int pos;
-    int counter;
-    int decim;
-};
-static FirDecimState g_decim[NUM_DECIM_STAGES];
-
-// Audio output uses the ↓8 stage (index 2) regardless of display span
-static constexpr int AUDIO_DECIM_IDX = 2;
-
-// Audio output buffer
+// ── Audio output ────────────────────────────────────────────
 static constexpr int AUDIO_OUT_BUF_SIZE = 128;
 static float g_audio_out_buf[AUDIO_OUT_BUF_SIZE];
 static int   g_audio_out_pos = 0;
 static dsp::AudioOutCallback g_audio_out_cb = nullptr;
-static float g_audio_gain = 1000.0f;  // ~70 dB gain to bring noise floor to audible
+static float g_audio_gain = 1000.0f;
 
-// Design Hamming-windowed sinc lowpass FIR
+// ═════════════════════════════════════════════════════════════
+// Filter design
+// ═════════════════════════════════════════════════════════════
+
 static void design_fir_lowpass(float *h, int N, float cutoff_hz, float sample_rate)
 {
     float fc = cutoff_hz / sample_rate;
@@ -131,37 +123,32 @@ static void design_fir_lowpass(float *h, int N, float cutoff_hz, float sample_ra
             h[n] = sinf(2.0f * (float)M_PI * fc * x) / ((float)M_PI * x) * w;
         }
     }
-    // Normalize for unity gain at DC
     float sum = 0;
     for (int n = 0; n < N; n++) sum += h[n];
     if (sum > 0) for (int n = 0; n < N; n++) h[n] /= sum;
 }
 
-// Process one sample through a FIR decimator stage, returns true if output ready
-static bool fir_decimate_sample(FirDecimState &s, float in_i, float in_q,
-                                float &out_i, float &out_q)
+// Blackman-Harris prototype window for WOLA filter bank.
+// Generates periodic form: symmetric BH(M+1) truncated to M samples.
+// Scaled so Σw[n] = fft_size, giving magnitude normalization consistent
+// with a plain N-point FFT (same dB reference).
+static void generate_wola_window(float *w, int M, int fft_size)
 {
-    s.delay_i[s.pos] = in_i;
-    s.delay_q[s.pos] = in_q;
-    s.pos = (s.pos + 1) % FIR_TAPS;
-
-    s.counter++;
-    if (s.counter < s.decim) return false;
-    s.counter = 0;
-
-    float acc_i = 0, acc_q = 0;
-    int idx = s.pos;
-    for (int k = 0; k < FIR_TAPS; k++) {
-        acc_i += s.delay_i[idx] * s.coeffs[k];
-        acc_q += s.delay_q[idx] * s.coeffs[k];
-        idx = (idx + 1) % FIR_TAPS;
+    const double a0 = 0.35875, a1 = 0.48829, a2 = 0.14128, a3 = 0.01168;
+    for (int n = 0; n < M; n++) {
+        double x = 2.0 * M_PI * n / M;   // periodic: /M not /(M-1)
+        w[n] = (float)(a0 - a1 * cos(x) + a2 * cos(2 * x) - a3 * cos(3 * x));
     }
-    out_i = acc_i;
-    out_q = acc_q;
-    return true;
+    float sum = 0;
+    for (int n = 0; n < M; n++) sum += w[n];
+    float scale = (float)fft_size / sum;
+    for (int n = 0; n < M; n++) w[n] *= scale;
 }
 
-// Apply CW complex FIR to one I/Q sample (runs at decimated 6kHz rate)
+// ═════════════════════════════════════════════════════════════
+// Audio filters (unchanged from pre-WOLA)
+// ═════════════════════════════════════════════════════════════
+
 static void cw_fir_sample(float in_i, float in_q, float &out_i, float &out_q)
 {
     g_cw_fir_delay_i[g_cw_fir_pos] = in_i;
@@ -179,7 +166,6 @@ static void cw_fir_sample(float in_i, float in_q, float &out_i, float &out_q)
     out_q = acc_q;
 }
 
-// Apply APF complex FIR to one I/Q sample (runs at decimated 6kHz rate)
 static void apf_fir_sample(float in_i, float in_q, float &out_i, float &out_q)
 {
     g_apf_fir_delay_i[g_apf_fir_pos] = in_i;
@@ -197,7 +183,6 @@ static void apf_fir_sample(float in_i, float in_q, float &out_i, float &out_q)
     out_q = acc_q;
 }
 
-// Apply SSB audio FIR (real-only, I stream) at decimated rate
 static float ssb_fir_sample(float in)
 {
     g_ssb_fir_delay[g_ssb_fir_pos] = in;
@@ -220,15 +205,73 @@ static void flush_audio_out()
     }
 }
 
-static void compute_spectrum()
-{
-    dsps_fft2r_fc32(g_fft_data, g_fft_size);
-    dsps_bit_rev_fc32(g_fft_data, g_fft_size);
+// ═════════════════════════════════════════════════════════════
+// Cascaded ↓2 decimation
+// ═════════════════════════════════════════════════════════════
 
-    const float scale = 1.0f / g_fft_size;
-    int half = g_fft_size / 2;
-    for (int i = 0; i < g_fft_size; i++) {
-        int bin = (i + half) % g_fft_size;
+static bool cascade_decimate(CascadeStage &s, float in_i, float in_q,
+                             float &out_i, float &out_q)
+{
+    s.delay_i[s.pos] = in_i;
+    s.delay_q[s.pos] = in_q;
+    s.pos = (s.pos + 1) % HB_TAPS;
+
+    s.counter++;
+    if (s.counter < 2) return false;
+    s.counter = 0;
+
+    float acc_i = 0, acc_q = 0;
+    int idx = s.pos;
+    for (int k = 0; k < HB_TAPS; k++) {
+        acc_i += s.delay_i[idx] * g_hb_coeffs[k];
+        acc_q += s.delay_q[idx] * g_hb_coeffs[k];
+        idx = (idx + 1) % HB_TAPS;
+    }
+    out_i = acc_i;
+    out_q = acc_q;
+    return true;
+}
+
+// ═════════════════════════════════════════════════════════════
+// WOLA processing
+// ═════════════════════════════════════════════════════════════
+
+static inline void wola_write(WolaState &w, float i, float q)
+{
+    w.buf_i[w.write_pos] = i;
+    w.buf_q[w.write_pos] = q;
+    w.write_pos = (w.write_pos + 1) % g_wola_m;
+    w.hop_counter++;
+}
+
+// Window + fold + FFT + magnitude.  Reads from circular buffer
+// at snapshot position (oldest sample = write_pos).
+static void wola_process(const WolaState &w)
+{
+    int wp = w.write_pos;   // snapshot (this IS the oldest sample position)
+    int N  = g_fft_size;
+    int M  = g_wola_m;
+
+    // Combined window + fold → g_fft_data (interleaved I/Q for FFT)
+    memset(g_fft_data, 0, 2 * N * sizeof(float));
+    for (int p = 0; p < WOLA_P; p++) {
+        for (int n = 0; n < N; n++) {
+            int buf_idx = (wp + p * N + n) % M;
+            float wv = g_wola_window[p * N + n];
+            g_fft_data[2 * n]     += w.buf_i[buf_idx] * wv;
+            g_fft_data[2 * n + 1] += w.buf_q[buf_idx] * wv;
+        }
+    }
+
+    // FFT
+    dsps_fft2r_fc32(g_fft_data, N);
+    dsps_bit_rev_fc32(g_fft_data, N);
+
+    // fftshift + magnitude in dB
+    const float scale = 1.0f / N;
+    int half = N / 2;
+    for (int i = 0; i < N; i++) {
+        int bin = (i + half) % N;
         float re = g_fft_data[2 * bin];
         float im = g_fft_data[2 * bin + 1];
         float mag = sqrtf(re * re + im * im) * scale;
@@ -236,34 +279,63 @@ static void compute_spectrum()
     }
 }
 
+// ═════════════════════════════════════════════════════════════
+// NCO helpers (unchanged)
+// ═════════════════════════════════════════════════════════════
+
+static void update_cw_ncos()
+{
+    if (g_cw_offset_hz == 0.0f) {
+        g_cw_nco_active = false;
+        g_cw_nco.inc = 0;
+        g_sidetone_nco.inc = 0;
+        return;
+    }
+    float total_shift = g_cw_offset_hz + g_soft_nco_hz;
+    nco::setFreq(g_cw_nco, total_shift, (float)g_sample_rate);
+    float dec_rate = (float)g_sample_rate / 8;
+    nco::setFreq(g_sidetone_nco, g_cw_offset_hz, dec_rate);
+    g_cw_nco_active = true;
+}
+
+// ═════════════════════════════════════════════════════════════
+// Public API
+// ═════════════════════════════════════════════════════════════
+
 void dsp::init(int sample_rate, int fft_size)
 {
-    g_sample_rate  = sample_rate;
-    g_fft_size     = fft_size;
-    g_num_bins     = fft_size;
+    g_sample_rate = sample_rate;
+    g_fft_size    = fft_size;
+    g_num_bins    = fft_size;
     g_fft_data     = new float[2 * fft_size];
     g_magnitude_db = new float[fft_size];
+    g_mix_phase    = 0;
 
-    g_input_buf[0] = new float[2 * fft_size];
-    g_input_buf[1] = new float[2 * fft_size];
-    memset(g_input_buf[0], 0, 2 * fft_size * sizeof(float));
-    memset(g_input_buf[1], 0, 2 * fft_size * sizeof(float));
-    g_write_buf = 0;
-    g_write_pos = 0;
-    g_ready_buf = -1;
-    g_mix_phase = 0;
+    // WOLA prototype window (Blackman-Harris, periodic form)
+    g_wola_m = WOLA_P * fft_size;
+    g_wola_window = new float[g_wola_m];
+    generate_wola_window(g_wola_window, g_wola_m, fft_size);
 
-    // Initialize FIR decimation stages: ↓2, ↓4, ↓8
-    int decim_factors[NUM_DECIM_STAGES] = {2, 4, 8};
-    float cutoffs[NUM_DECIM_STAGES] = {10000.0f, 5000.0f, 2400.0f};
-    for (int i = 0; i < NUM_DECIM_STAGES; i++) {
-        g_decim[i].decim = decim_factors[i];
-        g_decim[i].pos = 0;
-        g_decim[i].counter = 0;
-        memset(g_decim[i].delay_i, 0, sizeof(g_decim[i].delay_i));
-        memset(g_decim[i].delay_q, 0, sizeof(g_decim[i].delay_q));
-        design_fir_lowpass(g_decim[i].coeffs, FIR_TAPS, cutoffs[i], (float)sample_rate);
+    // WOLA per-span circular buffers
+    for (int i = 0; i < NUM_SPANS; i++) {
+        g_wola[i].buf_i = new float[g_wola_m]();
+        g_wola[i].buf_q = new float[g_wola_m]();
+        g_wola[i].write_pos = 0;
+        g_wola[i].hop_counter = 0;
+        g_wola[i].hop_size = g_hop_sizes[i];
     }
+
+    // Cascaded half-band decimation — same normalised cutoff for all stages.
+    // Designed at 48 kHz with 10 kHz cutoff; when reused at 24 kHz the
+    // effective cutoff becomes 5 kHz, at 12 kHz → 2.5 kHz, etc.
+    design_fir_lowpass(g_hb_coeffs, HB_TAPS, 10000.0f, (float)sample_rate);
+    for (int i = 0; i < 3; i++) {
+        memset(g_cascade[i].delay_i, 0, sizeof(g_cascade[i].delay_i));
+        memset(g_cascade[i].delay_q, 0, sizeof(g_cascade[i].delay_q));
+        g_cascade[i].pos = 0;
+        g_cascade[i].counter = 0;
+    }
+
     g_cur_span = 0;
     g_audio_out_pos = 0;
 
@@ -274,25 +346,25 @@ void dsp::init(int sample_rate, int fft_size)
     g_cw_nco_active = false;
     g_cw_offset_hz = 0;
 
-    // CW audio filter (runs at decimated rate)
+    // CW audio filter (at ↓8 rate = 6 kHz)
     float dec_rate = (float)sample_rate / 8;
     design_fir_lowpass(g_cw_fir_coeffs, CW_FIR_TAPS, CW_FIR_CUTOFF_HZ, dec_rate);
     memset(g_cw_fir_delay_i, 0, sizeof(g_cw_fir_delay_i));
     memset(g_cw_fir_delay_q, 0, sizeof(g_cw_fir_delay_q));
     g_cw_fir_pos = 0;
 
-    // Sidetone NCO (mix UP at decimated rate — set when CW offset is known)
+    // Sidetone NCO
     g_sidetone_nco.phase = 0;
     g_sidetone_nco.inc = 0;
 
-    // APF (very narrow CW filter)
+    // APF
     design_fir_lowpass(g_apf_fir_coeffs, APF_FIR_TAPS, APF_FIR_CUTOFF_HZ, dec_rate);
     memset(g_apf_fir_delay_i, 0, sizeof(g_apf_fir_delay_i));
     memset(g_apf_fir_delay_q, 0, sizeof(g_apf_fir_delay_q));
     g_apf_fir_pos = 0;
     g_apf_enabled = false;
 
-    // SSB/DIGI audio filter (3kHz LPF)
+    // SSB/DIGI filter
     design_fir_lowpass(g_ssb_fir_coeffs, SSB_FIR_TAPS, SSB_FIR_CUTOFF_HZ, dec_rate);
     memset(g_ssb_fir_delay, 0, sizeof(g_ssb_fir_delay));
     g_ssb_fir_pos = 0;
@@ -305,18 +377,17 @@ void dsp::init(int sample_rate, int fft_size)
 }
 
 void dsp::setAudioOutCallback(AudioOutCallback cb) { g_audio_out_cb = cb; }
-int  dsp::getDecimatedRate() { return g_sample_rate / 8; }  // audio always at ↓8
+int  dsp::getDecimatedRate() { return g_sample_rate / 8; }
 void dsp::setAudioGain(float gain) { g_audio_gain = gain; }
 float dsp::getAudioGain() { return g_audio_gain; }
 
 void dsp::startGoertzel()
 {
-    float dec_rate = (float)g_sample_rate / 8;  // 6kHz
+    float dec_rate = (float)g_sample_rate / 8;
     g_goertzel_target = (int)(dec_rate * GOERTZEL_DURATION_S);
     g_goertzel_count = 0;
     g_goertzel_result = 0;
 
-    // Initialize 31 bins: -150, -140, ..., 0, ..., +140, +150 Hz
     for (int i = 0; i < GOERTZEL_BINS; i++) {
         float freq = (i - GOERTZEL_BINS / 2) * GOERTZEL_BIN_HZ;
         float w = 2.0f * (float)M_PI * freq / dec_rate;
@@ -329,27 +400,9 @@ void dsp::startGoertzel()
     g_goertzel_running = true;
 }
 
-bool dsp::isGoertzelRunning() { return g_goertzel_running; }
+bool  dsp::isGoertzelRunning() { return g_goertzel_running; }
 float dsp::getGoertzelResult() { return g_goertzel_result; }
-void dsp::clearGoertzelResult() { g_goertzel_result = 0; }
-
-static void update_cw_ncos()
-{
-    if (g_cw_offset_hz == 0.0f) {
-        g_cw_nco_active = false;
-        g_cw_nco.inc = 0;
-        g_sidetone_nco.inc = 0;
-        return;
-    }
-    // CW down-conversion NCO includes soft correction
-    float total_shift = g_cw_offset_hz + g_soft_nco_hz;
-    nco::setFreq(g_cw_nco, total_shift, (float)g_sample_rate);
-    // Sidetone NCO at decimated rate — also includes correction so
-    // the audible tone stays at the nominal CW offset pitch
-    float dec_rate = (float)g_sample_rate / 8;
-    nco::setFreq(g_sidetone_nco, g_cw_offset_hz, dec_rate);
-    g_cw_nco_active = true;
-}
+void  dsp::clearGoertzelResult() { g_goertzel_result = 0; }
 
 void dsp::setCwOffset(float offset_hz)
 {
@@ -369,10 +422,12 @@ void dsp::setModeKnown(bool known) { g_mode_known = known; }
 void dsp::setApfEnabled(bool enabled) { g_apf_enabled = enabled; }
 bool dsp::isApfEnabled() { return g_apf_enabled; }
 
+// ═════════════════════════════════════════════════════════════
+// pushIQ — sample-by-sample processing
+// ═════════════════════════════════════════════════════════════
+
 void dsp::pushIQ(const float *iq, int num_frames)
 {
-    float *buf = g_input_buf[g_write_buf];
-
     for (int i = 0; i < num_frames; i++) {
         float I = iq[2 * i];
         float Q = iq[2 * i + 1];
@@ -387,7 +442,7 @@ void dsp::pushIQ(const float *iq, int num_frames)
         }
         g_mix_phase = (g_mix_phase + 1) & 3;
 
-        // CW offset NCO: shift CW sidetone offset to DC
+        // CW offset NCO: shift CW sidetone to DC
         if (g_cw_nco_active) {
             float nI, nQ;
             nco::mixDown(g_cw_nco, oI, oQ, nI, nQ);
@@ -395,58 +450,38 @@ void dsp::pushIQ(const float *iq, int num_frames)
             oQ = nQ;
         }
 
-        // Feed to FFT buffer — either direct (48k) or via decimator
-        if (g_cur_span == 0) {
-            // 48kHz span: feed every sample directly
-            int pos = g_write_pos;
-            buf[2 * pos]     = oI;
-            buf[2 * pos + 1] = oQ;
-            g_write_pos = pos + 1;
-            if (g_write_pos >= g_fft_size) {
-                __sync_synchronize();
-                g_ready_buf = g_write_buf;
-                g_write_buf = 1 - g_write_buf;
-                buf = g_input_buf[g_write_buf];
-                g_write_pos = 0;
-            }
-        }
+        // ── Fill 48k WOLA buffer (span 0) ──
+        wola_write(g_wola[0], oI, oQ);
 
-        // Run all decimation stages (each independently from 48kHz)
-        for (int si = 0; si < NUM_DECIM_STAGES; si++) {
-            float di, dq;
-            if (fir_decimate_sample(g_decim[si], oI, oQ, di, dq)) {
-                // Feed to FFT if this is the selected span's decimator
-                // span 1=↓2(idx 0), span 2=↓4(idx 1), span 3=↓8(idx 2)
-                if (g_cur_span == si + 1) {
-                    int pos = g_write_pos;
-                    buf[2 * pos]     = di;
-                    buf[2 * pos + 1] = dq;
-                    g_write_pos = pos + 1;
-                    if (g_write_pos >= g_fft_size) {
-                        __sync_synchronize();
-                        g_ready_buf = g_write_buf;
-                        g_write_buf = 1 - g_write_buf;
-                        buf = g_input_buf[g_write_buf];
-                        g_write_pos = 0;
-                    }
-                }
+        // ── Cascade ↓2 stage 1: 48k → 24k ──
+        float d1i, d1q;
+        if (cascade_decimate(g_cascade[0], oI, oQ, d1i, d1q)) {
+            wola_write(g_wola[1], d1i, d1q);
 
-                // ↓8 stage (idx 2) always feeds audio output
-                if (si == AUDIO_DECIM_IDX) {
+            // ── Cascade ↓2 stage 2: 24k → 12k ──
+            float d2i, d2q;
+            if (cascade_decimate(g_cascade[1], d1i, d1q, d2i, d2q)) {
+                wola_write(g_wola[2], d2i, d2q);
+
+                // ── Cascade ↓2 stage 3: 12k → 6k ──
+                float d3i, d3q;
+                if (cascade_decimate(g_cascade[2], d2i, d2q, d3i, d3q)) {
+                    wola_write(g_wola[3], d3i, d3q);
+
+                    // ── Audio pipeline (6 kHz, unchanged) ──
                     float audio = 0;
                     if (!g_mode_known) {
                         // Mute until mode is determined
                     } else if (g_cw_nco_active) {
                         float filt_i, filt_q;
                         if (g_apf_enabled)
-                            apf_fir_sample(di, dq, filt_i, filt_q);
+                            apf_fir_sample(d3i, d3q, filt_i, filt_q);
                         else
-                            cw_fir_sample(di, dq, filt_i, filt_q);
+                            cw_fir_sample(d3i, d3q, filt_i, filt_q);
 
-                        // Feed CW-filtered complex I/Q to Goertzel detector
+                        // Goertzel detector
                         if (g_goertzel_running) {
                             for (int b = 0; b < GOERTZEL_BINS; b++) {
-                                // Complex Goertzel: same recursion on I and Q independently
                                 float c = g_goertzel[b].coeff;
                                 float s0_re = filt_i + c * g_goertzel[b].s1_re - g_goertzel[b].s2_re;
                                 float s0_im = filt_q + c * g_goertzel[b].s1_im - g_goertzel[b].s2_im;
@@ -457,16 +492,14 @@ void dsp::pushIQ(const float *iq, int num_frames)
                             }
                             g_goertzel_count++;
                             if (g_goertzel_count >= g_goertzel_target) {
-                                // Compute complex DFT power per bin, find peak
                                 float max_power = -1;
                                 int max_bin = GOERTZEL_BINS / 2;
                                 for (int b = 0; b < GOERTZEL_BINS; b++) {
                                     float ck = g_goertzel[b].cos_k;
                                     float sk = g_goertzel[b].sin_k;
-                                    // X = s1 - s2 * exp(-j*w) for both re/im
-                                    float xr = g_goertzel[b].s1_re - g_goertzel[b].s2_re*ck + g_goertzel[b].s2_im*sk;
-                                    float xi = g_goertzel[b].s1_im - g_goertzel[b].s2_im*ck - g_goertzel[b].s2_re*sk;
-                                    float power = xr*xr + xi*xi;
+                                    float xr = g_goertzel[b].s1_re - g_goertzel[b].s2_re * ck + g_goertzel[b].s2_im * sk;
+                                    float xi = g_goertzel[b].s1_im - g_goertzel[b].s2_im * ck - g_goertzel[b].s2_re * sk;
+                                    float power = xr * xr + xi * xi;
                                     if (power > max_power) {
                                         max_power = power;
                                         max_bin = b;
@@ -481,11 +514,10 @@ void dsp::pushIQ(const float *iq, int num_frames)
                         nco::mixUp(g_sidetone_nco, filt_i, filt_q, tone_i, tone_q);
                         audio = tone_i;
                     } else {
-                        // Non-CW: 3kHz LPF on I stream
-                        audio = ssb_fir_sample(di);
+                        // Non-CW: 3 kHz LPF on I stream
+                        audio = ssb_fir_sample(d3i);
                     }
                     audio *= g_audio_gain;
-                    // Soft saturation (tanh) instead of hard clip
                     audio = tanhf(audio);
                     g_audio_out_buf[g_audio_out_pos++] = audio;
                     if (g_audio_out_pos >= AUDIO_OUT_BUF_SIZE)
@@ -496,28 +528,31 @@ void dsp::pushIQ(const float *iq, int num_frames)
     }
 }
 
+// ═════════════════════════════════════════════════════════════
+// processIfReady — called from main loop
+// ═════════════════════════════════════════════════════════════
+
 bool dsp::processIfReady()
 {
-    int rb = g_ready_buf;
-    if (rb < 0) return false;
-    g_ready_buf = -1;
+    WolaState &w = g_wola[g_cur_span];
+    if (w.hop_counter < w.hop_size) return false;
+    w.hop_counter -= w.hop_size;
     __sync_synchronize();
 
-    memcpy(g_fft_data, g_input_buf[rb], 2 * g_fft_size * sizeof(float));
-    compute_spectrum();
+    wola_process(w);
     return true;
 }
 
-int dsp::getNumBins()              { return g_num_bins; }
-const float* dsp::getMagnitudeDb() { return g_magnitude_db; }
+int          dsp::getNumBins()       { return g_num_bins; }
+const float* dsp::getMagnitudeDb()   { return g_magnitude_db; }
 
 int dsp::displayBin(int display_idx)
 {
     if (g_cur_span == 0) {
-        // 48kHz span: virtual rotation to center LO (shift by 3N/4 = 12kHz)
+        // 48k span: rotate by 3N/4 to center VFO (placed at DC by fs/4 mixer)
         return (display_idx + 3 * g_fft_size / 4) % g_fft_size;
     }
-    // Narrow spans: DC (=VFO) already at center after fftshift, no rotation
+    // Narrow spans: DC (= VFO) already at center after fftshift
     return display_idx;
 }
 
@@ -526,20 +561,18 @@ void dsp::setSpan(int span_idx)
     if (span_idx < 0 || span_idx >= NUM_SPANS) return;
     if (span_idx == g_cur_span) return;
     g_cur_span = span_idx;
-    // Reset FFT buffer to avoid mixing rates
-    g_write_pos = 0;
-    g_ready_buf = -1;
+    // Reset hop counter to prevent burst of stale frames on span switch
+    g_wola[span_idx].hop_counter = 0;
 }
 
 int dsp::getSpan() { return g_cur_span; }
 
 int dsp::getSpanRate()
 {
-    if (g_cur_span == 0) return g_sample_rate;
-    return g_sample_rate / g_spans[g_cur_span].decim;
+    return g_span_rates[g_cur_span];
 }
 
 const char* dsp::getSpanLabel()
 {
-    return g_spans[g_cur_span].label;
+    return g_span_labels[g_cur_span];
 }
