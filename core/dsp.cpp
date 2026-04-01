@@ -128,17 +128,34 @@ static void design_fir_lowpass(float *h, int N, float cutoff_hz, float sample_ra
     if (sum > 0) for (int n = 0; n < N; n++) h[n] /= sum;
 }
 
-// Blackman-Harris prototype window for WOLA filter bank.
-// Generates periodic form: symmetric BH(M+1) truncated to M samples.
-// Scaled so Σw[n] = fft_size, giving magnitude normalization consistent
-// with a plain N-point FFT (same dB reference).
-static void generate_wola_window(float *w, int M, int fft_size)
+// WOLA prototype filter: windowed-sinc lowpass with Blackman-Harris envelope.
+// Cutoff at fs/(2*N) = half the bin spacing, giving each DFT bin a flat
+// passband across its full width with sharp skirts and -92 dB sidelobes.
+// Reference: Lyons, "Understanding DSP", Ch.13 — WOLA spectrum analyzer.
+// Scaled so Σw[n] = N for magnitude normalization consistent with plain FFT.
+static void generate_wola_prototype(float *w, int M, int fft_size)
 {
     const double a0 = 0.35875, a1 = 0.48829, a2 = 0.14128, a3 = 0.01168;
+    double fc = 1.0 / fft_size;  // normalized cutoff = 1/N (full bin spacing)
+    int center = M / 2;
+
     for (int n = 0; n < M; n++) {
-        double x = 2.0 * M_PI * n / M;   // periodic: /M not /(M-1)
-        w[n] = (float)(a0 - a1 * cos(x) + a2 * cos(2 * x) - a3 * cos(3 * x));
+        // Blackman-Harris window (periodic form)
+        double x = 2.0 * M_PI * n / M;
+        double bh = a0 - a1 * cos(x) + a2 * cos(2 * x) - a3 * cos(3 * x);
+
+        // Sinc lowpass — flat passband across 1 bin, BH-shaped skirts
+        double s;
+        int k = n - center;
+        if (k == 0)
+            s = 2.0 * fc;
+        else
+            s = sin(2.0 * M_PI * fc * k) / (M_PI * k);
+
+        w[n] = (float)(s * bh);
     }
+
+    // Scale so Σw = N (match plain FFT dB reference)
     float sum = 0;
     for (int n = 0; n < M; n++) sum += w[n];
     float scale = (float)fft_size / sum;
@@ -311,10 +328,10 @@ void dsp::init(int sample_rate, int fft_size)
     g_magnitude_db = new float[fft_size];
     g_mix_phase    = 0;
 
-    // WOLA prototype window (Blackman-Harris, periodic form)
+    // WOLA prototype filter (windowed-sinc with Blackman-Harris)
     g_wola_m = WOLA_P * fft_size;
     g_wola_window = new float[g_wola_m];
-    generate_wola_window(g_wola_window, g_wola_m, fft_size);
+    generate_wola_prototype(g_wola_window, g_wola_m, fft_size);
 
     // WOLA per-span circular buffers
     for (int i = 0; i < NUM_SPANS; i++) {
