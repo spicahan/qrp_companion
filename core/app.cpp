@@ -248,8 +248,8 @@ static void fmt_fps(char *buf, int len) {
 
 static ui::Label lbl_span, lbl_freq, lbl_fps;
 
-// --- Bottom band buttons ---
-static ui::Band bottom_band;
+// --- Bands (declared before handlers so all handlers can reference them) ---
+static ui::Band header_band, bottom_band, right_band;
 
 static void btn_span_press(ui::Button &) {
     bottom_band.setLayout("span_select");
@@ -296,20 +296,36 @@ static void btn_15_press(ui::Button &) { tune_band(21074000); }
 static void btn_12_press(ui::Button &) { tune_band(24915000); }
 static void btn_10_press(ui::Button &) { tune_band(28074000); }
 
-static ui::Button btn_span, btn_filter, btn_zerobeat, btn_band;
+// Dynamic range (DR) mode
+static void btn_dr_press(ui::Button &) {
+    bottom_band.setLayout("dr_active");
+    right_band.setLayout("dr_sliders");
+}
+static void btn_dr_default_press(ui::Button &) {
+    ui::set_f32(ui::PROP_db_floor, SPEC_DB_FLOOR, ui::FROM_UI);
+    ui::set_f32(ui::PROP_db_ceil, SPEC_DB_CEIL, ui::FROM_UI);
+}
+static void btn_dr_back_press(ui::Button &) {
+    bottom_band.setLayout("default");
+    right_band.setLayout("default");
+}
+
+static ui::Button btn_span, btn_filter, btn_zerobeat, btn_band, btn_dr;
 static ui::Button btn_48k, btn_12k, btn_6k, btn_3k, btn_span_back;
 static ui::Button btn_40, btn_30, btn_20, btn_17, btn_15, btn_12, btn_10, btn_back;
+static ui::Button btn_dr_default, btn_dr_back;
 
 static ui::Panel panel_bottom_default = { "default" };
 static ui::Panel panel_span_select    = { "span_select" };
 static ui::Panel panel_band_select    = { "band_select" };
+static ui::Panel panel_dr_bottom      = { "dr_active" };
 
-// --- Right band slider ---
+// --- Right band ---
 static ui::Slider slider_gain;
-static ui::Panel panel_right_default = { "default" };
+static ui::Slider slider_ceil, slider_floor;
+static ui::Panel panel_right_default  = { "default" };
+static ui::Panel panel_right_dr       = { "dr_sliders" };
 
-// --- Bands ---
-static ui::Band header_band, right_band;
 static ui::Panel panel_header = { "default" };
 
 // ═══════════════════════════════════════════════════════════════
@@ -423,35 +439,61 @@ void app::init()
     make_button(btn_12,  "12",   COL_WHITE, COL_NAVY, btn_12_press);
     make_button(btn_10,  "10",   COL_WHITE, COL_NAVY, btn_10_press);
     make_button(btn_back,"Back", COL_RED,   COL_DGREY, btn_back_press);
+    make_button(btn_dr,  "DR",   COL_WHITE, COL_DGREY, btn_dr_press);
+    make_button(btn_dr_default, "Default", COL_CYAN, COL_DGREY, btn_dr_default_press);
+    make_button(btn_dr_back,    "Back",    COL_RED,  COL_DGREY, btn_dr_back_press);
 
-    // Init slider
+    // Init sliders
     slider_gain.type = ui::W_SLIDER;
     slider_gain.bind = ui::PROP_audio_gain;
     slider_gain.min_val = 100.0f; slider_gain.max_val = 10000.0f;
     slider_gain.logarithmic = true; slider_gain.unit = "dB";
 
-    // --- Layout: Right band (slider) ---
+    slider_ceil.type = ui::W_SLIDER;
+    slider_ceil.bind = ui::PROP_db_ceil;
+    slider_ceil.min_val = -80.0f; slider_ceil.max_val = 0.0f;
+    slider_ceil.logarithmic = false; slider_ceil.unit = nullptr;
+
+    slider_floor.type = ui::W_SLIDER;
+    slider_floor.bind = ui::PROP_db_floor;
+    slider_floor.min_val = -150.0f; slider_floor.max_val = -40.0f;
+    slider_floor.logarithmic = false; slider_floor.unit = nullptr;
+
+    // --- Layout: Right band ---
     int slider_x = log_w - SIDE_W;
+    int rh = SPEC_H + GAP + wf_h;
+
     slider_gain.x = slider_x; slider_gain.y = spec_y;
-    slider_gain.w = SIDE_W; slider_gain.h = SPEC_H + GAP + wf_h;
+    slider_gain.w = SIDE_W; slider_gain.h = rh;
     panel_right_default.add(&slider_gain);
+
+    slider_ceil.x = slider_x; slider_ceil.y = spec_y;
+    slider_ceil.w = SIDE_W;   slider_ceil.h = rh / 2;
+    slider_floor.x = slider_x; slider_floor.y = spec_y + rh / 2;
+    slider_floor.w = SIDE_W;   slider_floor.h = rh / 2;
+    panel_right_dr.add(&slider_ceil);
+    panel_right_dr.add(&slider_floor);
+
     right_band.x = slider_x; right_band.y = spec_y;
-    right_band.w = SIDE_W; right_band.h = SPEC_H + GAP + wf_h;
+    right_band.w = SIDE_W; right_band.h = rh;
     right_band.addPanel(&panel_right_default);
+    right_band.addPanel(&panel_right_dr);
 
     // --- Layout: Bottom band ---
     int bot_y = log_h - BOTTOM_H;
-    int bw = log_w / 4;
+    int bw = log_w / 5;
 
-    btn_span.x = 0;       btn_span.y = bot_y;   btn_span.w = bw;            btn_span.h = BOTTOM_H;
-    btn_filter.x = bw;    btn_filter.y = bot_y;  btn_filter.w = bw;          btn_filter.h = BOTTOM_H;
-    btn_zerobeat.x = 2*bw; btn_zerobeat.y = bot_y; btn_zerobeat.w = bw;      btn_zerobeat.h = BOTTOM_H;
-    btn_band.x = 3*bw;    btn_band.y = bot_y;    btn_band.w = log_w - 3*bw;  btn_band.h = BOTTOM_H;
+    btn_span.x = 0;       btn_span.y = bot_y;   btn_span.w = bw;   btn_span.h = BOTTOM_H;
+    btn_filter.x = bw;    btn_filter.y = bot_y;  btn_filter.w = bw; btn_filter.h = BOTTOM_H;
+    btn_zerobeat.x = 2*bw; btn_zerobeat.y = bot_y; btn_zerobeat.w = bw; btn_zerobeat.h = BOTTOM_H;
+    btn_band.x = 3*bw;    btn_band.y = bot_y;    btn_band.w = bw;   btn_band.h = BOTTOM_H;
+    btn_dr.x = 4*bw;      btn_dr.y = bot_y;      btn_dr.w = log_w - 4*bw; btn_dr.h = BOTTOM_H;
 
     panel_bottom_default.add(&btn_span);
     panel_bottom_default.add(&btn_filter);
     panel_bottom_default.add(&btn_zerobeat);
     panel_bottom_default.add(&btn_band);
+    panel_bottom_default.add(&btn_dr);
 
     // Span select panel (5 buttons)
     int sbw = log_w / 5;
@@ -487,10 +529,18 @@ void app::init()
     panel_band_select.add(&btn_10);
     panel_band_select.add(&btn_back);
 
+    // DR mode bottom panel (2 buttons)
+    int drw = log_w / 2;
+    btn_dr_default.x = 0;   btn_dr_default.y = bot_y; btn_dr_default.w = drw;          btn_dr_default.h = BOTTOM_H;
+    btn_dr_back.x = drw;    btn_dr_back.y = bot_y;    btn_dr_back.w = log_w - drw;     btn_dr_back.h = BOTTOM_H;
+    panel_dr_bottom.add(&btn_dr_default);
+    panel_dr_bottom.add(&btn_dr_back);
+
     bottom_band.x = 0; bottom_band.y = bot_y; bottom_band.w = log_w; bottom_band.h = BOTTOM_H;
     bottom_band.addPanel(&panel_bottom_default);
     bottom_band.addPanel(&panel_span_select);
     bottom_band.addPanel(&panel_band_select);
+    bottom_band.addPanel(&panel_dr_bottom);
 
     // --- Audio ---
     pal::audioOutputOpen(dsp::getDecimatedRate());
