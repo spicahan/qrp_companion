@@ -282,8 +282,7 @@ static void select_span(int idx) {
 }
 static void btn_48k_press(ui::Button &)   { select_span(0); }
 static void btn_12k_press(ui::Button &)   { select_span(1); }
-static void btn_6k_press(ui::Button &)    { select_span(2); }
-static void btn_3k_press(ui::Button &)    { select_span(3); }
+static void btn_4k_press(ui::Button &)    { select_span(2); }
 static void btn_noniq_press(ui::Button &) { select_span(dsp::NON_IQ_SPAN); }
 
 // Band selection helpers
@@ -314,7 +313,7 @@ static void btn_dr_back_press(ui::Button &) {
 }
 
 static ui::Button btn_span, btn_filter, btn_zerobeat, btn_band, btn_dr;
-static ui::Button btn_48k, btn_12k, btn_6k, btn_3k, btn_noniq, btn_span_back;
+static ui::Button btn_48k, btn_12k, btn_4k, btn_noniq, btn_span_back;
 static ui::Button btn_40, btn_30, btn_20, btn_17, btn_15, btn_12, btn_10, btn_back;
 static ui::Button btn_dr_default, btn_dr_back;
 
@@ -431,8 +430,7 @@ void app::init()
     make_button(btn_band,     "Band",   COL_WHITE,  COL_DGREY, btn_band_press);
     make_button(btn_48k, "48k",    COL_CYAN, COL_NAVY, btn_48k_press);
     make_button(btn_12k, "+/-12k", COL_CYAN, COL_NAVY, btn_12k_press);
-    make_button(btn_6k,  "+/-6k",  COL_CYAN, COL_NAVY, btn_6k_press);
-    make_button(btn_3k,  "+/-3k",  COL_CYAN, COL_NAVY, btn_3k_press);
+    make_button(btn_4k,  "+/-4k",  COL_CYAN, COL_NAVY, btn_4k_press);
     make_button(btn_noniq, "NonIQ", COL_CYAN, COL_NAVY, btn_noniq_press);
     make_button(btn_span_back, "Back", COL_RED, COL_DGREY, btn_back_press);
     make_button(btn_40,  "40",   COL_WHITE, COL_NAVY, btn_40_press);
@@ -499,19 +497,17 @@ void app::init()
     panel_bottom_default.add(&btn_band);
     panel_bottom_default.add(&btn_dr);
 
-    // Span select panel (6 buttons)
-    int sbw = log_w / 6;
+    // Span select panel (5 buttons)
+    int sbw = log_w / 5;
     btn_48k.x = 0;        btn_48k.y = bot_y;  btn_48k.w = sbw;           btn_48k.h = BOTTOM_H;
     btn_12k.x = sbw;      btn_12k.y = bot_y;  btn_12k.w = sbw;           btn_12k.h = BOTTOM_H;
-    btn_6k.x = 2*sbw;     btn_6k.y = bot_y;   btn_6k.w = sbw;            btn_6k.h = BOTTOM_H;
-    btn_3k.x = 3*sbw;     btn_3k.y = bot_y;   btn_3k.w = sbw;            btn_3k.h = BOTTOM_H;
-    btn_noniq.x = 4*sbw;  btn_noniq.y = bot_y; btn_noniq.w = sbw;        btn_noniq.h = BOTTOM_H;
-    btn_span_back.x = 5*sbw; btn_span_back.y = bot_y; btn_span_back.w = log_w - 5*sbw; btn_span_back.h = BOTTOM_H;
+    btn_4k.x = 2*sbw;     btn_4k.y = bot_y;   btn_4k.w = sbw;            btn_4k.h = BOTTOM_H;
+    btn_noniq.x = 3*sbw;  btn_noniq.y = bot_y; btn_noniq.w = sbw;        btn_noniq.h = BOTTOM_H;
+    btn_span_back.x = 4*sbw; btn_span_back.y = bot_y; btn_span_back.w = log_w - 4*sbw; btn_span_back.h = BOTTOM_H;
 
     panel_span_select.add(&btn_48k);
     panel_span_select.add(&btn_12k);
-    panel_span_select.add(&btn_6k);
-    panel_span_select.add(&btn_3k);
+    panel_span_select.add(&btn_4k);
     panel_span_select.add(&btn_noniq);
     panel_span_select.add(&btn_span_back);
 

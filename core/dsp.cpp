@@ -28,17 +28,25 @@ static WolaState g_wola[dsp::NUM_SPANS];
 static float *g_wola_window;       // prototype filter [wola_m]
 static int    g_wola_m;            // = WOLA_P * fft_size
 
-// ── Cascaded half-band decimation (48k → 24k → 12k → 6k) ───
-static constexpr int HB_TAPS = 65;
+// ── Independent decimation (no cascade — minimal latency) ────
+//  ↓2: 48k → 24k for ±12k span
+//  ↓6: 48k → 8k  for ±4k span + audio output
+static constexpr int D2_TAPS = 65;    // ↓2 anti-alias FIR
+static constexpr int D6_TAPS = 193;   // ↓6 anti-alias FIR (divisible-ish, odd)
+static constexpr int AUDIO_DECIM = 6; // decimation factor for audio path
 
-struct CascadeStage {
-    float delay_i[HB_TAPS];
-    float delay_q[HB_TAPS];
+struct DecimState {
+    float *delay_i;
+    float *delay_q;
+    int   taps;
     int   pos;
     int   counter;
+    int   decim;
 };
-static float g_hb_coeffs[HB_TAPS]; // shared across all 3 stages
-static CascadeStage g_cascade[3];
+static DecimState g_decim2;   // ↓2
+static DecimState g_decim6;   // ↓6
+static float g_d2_coeffs[D2_TAPS];
+static float g_d6_coeffs[D6_TAPS];
 
 // ── fs/4 down-conversion mixer ───────────────────────────────
 static int g_mix_phase;
@@ -49,7 +57,7 @@ static bool  g_cw_nco_active = false;
 static float g_cw_offset_hz = 0;
 static float g_soft_nco_hz = 0;
 
-// ── CW audio filter (300 Hz BW at 6 kHz) + sidetone NCO ────
+// ── CW audio filter (300 Hz BW at 8 kHz) + sidetone NCO ────
 static constexpr int CW_FIR_TAPS = 65;
 static constexpr float CW_FIR_CUTOFF_HZ = 150.0f;
 static float g_cw_fir_coeffs[CW_FIR_TAPS];
@@ -58,7 +66,7 @@ static float g_cw_fir_delay_q[CW_FIR_TAPS];
 static int   g_cw_fir_pos = 0;
 static NcoState g_sidetone_nco;
 
-// ── APF (40 Hz BW at 6 kHz) ─────────────────────────────────
+// ── APF (40 Hz BW at 8 kHz) ─────────────────────────────────
 static constexpr int APF_FIR_TAPS = 257;
 static constexpr float APF_FIR_CUTOFF_HZ = 20.0f;
 static float g_apf_fir_coeffs[APF_FIR_TAPS];
@@ -67,7 +75,7 @@ static float g_apf_fir_delay_q[APF_FIR_TAPS];
 static int   g_apf_fir_pos = 0;
 static bool  g_apf_enabled = false;
 
-// ── SSB/DIGI audio filter (3 kHz LPF at 6 kHz) ─────────────
+// ── SSB/DIGI audio filter (3 kHz LPF at 8 kHz) ─────────────
 static constexpr int SSB_FIR_TAPS = 65;
 static constexpr float SSB_FIR_CUTOFF_HZ = 2800.0f;
 static float g_ssb_fir_coeffs[SSB_FIR_TAPS];
@@ -98,16 +106,17 @@ static constexpr int HILBERT_TAPS = 255;
 static float g_hilbert_coeffs[HILBERT_TAPS];
 static float g_hilbert_delay[HILBERT_TAPS];
 static int   g_hilbert_pos = 0;
-static int   g_hard_decim_counter = 0;   // hard ↓8 counter for Non-I/Q
+static int   g_hard_decim_counter = 0;   // hard ↓6 counter for Non-I/Q
 
 // ── Span definitions ────────────────────────────────────────
-static const int g_span_rates[dsp::NUM_SPANS]  = { 48000, 24000, 12000, 6000, 6000 };
-static const int g_hop_sizes[dsp::NUM_SPANS]   = {  2048,  1024,   512,  512,  512 };
-static const char *g_span_labels[dsp::NUM_SPANS] = { "48k", "+/-12k", "+/-6k", "+/-3k", "NonIQ" };
+// 0=48k, 1=±12k, 2=±4k, 3=NonIQ
+static const int g_span_rates[dsp::NUM_SPANS]  = { 48000, 24000,  8000,  8000 };
+static const int g_hop_sizes[dsp::NUM_SPANS]   = {  2048,  1024,   320,   320 };
+static const char *g_span_labels[dsp::NUM_SPANS] = { "48k", "+/-12k", "+/-4k", "NonIQ" };
 static int g_cur_span = 0;
 
 // ── Audio output ────────────────────────────────────────────
-static constexpr int AUDIO_OUT_BUF_SIZE = 128;
+static constexpr int AUDIO_OUT_BUF_SIZE = 32;   // smaller for lower latency
 static float g_audio_out_buf[AUDIO_OUT_BUF_SIZE];
 static int   g_audio_out_pos = 0;
 static dsp::AudioOutCallback g_audio_out_cb = nullptr;
@@ -136,10 +145,8 @@ static void design_fir_lowpass(float *h, int N, float cutoff_hz, float sample_ra
 }
 
 // WOLA prototype filter: windowed-sinc lowpass with Blackman-Harris envelope.
-// Cutoff at fs/(2*N) = half the bin spacing, giving each DFT bin a flat
-// passband across its full width with sharp skirts and -92 dB sidelobes.
+// Cutoff at fs/N (full bin spacing) for flat-top per-bin response.
 // Reference: Lyons, "Understanding DSP", Ch.13 — WOLA spectrum analyzer.
-// Scaled so Σw[n] = N for magnitude normalization consistent with plain FFT.
 static void generate_wola_prototype(float *w, int M, int fft_size)
 {
     const double a0 = 0.35875, a1 = 0.48829, a2 = 0.14128, a3 = 0.01168;
@@ -147,11 +154,9 @@ static void generate_wola_prototype(float *w, int M, int fft_size)
     int center = M / 2;
 
     for (int n = 0; n < M; n++) {
-        // Blackman-Harris window (periodic form)
         double x = 2.0 * M_PI * n / M;
         double bh = a0 - a1 * cos(x) + a2 * cos(2 * x) - a3 * cos(3 * x);
 
-        // Sinc lowpass — flat passband across 1 bin, BH-shaped skirts
         double s;
         int k = n - center;
         if (k == 0)
@@ -162,7 +167,6 @@ static void generate_wola_prototype(float *w, int M, int fft_size)
         w[n] = (float)(s * bh);
     }
 
-    // Scale so Σw = N (match plain FFT dB reference)
     float sum = 0;
     for (int n = 0; n < M; n++) sum += w[n];
     float scale = (float)fft_size / sum;
@@ -175,7 +179,6 @@ static void generate_wola_prototype(float *w, int M, int fft_size)
 
 static void design_hilbert(float *h, int N)
 {
-    // Blackman-Harris windowed Hilbert FIR.  Only odd-offset taps are non-zero.
     const double a0 = 0.35875, a1 = 0.48829, a2 = 0.14128, a3 = 0.01168;
     int center = (N - 1) / 2;
     for (int n = 0; n < N; n++) {
@@ -195,18 +198,14 @@ static void hilbert_process(float in, float &out_i, float &out_q)
     g_hilbert_delay[g_hilbert_pos] = in;
     g_hilbert_pos = (g_hilbert_pos + 1) % HILBERT_TAPS;
 
-    // Q output: iterate only non-zero taps (where index parity differs
-    // from center).  Negated because the circular-buffer loop convolves
-    // in time-reversed order, inverting antisymmetric (Hilbert) filters.
     float acc = 0;
-    int start = ((HILBERT_TAPS - 1) / 2) & 1 ? 0 : 1;  // center odd → even indices, center even → odd
+    int start = ((HILBERT_TAPS - 1) / 2) & 1 ? 0 : 1;
     for (int k = start; k < HILBERT_TAPS; k += 2) {
         int idx = (g_hilbert_pos + k) % HILBERT_TAPS;
         acc += g_hilbert_delay[idx] * g_hilbert_coeffs[k];
     }
     out_q = -acc;
 
-    // I output: delayed by (N-1)/2 to match Hilbert group delay
     int delayed_idx = (g_hilbert_pos + (HILBERT_TAPS - 1) / 2) % HILBERT_TAPS;
     out_i = g_hilbert_delay[delayed_idx];
 }
@@ -272,26 +271,36 @@ static void flush_audio_out()
 }
 
 // ═════════════════════════════════════════════════════════════
-// Cascaded ↓2 decimation
+// Independent decimation (no cascade — minimal group delay)
 // ═════════════════════════════════════════════════════════════
 
-static bool cascade_decimate(CascadeStage &s, float in_i, float in_q,
-                             float &out_i, float &out_q)
+static void decim_init(DecimState &s, int taps, int decim)
+{
+    s.delay_i = new float[taps]();
+    s.delay_q = new float[taps]();
+    s.taps = taps;
+    s.pos = 0;
+    s.counter = 0;
+    s.decim = decim;
+}
+
+static bool decim_process(DecimState &s, const float *coeffs,
+                          float in_i, float in_q, float &out_i, float &out_q)
 {
     s.delay_i[s.pos] = in_i;
     s.delay_q[s.pos] = in_q;
-    s.pos = (s.pos + 1) % HB_TAPS;
+    s.pos = (s.pos + 1) % s.taps;
 
     s.counter++;
-    if (s.counter < 2) return false;
+    if (s.counter < s.decim) return false;
     s.counter = 0;
 
     float acc_i = 0, acc_q = 0;
     int idx = s.pos;
-    for (int k = 0; k < HB_TAPS; k++) {
-        acc_i += s.delay_i[idx] * g_hb_coeffs[k];
-        acc_q += s.delay_q[idx] * g_hb_coeffs[k];
-        idx = (idx + 1) % HB_TAPS;
+    for (int k = 0; k < s.taps; k++) {
+        acc_i += s.delay_i[idx] * coeffs[k];
+        acc_q += s.delay_q[idx] * coeffs[k];
+        idx = (idx + 1) % s.taps;
     }
     out_i = acc_i;
     out_q = acc_q;
@@ -310,15 +319,12 @@ static inline void wola_write(WolaState &w, float i, float q)
     w.hop_counter++;
 }
 
-// Window + fold + FFT + magnitude.  Reads from circular buffer
-// at snapshot position (oldest sample = write_pos).
 static void wola_process(const WolaState &w)
 {
-    int wp = w.write_pos;   // snapshot (this IS the oldest sample position)
+    int wp = w.write_pos;
     int N  = g_fft_size;
     int M  = g_wola_m;
 
-    // Combined window + fold → g_fft_data (interleaved I/Q for FFT)
     memset(g_fft_data, 0, 2 * N * sizeof(float));
     for (int p = 0; p < WOLA_P; p++) {
         for (int n = 0; n < N; n++) {
@@ -329,11 +335,9 @@ static void wola_process(const WolaState &w)
         }
     }
 
-    // FFT
     dsps_fft2r_fc32(g_fft_data, N);
     dsps_bit_rev_fc32(g_fft_data, N);
 
-    // fftshift + magnitude in dB
     const float scale = 1.0f / N;
     int half = N / 2;
     for (int i = 0; i < N; i++) {
@@ -346,7 +350,7 @@ static void wola_process(const WolaState &w)
 }
 
 // ═════════════════════════════════════════════════════════════
-// NCO helpers (unchanged)
+// NCO helpers
 // ═════════════════════════════════════════════════════════════
 
 static void update_cw_ncos()
@@ -359,7 +363,7 @@ static void update_cw_ncos()
     }
     float total_shift = g_cw_offset_hz + g_soft_nco_hz;
     nco::setFreq(g_cw_nco, total_shift, (float)g_sample_rate);
-    float dec_rate = (float)g_sample_rate / 8;
+    float dec_rate = (float)g_sample_rate / AUDIO_DECIM;
     nco::setFreq(g_sidetone_nco, g_cw_offset_hz, dec_rate);
     g_cw_nco_active = true;
 }
@@ -391,16 +395,14 @@ void dsp::init(int sample_rate, int fft_size)
         g_wola[i].hop_size = g_hop_sizes[i];
     }
 
-    // Cascaded half-band decimation — same normalised cutoff for all stages.
-    // Designed at 48 kHz with 10 kHz cutoff; when reused at 24 kHz the
-    // effective cutoff becomes 5 kHz, at 12 kHz → 2.5 kHz, etc.
-    design_fir_lowpass(g_hb_coeffs, HB_TAPS, 10000.0f, (float)sample_rate);
-    for (int i = 0; i < 3; i++) {
-        memset(g_cascade[i].delay_i, 0, sizeof(g_cascade[i].delay_i));
-        memset(g_cascade[i].delay_q, 0, sizeof(g_cascade[i].delay_q));
-        g_cascade[i].pos = 0;
-        g_cascade[i].counter = 0;
-    }
+    // Independent decimators (no cascade)
+    // ↓2: 48k → 24k, cutoff 10 kHz
+    design_fir_lowpass(g_d2_coeffs, D2_TAPS, 10000.0f, (float)sample_rate);
+    decim_init(g_decim2, D2_TAPS, 2);
+
+    // ↓6: 48k → 8k, cutoff 3.5 kHz (passband 3kHz + margin, stopband at 4kHz Nyquist)
+    design_fir_lowpass(g_d6_coeffs, D6_TAPS, 3500.0f, (float)sample_rate);
+    decim_init(g_decim6, D6_TAPS, AUDIO_DECIM);
 
     // Hilbert transform (Non-I/Q mode)
     design_hilbert(g_hilbert_coeffs, HILBERT_TAPS);
@@ -418,8 +420,8 @@ void dsp::init(int sample_rate, int fft_size)
     g_cw_nco_active = false;
     g_cw_offset_hz = 0;
 
-    // CW audio filter (at ↓8 rate = 6 kHz)
-    float dec_rate = (float)sample_rate / 8;
+    // Audio filters (at ↓6 rate = 8 kHz)
+    float dec_rate = (float)sample_rate / AUDIO_DECIM;
     design_fir_lowpass(g_cw_fir_coeffs, CW_FIR_TAPS, CW_FIR_CUTOFF_HZ, dec_rate);
     memset(g_cw_fir_delay_i, 0, sizeof(g_cw_fir_delay_i));
     memset(g_cw_fir_delay_q, 0, sizeof(g_cw_fir_delay_q));
@@ -449,13 +451,13 @@ void dsp::init(int sample_rate, int fft_size)
 }
 
 void dsp::setAudioOutCallback(AudioOutCallback cb) { g_audio_out_cb = cb; }
-int  dsp::getDecimatedRate() { return g_sample_rate / 8; }
+int  dsp::getDecimatedRate() { return g_sample_rate / AUDIO_DECIM; }
 void dsp::setAudioGain(float gain) { g_audio_gain = gain; }
 float dsp::getAudioGain() { return g_audio_gain; }
 
 void dsp::startGoertzel()
 {
-    float dec_rate = (float)g_sample_rate / 8;
+    float dec_rate = (float)g_sample_rate / AUDIO_DECIM;
     g_goertzel_target = (int)(dec_rate * GOERTZEL_DURATION_S);
     g_goertzel_count = 0;
     g_goertzel_result = 0;
@@ -495,10 +497,10 @@ void dsp::setApfEnabled(bool enabled) { g_apf_enabled = enabled; }
 bool dsp::isApfEnabled() { return g_apf_enabled; }
 
 // ═════════════════════════════════════════════════════════════
-// Audio pipeline helper (called at 6 kHz from both I/Q and Non-I/Q paths)
+// Audio pipeline helper (called at 8 kHz)
 // ═════════════════════════════════════════════════════════════
 
-static void process_audio_6k(float d3i, float d3q)
+static void process_audio_8k(float di, float dq)
 {
     float audio = 0;
     if (!g_mode_known) {
@@ -506,9 +508,9 @@ static void process_audio_6k(float d3i, float d3q)
     } else if (g_cw_nco_active) {
         float filt_i, filt_q;
         if (g_apf_enabled)
-            apf_fir_sample(d3i, d3q, filt_i, filt_q);
+            apf_fir_sample(di, dq, filt_i, filt_q);
         else
-            cw_fir_sample(d3i, d3q, filt_i, filt_q);
+            cw_fir_sample(di, dq, filt_i, filt_q);
 
         // Goertzel detector
         if (g_goertzel_running) {
@@ -546,7 +548,7 @@ static void process_audio_6k(float d3i, float d3q)
         audio = tone_i;
     } else {
         // Non-CW: 3 kHz LPF on I stream
-        audio = ssb_fir_sample(d3i);
+        audio = ssb_fir_sample(di);
     }
     audio *= g_audio_gain;
     audio = tanhf(audio);
@@ -566,7 +568,7 @@ void dsp::pushIQ(const float *iq, int num_frames)
         float Q = iq[2 * i + 1];
 
         if (g_cur_span == NON_IQ_SPAN) {
-            // ── Non-I/Q path: mono baseband → Hilbert → CW NCO → hard ↓8 ──
+            // ── Non-I/Q path: mono baseband → Hilbert → CW NCO → hard ↓6 ──
             float hI, hQ;
             hilbert_process(I, hI, hQ);
 
@@ -577,10 +579,10 @@ void dsp::pushIQ(const float *iq, int num_frames)
             }
 
             g_hard_decim_counter++;
-            if (g_hard_decim_counter >= 8) {
+            if (g_hard_decim_counter >= AUDIO_DECIM) {
                 g_hard_decim_counter = 0;
                 wola_write(g_wola[NON_IQ_SPAN], hI, hQ);
-                process_audio_6k(hI, hQ);
+                process_audio_8k(hI, hQ);
             }
         } else {
             // ── Normal I/Q path ──
@@ -605,23 +607,17 @@ void dsp::pushIQ(const float *iq, int num_frames)
             // Fill 48k WOLA buffer (span 0)
             wola_write(g_wola[0], oI, oQ);
 
-            // Cascade ↓2 stage 1: 48k → 24k
-            float d1i, d1q;
-            if (cascade_decimate(g_cascade[0], oI, oQ, d1i, d1q)) {
-                wola_write(g_wola[1], d1i, d1q);
+            // ↓2: 48k → 24k (independent, for ±12k span)
+            float d2i, d2q;
+            if (decim_process(g_decim2, g_d2_coeffs, oI, oQ, d2i, d2q)) {
+                wola_write(g_wola[1], d2i, d2q);
+            }
 
-                // Cascade ↓2 stage 2: 24k → 12k
-                float d2i, d2q;
-                if (cascade_decimate(g_cascade[1], d1i, d1q, d2i, d2q)) {
-                    wola_write(g_wola[2], d2i, d2q);
-
-                    // Cascade ↓2 stage 3: 12k → 6k
-                    float d3i, d3q;
-                    if (cascade_decimate(g_cascade[2], d2i, d2q, d3i, d3q)) {
-                        wola_write(g_wola[3], d3i, d3q);
-                        process_audio_6k(d3i, d3q);
-                    }
-                }
+            // ↓6: 48k → 8k (independent, for ±4k span + audio)
+            float d6i, d6q;
+            if (decim_process(g_decim6, g_d6_coeffs, oI, oQ, d6i, d6q)) {
+                wola_write(g_wola[2], d6i, d6q);
+                process_audio_8k(d6i, d6q);
             }
         }
     }
@@ -651,7 +647,7 @@ int dsp::displayBin(int display_idx)
         // 48k span: rotate by 3N/4 to center VFO (placed at DC by fs/4 mixer)
         return (display_idx + 3 * g_fft_size / 4) % g_fft_size;
     }
-    // Narrow spans: DC (= VFO) already at center after fftshift
+    // Narrow spans + NonIQ: DC (= VFO) already at center after fftshift
     return display_idx;
 }
 
@@ -660,7 +656,6 @@ void dsp::setSpan(int span_idx)
     if (span_idx < 0 || span_idx >= NUM_SPANS) return;
     if (span_idx == g_cur_span) return;
     g_cur_span = span_idx;
-    // Reset hop counter to prevent burst of stale frames on span switch
     g_wola[span_idx].hop_counter = 0;
 }
 

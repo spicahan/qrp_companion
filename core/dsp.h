@@ -44,9 +44,9 @@ const float* getMagnitudeDb();       // dB values after fftshift
 int  displayBin(int display_idx);
 
 // Span control
-static constexpr int NUM_SPANS = 5;
-static constexpr int NON_IQ_SPAN = 4;
-void setSpan(int span_idx);          // 0=48k, 1=±12k, 2=±6k, 3=±3k, 4=NonIQ
+static constexpr int NUM_SPANS = 4;
+static constexpr int NON_IQ_SPAN = 3;
+void setSpan(int span_idx);          // 0=48k, 1=±12k, 2=±4k, 3=NonIQ
 int  getSpan();
 int  getSpanRate();                  // effective sample rate of current span
 const char* getSpanLabel();
