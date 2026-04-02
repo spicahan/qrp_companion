@@ -114,6 +114,11 @@ const char* cat::getModeStr()
 
 void cat::suppressPolling(bool suppress) { s_polling_suppressed = suppress; }
 
+void cat::setIqMode(bool enable)
+{
+    send_cmd(enable ? "Q91;" : "Q90;");
+}
+
 void cat::setVfoFreq(uint64_t freq_hz)
 {
     if (freq_hz == 0) return;

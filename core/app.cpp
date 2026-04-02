@@ -177,8 +177,10 @@ static void on_gain_change(ui::PropId, ui::Source) {
 }
 
 static void on_span_change(ui::PropId, ui::Source) {
-    dsp::setSpan(ui::get_i32(ui::PROP_span_idx));
+    int span = ui::get_i32(ui::PROP_span_idx);
+    dsp::setSpan(span);
     precompute_pixel_bin_map();
+    cat::setIqMode(span != dsp::NON_IQ_SPAN);
 }
 
 static void on_apf_change(ui::PropId, ui::Source) {
@@ -551,6 +553,7 @@ void app::init()
     dsp::setAudioOutCallback(audio_output_cb);
     pal::audioInputOpen(audio_input_cb);
     cat::init();
+    cat::setIqMode(true);  // default span is I/Q
 }
 
 // ═══════════════════════════════════════════════════════════════

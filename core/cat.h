@@ -18,4 +18,7 @@ void setVfoFreq(uint64_t freq_hz);
 // Suppress periodic polling (e.g. during drag-to-tune)
 void suppressPolling(bool suppress);
 
+// Enable/disable QMX I/Q mode (Q91; / Q90;)
+void setIqMode(bool enable);
+
 } // namespace cat
