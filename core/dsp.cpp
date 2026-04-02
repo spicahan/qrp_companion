@@ -15,18 +15,21 @@ static float *g_fft_data;
 static float *g_magnitude_db;
 
 // ── WOLA filter bank ─────────────────────────────────────────
-static constexpr int WOLA_P = 4;   // polyphase segments
+// Per-span P: wide spans (48k,±12k) use P=4 for sidelobe rejection,
+// narrow spans (±4k,NonIQ) use P=2 for lower spectral latency.
+static const int g_wola_p[dsp::NUM_SPANS] = { 4, 4, 2, 2 };
 
 struct WolaState {
-    float *buf_i;                   // circular buffer I [wola_m]
-    float *buf_q;                   // circular buffer Q [wola_m]
+    float *buf_i;                   // circular buffer I [M]
+    float *buf_q;                   // circular buffer Q [M]
+    float *window;                  // prototype filter [M]
+    int   M;                        // = P * fft_size
+    int   P;                        // polyphase segments
     int   write_pos;
     volatile int hop_counter;
     int   hop_size;
 };
 static WolaState g_wola[dsp::NUM_SPANS];
-static float *g_wola_window;       // prototype filter [wola_m]
-static int    g_wola_m;            // = WOLA_P * fft_size
 
 // ── Independent decimation (no cascade — minimal latency) ────
 //  ↓2: 48k → 24k for ±12k span
@@ -111,7 +114,7 @@ static int   g_hard_decim_counter = 0;   // hard ↓6 counter for Non-I/Q
 // ── Span definitions ────────────────────────────────────────
 // 0=48k, 1=±12k, 2=±4k, 3=NonIQ
 static const int g_span_rates[dsp::NUM_SPANS]  = { 48000, 24000,  8000,  8000 };
-static const int g_hop_sizes[dsp::NUM_SPANS]   = {  2048,  1024,   320,   320 };
+static const int g_hop_sizes[dsp::NUM_SPANS]   = {  2048,  1024,   320,   320 };  // N=512
 static const char *g_span_labels[dsp::NUM_SPANS] = { "48k", "+/-12k", "+/-4k", "NonIQ" };
 static int g_cur_span = 0;
 
@@ -315,7 +318,7 @@ static inline void wola_write(WolaState &w, float i, float q)
 {
     w.buf_i[w.write_pos] = i;
     w.buf_q[w.write_pos] = q;
-    w.write_pos = (w.write_pos + 1) % g_wola_m;
+    w.write_pos = (w.write_pos + 1) % w.M;
     w.hop_counter++;
 }
 
@@ -323,13 +326,14 @@ static void wola_process(const WolaState &w)
 {
     int wp = w.write_pos;
     int N  = g_fft_size;
-    int M  = g_wola_m;
+    int M  = w.M;
+    int P  = w.P;
 
     memset(g_fft_data, 0, 2 * N * sizeof(float));
-    for (int p = 0; p < WOLA_P; p++) {
+    for (int p = 0; p < P; p++) {
         for (int n = 0; n < N; n++) {
             int buf_idx = (wp + p * N + n) % M;
-            float wv = g_wola_window[p * N + n];
+            float wv = w.window[p * N + n];
             g_fft_data[2 * n]     += w.buf_i[buf_idx] * wv;
             g_fft_data[2 * n + 1] += w.buf_q[buf_idx] * wv;
         }
@@ -381,15 +385,16 @@ void dsp::init(int sample_rate, int fft_size)
     g_magnitude_db = new float[fft_size];
     g_mix_phase    = 0;
 
-    // WOLA prototype filter (windowed-sinc with Blackman-Harris)
-    g_wola_m = WOLA_P * fft_size;
-    g_wola_window = new float[g_wola_m];
-    generate_wola_prototype(g_wola_window, g_wola_m, fft_size);
-
-    // WOLA per-span circular buffers
+    // WOLA per-span: each span has its own P, M, window, and buffers
     for (int i = 0; i < NUM_SPANS; i++) {
-        g_wola[i].buf_i = new float[g_wola_m]();
-        g_wola[i].buf_q = new float[g_wola_m]();
+        int P = g_wola_p[i];
+        int M = P * fft_size;
+        g_wola[i].P = P;
+        g_wola[i].M = M;
+        g_wola[i].window = new float[M];
+        generate_wola_prototype(g_wola[i].window, M, fft_size);
+        g_wola[i].buf_i = new float[M]();
+        g_wola[i].buf_q = new float[M]();
         g_wola[i].write_pos = 0;
         g_wola[i].hop_counter = 0;
         g_wola[i].hop_size = g_hop_sizes[i];

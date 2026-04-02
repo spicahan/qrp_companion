@@ -30,7 +30,7 @@ static uint16_t COL_CYAN, COL_GREEN, COL_YELLOW, COL_RED;
 
 // DSP
 static constexpr int SAMPLE_RATE = 48000;
-static constexpr int FFT_SIZE    = 1024;
+static constexpr int FFT_SIZE    = 512;
 static int64_t last_dsp_time;
 
 // Waterfall
