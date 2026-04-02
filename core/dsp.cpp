@@ -93,10 +93,17 @@ static int   g_goertzel_target = 0;
 static bool  g_goertzel_running = false;
 static float g_goertzel_result = 0;
 
+// ── Hilbert transform (real → analytic for Non-I/Q mode) ────
+static constexpr int HILBERT_TAPS = 255;
+static float g_hilbert_coeffs[HILBERT_TAPS];
+static float g_hilbert_delay[HILBERT_TAPS];
+static int   g_hilbert_pos = 0;
+static int   g_hard_decim_counter = 0;   // hard ↓8 counter for Non-I/Q
+
 // ── Span definitions ────────────────────────────────────────
-static const int g_span_rates[dsp::NUM_SPANS]  = { 48000, 24000, 12000,  6000 };
-static const int g_hop_sizes[dsp::NUM_SPANS]   = {  2048,  1024,   512,   512 };
-static const char *g_span_labels[dsp::NUM_SPANS] = { "48k", "+/-12k", "+/-6k", "+/-3k" };
+static const int g_span_rates[dsp::NUM_SPANS]  = { 48000, 24000, 12000, 6000, 6000 };
+static const int g_hop_sizes[dsp::NUM_SPANS]   = {  2048,  1024,   512,  512,  512 };
+static const char *g_span_labels[dsp::NUM_SPANS] = { "48k", "+/-12k", "+/-6k", "+/-3k", "NonIQ" };
 static int g_cur_span = 0;
 
 // ── Audio output ────────────────────────────────────────────
@@ -163,7 +170,49 @@ static void generate_wola_prototype(float *w, int M, int fft_size)
 }
 
 // ═════════════════════════════════════════════════════════════
-// Audio filters (unchanged from pre-WOLA)
+// Hilbert transform (Non-I/Q mode)
+// ═════════════════════════════════════════════════════════════
+
+static void design_hilbert(float *h, int N)
+{
+    // Blackman-Harris windowed Hilbert FIR.  Only odd-offset taps are non-zero.
+    const double a0 = 0.35875, a1 = 0.48829, a2 = 0.14128, a3 = 0.01168;
+    int center = (N - 1) / 2;
+    for (int n = 0; n < N; n++) {
+        int k = n - center;
+        if (k == 0 || (k & 1) == 0) {
+            h[n] = 0.0f;
+        } else {
+            double x = 2.0 * M_PI * n / (N - 1);
+            double win = a0 - a1 * cos(x) + a2 * cos(2 * x) - a3 * cos(3 * x);
+            h[n] = (float)((2.0 / (M_PI * k)) * win);
+        }
+    }
+}
+
+static void hilbert_process(float in, float &out_i, float &out_q)
+{
+    g_hilbert_delay[g_hilbert_pos] = in;
+    g_hilbert_pos = (g_hilbert_pos + 1) % HILBERT_TAPS;
+
+    // Q output: iterate only non-zero taps (where index parity differs
+    // from center).  Negated because the circular-buffer loop convolves
+    // in time-reversed order, inverting antisymmetric (Hilbert) filters.
+    float acc = 0;
+    int start = ((HILBERT_TAPS - 1) / 2) & 1 ? 0 : 1;  // center odd → even indices, center even → odd
+    for (int k = start; k < HILBERT_TAPS; k += 2) {
+        int idx = (g_hilbert_pos + k) % HILBERT_TAPS;
+        acc += g_hilbert_delay[idx] * g_hilbert_coeffs[k];
+    }
+    out_q = -acc;
+
+    // I output: delayed by (N-1)/2 to match Hilbert group delay
+    int delayed_idx = (g_hilbert_pos + (HILBERT_TAPS - 1) / 2) % HILBERT_TAPS;
+    out_i = g_hilbert_delay[delayed_idx];
+}
+
+// ═════════════════════════════════════════════════════════════
+// Audio filters
 // ═════════════════════════════════════════════════════════════
 
 static void cw_fir_sample(float in_i, float in_q, float &out_i, float &out_q)
@@ -353,6 +402,12 @@ void dsp::init(int sample_rate, int fft_size)
         g_cascade[i].counter = 0;
     }
 
+    // Hilbert transform (Non-I/Q mode)
+    design_hilbert(g_hilbert_coeffs, HILBERT_TAPS);
+    memset(g_hilbert_delay, 0, sizeof(g_hilbert_delay));
+    g_hilbert_pos = 0;
+    g_hard_decim_counter = 0;
+
     g_cur_span = 0;
     g_audio_out_pos = 0;
 
@@ -440,6 +495,67 @@ void dsp::setApfEnabled(bool enabled) { g_apf_enabled = enabled; }
 bool dsp::isApfEnabled() { return g_apf_enabled; }
 
 // ═════════════════════════════════════════════════════════════
+// Audio pipeline helper (called at 6 kHz from both I/Q and Non-I/Q paths)
+// ═════════════════════════════════════════════════════════════
+
+static void process_audio_6k(float d3i, float d3q)
+{
+    float audio = 0;
+    if (!g_mode_known) {
+        // Mute until mode is determined
+    } else if (g_cw_nco_active) {
+        float filt_i, filt_q;
+        if (g_apf_enabled)
+            apf_fir_sample(d3i, d3q, filt_i, filt_q);
+        else
+            cw_fir_sample(d3i, d3q, filt_i, filt_q);
+
+        // Goertzel detector
+        if (g_goertzel_running) {
+            for (int b = 0; b < GOERTZEL_BINS; b++) {
+                float c = g_goertzel[b].coeff;
+                float s0_re = filt_i + c * g_goertzel[b].s1_re - g_goertzel[b].s2_re;
+                float s0_im = filt_q + c * g_goertzel[b].s1_im - g_goertzel[b].s2_im;
+                g_goertzel[b].s2_re = g_goertzel[b].s1_re;
+                g_goertzel[b].s2_im = g_goertzel[b].s1_im;
+                g_goertzel[b].s1_re = s0_re;
+                g_goertzel[b].s1_im = s0_im;
+            }
+            g_goertzel_count++;
+            if (g_goertzel_count >= g_goertzel_target) {
+                float max_power = -1;
+                int max_bin = GOERTZEL_BINS / 2;
+                for (int b = 0; b < GOERTZEL_BINS; b++) {
+                    float ck = g_goertzel[b].cos_k;
+                    float sk = g_goertzel[b].sin_k;
+                    float xr = g_goertzel[b].s1_re - g_goertzel[b].s2_re * ck + g_goertzel[b].s2_im * sk;
+                    float xi = g_goertzel[b].s1_im - g_goertzel[b].s2_im * ck - g_goertzel[b].s2_re * sk;
+                    float power = xr * xr + xi * xi;
+                    if (power > max_power) {
+                        max_power = power;
+                        max_bin = b;
+                    }
+                }
+                g_goertzel_result = (max_bin - GOERTZEL_BINS / 2) * GOERTZEL_BIN_HZ;
+                g_goertzel_running = false;
+            }
+        }
+
+        float tone_i, tone_q;
+        nco::mixUp(g_sidetone_nco, filt_i, filt_q, tone_i, tone_q);
+        audio = tone_i;
+    } else {
+        // Non-CW: 3 kHz LPF on I stream
+        audio = ssb_fir_sample(d3i);
+    }
+    audio *= g_audio_gain;
+    audio = tanhf(audio);
+    g_audio_out_buf[g_audio_out_pos++] = audio;
+    if (g_audio_out_pos >= AUDIO_OUT_BUF_SIZE)
+        flush_audio_out();
+}
+
+// ═════════════════════════════════════════════════════════════
 // pushIQ — sample-by-sample processing
 // ═════════════════════════════════════════════════════════════
 
@@ -449,96 +565,62 @@ void dsp::pushIQ(const float *iq, int num_frames)
         float I = iq[2 * i];
         float Q = iq[2 * i + 1];
 
-        // fs/4 complex down-conversion
-        float oI, oQ;
-        switch (g_mix_phase) {
-            case 0: oI =  I; oQ =  Q; break;
-            case 1: oI =  Q; oQ = -I; break;
-            case 2: oI = -I; oQ = -Q; break;
-            case 3: oI = -Q; oQ =  I; break;
-        }
-        g_mix_phase = (g_mix_phase + 1) & 3;
+        if (g_cur_span == NON_IQ_SPAN) {
+            // ── Non-I/Q path: mono baseband → Hilbert → CW NCO → hard ↓8 ──
+            float hI, hQ;
+            hilbert_process(I, hI, hQ);
 
-        // CW offset NCO: shift CW sidetone to DC
-        if (g_cw_nco_active) {
-            float nI, nQ;
-            nco::mixDown(g_cw_nco, oI, oQ, nI, nQ);
-            oI = nI;
-            oQ = nQ;
-        }
+            if (g_cw_nco_active) {
+                float nI, nQ;
+                nco::mixDown(g_cw_nco, hI, hQ, nI, nQ);
+                hI = nI; hQ = nQ;
+            }
 
-        // ── Fill 48k WOLA buffer (span 0) ──
-        wola_write(g_wola[0], oI, oQ);
+            g_hard_decim_counter++;
+            if (g_hard_decim_counter >= 8) {
+                g_hard_decim_counter = 0;
+                wola_write(g_wola[NON_IQ_SPAN], hI, hQ);
+                process_audio_6k(hI, hQ);
+            }
+        } else {
+            // ── Normal I/Q path ──
 
-        // ── Cascade ↓2 stage 1: 48k → 24k ──
-        float d1i, d1q;
-        if (cascade_decimate(g_cascade[0], oI, oQ, d1i, d1q)) {
-            wola_write(g_wola[1], d1i, d1q);
+            // fs/4 complex down-conversion
+            float oI, oQ;
+            switch (g_mix_phase) {
+                case 0: oI =  I; oQ =  Q; break;
+                case 1: oI =  Q; oQ = -I; break;
+                case 2: oI = -I; oQ = -Q; break;
+                case 3: oI = -Q; oQ =  I; break;
+            }
+            g_mix_phase = (g_mix_phase + 1) & 3;
 
-            // ── Cascade ↓2 stage 2: 24k → 12k ──
-            float d2i, d2q;
-            if (cascade_decimate(g_cascade[1], d1i, d1q, d2i, d2q)) {
-                wola_write(g_wola[2], d2i, d2q);
+            // CW offset NCO: shift CW sidetone to DC
+            if (g_cw_nco_active) {
+                float nI, nQ;
+                nco::mixDown(g_cw_nco, oI, oQ, nI, nQ);
+                oI = nI; oQ = nQ;
+            }
 
-                // ── Cascade ↓2 stage 3: 12k → 6k ──
-                float d3i, d3q;
-                if (cascade_decimate(g_cascade[2], d2i, d2q, d3i, d3q)) {
-                    wola_write(g_wola[3], d3i, d3q);
+            // Fill 48k WOLA buffer (span 0)
+            wola_write(g_wola[0], oI, oQ);
 
-                    // ── Audio pipeline (6 kHz, unchanged) ──
-                    float audio = 0;
-                    if (!g_mode_known) {
-                        // Mute until mode is determined
-                    } else if (g_cw_nco_active) {
-                        float filt_i, filt_q;
-                        if (g_apf_enabled)
-                            apf_fir_sample(d3i, d3q, filt_i, filt_q);
-                        else
-                            cw_fir_sample(d3i, d3q, filt_i, filt_q);
+            // Cascade ↓2 stage 1: 48k → 24k
+            float d1i, d1q;
+            if (cascade_decimate(g_cascade[0], oI, oQ, d1i, d1q)) {
+                wola_write(g_wola[1], d1i, d1q);
 
-                        // Goertzel detector
-                        if (g_goertzel_running) {
-                            for (int b = 0; b < GOERTZEL_BINS; b++) {
-                                float c = g_goertzel[b].coeff;
-                                float s0_re = filt_i + c * g_goertzel[b].s1_re - g_goertzel[b].s2_re;
-                                float s0_im = filt_q + c * g_goertzel[b].s1_im - g_goertzel[b].s2_im;
-                                g_goertzel[b].s2_re = g_goertzel[b].s1_re;
-                                g_goertzel[b].s2_im = g_goertzel[b].s1_im;
-                                g_goertzel[b].s1_re = s0_re;
-                                g_goertzel[b].s1_im = s0_im;
-                            }
-                            g_goertzel_count++;
-                            if (g_goertzel_count >= g_goertzel_target) {
-                                float max_power = -1;
-                                int max_bin = GOERTZEL_BINS / 2;
-                                for (int b = 0; b < GOERTZEL_BINS; b++) {
-                                    float ck = g_goertzel[b].cos_k;
-                                    float sk = g_goertzel[b].sin_k;
-                                    float xr = g_goertzel[b].s1_re - g_goertzel[b].s2_re * ck + g_goertzel[b].s2_im * sk;
-                                    float xi = g_goertzel[b].s1_im - g_goertzel[b].s2_im * ck - g_goertzel[b].s2_re * sk;
-                                    float power = xr * xr + xi * xi;
-                                    if (power > max_power) {
-                                        max_power = power;
-                                        max_bin = b;
-                                    }
-                                }
-                                g_goertzel_result = (max_bin - GOERTZEL_BINS / 2) * GOERTZEL_BIN_HZ;
-                                g_goertzel_running = false;
-                            }
-                        }
+                // Cascade ↓2 stage 2: 24k → 12k
+                float d2i, d2q;
+                if (cascade_decimate(g_cascade[1], d1i, d1q, d2i, d2q)) {
+                    wola_write(g_wola[2], d2i, d2q);
 
-                        float tone_i, tone_q;
-                        nco::mixUp(g_sidetone_nco, filt_i, filt_q, tone_i, tone_q);
-                        audio = tone_i;
-                    } else {
-                        // Non-CW: 3 kHz LPF on I stream
-                        audio = ssb_fir_sample(d3i);
+                    // Cascade ↓2 stage 3: 12k → 6k
+                    float d3i, d3q;
+                    if (cascade_decimate(g_cascade[2], d2i, d2q, d3i, d3q)) {
+                        wola_write(g_wola[3], d3i, d3q);
+                        process_audio_6k(d3i, d3q);
                     }
-                    audio *= g_audio_gain;
-                    audio = tanhf(audio);
-                    g_audio_out_buf[g_audio_out_pos++] = audio;
-                    if (g_audio_out_pos >= AUDIO_OUT_BUF_SIZE)
-                        flush_audio_out();
                 }
             }
         }
