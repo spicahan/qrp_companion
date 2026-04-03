@@ -59,9 +59,9 @@ static NcoState g_cw_nco;
 static bool  g_cw_nco_active = false;
 static float g_cw_offset_hz = 0;
 
-// ── CW audio filter (300 Hz BW at 8 kHz) + sidetone NCO ────
+// ── CW filter for Goertzel (500 Hz BW at 8 kHz) + sidetone NCO ──
 static constexpr int CW_FIR_TAPS = 65;
-static constexpr float CW_FIR_CUTOFF_HZ = 150.0f;
+static constexpr float CW_FIR_CUTOFF_HZ = 250.0f;
 static float g_cw_fir_coeffs[CW_FIR_TAPS];
 static float g_cw_fir_delay_i[CW_FIR_TAPS];
 static float g_cw_fir_delay_q[CW_FIR_TAPS];
@@ -87,7 +87,7 @@ static int   g_ssb_fir_pos = 0;
 static bool  g_mode_known = false;
 
 // ── Goertzel fine-tune detector ─────────────────────────────
-static constexpr int GOERTZEL_BINS = 301;
+static constexpr int GOERTZEL_BINS = 501;      // ±250 Hz at 1 Hz resolution
 static constexpr float GOERTZEL_BIN_HZ = 1.0f;
 static constexpr float GOERTZEL_DURATION_S = 1.0f;
 
@@ -497,14 +497,14 @@ bool dsp::isApfEnabled() { return g_apf_enabled; }
 
 static void process_audio_8k(float di, float dq)
 {
-    // Goertzel detector (runs on CW-filtered I/Q when active)
-    if (g_goertzel_running && g_cw_nco_active) {
-        float filt_i, filt_q;
-        if (g_apf_enabled)
-            apf_fir_sample(di, dq, filt_i, filt_q);
-        else
-            cw_fir_sample(di, dq, filt_i, filt_q);
+    // CW filter runs continuously to keep delay lines warm for Goertzel.
+    // Always use the CW filter (not APF) — APF is handled by QMX via CAT.
+    float filt_i = di, filt_q = dq;
+    if (g_cw_nco_active)
+        cw_fir_sample(di, dq, filt_i, filt_q);
 
+    // Goertzel detector (uses CW-filtered I/Q)
+    if (g_goertzel_running && g_cw_nco_active) {
         for (int b = 0; b < GOERTZEL_BINS; b++) {
             float c = g_goertzel[b].coeff;
             float s0_re = filt_i + c * g_goertzel[b].s1_re - g_goertzel[b].s2_re;
