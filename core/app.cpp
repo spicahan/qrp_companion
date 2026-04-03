@@ -184,17 +184,19 @@ static void on_span_change(ui::PropId, ui::Source) {
 }
 
 static void on_apf_change(ui::PropId, ui::Source) {
-    dsp::setApfEnabled(ui::get_bool(ui::PROP_apf_enabled));
+    bool apf = ui::get_bool(ui::PROP_apf_enabled);
+    dsp::setApfEnabled(apf);
+    cat::setCwFilter(apf ? "50" : "250");
 }
 
 static void on_mode_change(ui::PropId, ui::Source src) {
     int mode = ui::get_i32(ui::PROP_mode);
     int offset = ui::get_i32(ui::PROP_cw_offset);
-    ui::set_f32(ui::PROP_soft_nco, 0, ui::FROM_DSP);
-    dsp::setSoftNcoCorrection(0);
     if (mode == 3 && offset > 0) {
         dsp::setCwOffset((float)offset);
         dsp::setModeKnown(true);
+        // CW mode: mute local playback (use QMX's own audio output)
+        ui::set_f32(ui::PROP_audio_gain, 100.0f, ui::FROM_DSP);
     } else if (mode > 0) {
         dsp::setCwOffset(0);
         dsp::setModeKnown(true);
@@ -203,10 +205,6 @@ static void on_mode_change(ui::PropId, ui::Source src) {
 
 static void on_cwofs_change(ui::PropId, ui::Source) {
     on_mode_change(ui::PROP_mode, ui::FROM_RADIO);  // re-evaluate
-}
-
-static void on_nco_change(ui::PropId, ui::Source) {
-    dsp::setSoftNcoCorrection(ui::get_f32(ui::PROP_soft_nco));
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -221,17 +219,12 @@ static void fmt_span(char *buf, int len) {
 static void fmt_freq(char *buf, int len) {
     uint64_t vfo = ui::get_u64(ui::PROP_vfo_freq);
     if (vfo > 0) {
-        int mhz  = (int)(vfo / 1000000);
-        int khz  = (int)((vfo % 1000000) / 1000);
-        int hz10 = (int)((vfo % 1000) / 10);
-        float soft = ui::get_f32(ui::PROP_soft_nco);
-        int mode = ui::get_i32(ui::PROP_mode);
-        if (soft != 0.0f && mode == 3)
-            snprintf(buf, len, "%-4s %d.%03d.%02d%+.1f", cat::getModeStr(), mhz, khz, hz10, soft);
-        else
-            snprintf(buf, len, "%-4s %d.%03d.%02d", cat::getModeStr(), mhz, khz, hz10);
+        int mhz = (int)(vfo / 1000000);
+        int khz = (int)((vfo % 1000000) / 1000);
+        int hz  = (int)(vfo % 1000);
+        snprintf(buf, len, "%-4s %d.%03d.%03d", cat::getModeStr(), mhz, khz, hz);
     } else {
-        snprintf(buf, len, "%-4s ---.---.--", cat::getModeStr());
+        snprintf(buf, len, "%-4s ---.---.---", cat::getModeStr());
     }
     int blen = strlen(buf);
     while (blen < 24) buf[blen++] = ' ';
@@ -239,13 +232,7 @@ static void fmt_freq(char *buf, int len) {
 }
 
 static void fmt_fps(char *buf, int len) {
-    float f = ui::get_f32(ui::PROP_fps);
-    int mode = ui::get_i32(ui::PROP_mode);
-    bool apf = ui::get_bool(ui::PROP_apf_enabled);
-    if (mode == 3)
-        snprintf(buf, len, "%s %4.0fFPS", apf ? "APF" : "CW ", f);
-    else
-        snprintf(buf, len, "%4.0fFPS", f);
+    snprintf(buf, len, "%4.0fFPS", ui::get_f32(ui::PROP_fps));
 }
 
 static ui::Label lbl_span, lbl_freq, lbl_fps;
@@ -385,7 +372,6 @@ void app::init()
     ui::on_change(ui::PROP_apf_enabled, on_apf_change);
     ui::on_change(ui::PROP_mode,        on_mode_change);
     ui::on_change(ui::PROP_cw_offset,   on_cwofs_change);
-    ui::on_change(ui::PROP_soft_nco,    on_nco_change);
 
     // --- DSP ---
     dsp::init(SAMPLE_RATE, FFT_SIZE);
@@ -578,18 +564,15 @@ void app::tick()
     // VFO marker position
     g_vfo_x = (dsp::getSpan() == 0) ? spec_w * 3 / 4 : spec_w / 2;
 
-    // --- Goertzel result → properties ---
+    // --- Goertzel result → VFO at 1Hz resolution ---
     if (!dsp::isGoertzelRunning() && dsp::getGoertzelResult() != 0) {
         float g_offset = dsp::getGoertzelResult();
         dsp::clearGoertzelResult();
         uint64_t vfo = ui::get_u64(ui::PROP_vfo_freq);
         if (vfo > 0) {
-            int rounded = ((int)(g_offset + (g_offset >= 0 ? 5.0f : -5.0f))) / 10 * 10;
-            int vfo_delta = -rounded;
-            float soft_hz = -(g_offset - (float)rounded);
-            if (vfo_delta != 0)
-                ui::set_u64(ui::PROP_vfo_freq, (int64_t)vfo + vfo_delta, ui::FROM_UI);
-            ui::set_f32(ui::PROP_soft_nco, soft_hz, ui::FROM_DSP);
+            int delta = -(int)roundf(g_offset);
+            if (delta != 0)
+                ui::set_u64(ui::PROP_vfo_freq, (int64_t)vfo + delta, ui::FROM_UI);
         }
     }
 
@@ -621,8 +604,6 @@ void app::tick()
         bool in_spec_wf = (evt.x >= spec_x && evt.x < spec_x + spec_w &&
                            evt.y >= spec_y && evt.y < wf_y + wf_h);
         if (evt.action == pal::TouchEvent::DOWN && in_spec_wf) {
-            dsp::setSoftNcoCorrection(0);
-            ui::set_f32(ui::PROP_soft_nco, 0, ui::FROM_UI);
             dragging = true;
             drag_start_x = evt.x;
             drag_start_freq = ui::get_u64(ui::PROP_vfo_freq);
@@ -641,7 +622,7 @@ void app::tick()
             if (total_drag < TAP_THRESHOLD && drag_start_freq > 0) {
                 int delta_px = evt.x - spec_x - g_vfo_x;
                 int delta_hz = delta_px * dsp::getSpanRate() / spec_w;
-                uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
+                uint64_t new_freq = ((int64_t)drag_start_freq + delta_hz) / 10 * 10;
                 if (new_freq > 0) {
                     ui::set_u64(ui::PROP_vfo_freq, new_freq, ui::FROM_UI);
                     if (ui::get_i32(ui::PROP_mode) == 3)
@@ -650,7 +631,7 @@ void app::tick()
             } else if (drag_vfo_dirty && drag_start_freq > 0) {
                 int delta_px = drag_current_x - drag_start_x;
                 int delta_hz = -delta_px * dsp::getSpanRate() / spec_w;
-                uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
+                uint64_t new_freq = ((int64_t)drag_start_freq + delta_hz) / 10 * 10;
                 if (new_freq > 0)
                     ui::set_u64(ui::PROP_vfo_freq, new_freq, ui::FROM_UI);
             }
@@ -664,7 +645,7 @@ void app::tick()
     if (dragging && drag_vfo_dirty && drag_start_freq > 0) {
         int delta_px = drag_current_x - drag_start_x;
         int delta_hz = -delta_px * dsp::getSpanRate() / spec_w;
-        uint64_t new_freq = (int64_t)drag_start_freq + delta_hz;
+        uint64_t new_freq = ((int64_t)drag_start_freq + delta_hz) / 10 * 10;
         if (new_freq > 0)
             ui::set_u64(ui::PROP_vfo_freq, new_freq, ui::FROM_UI);
         drag_vfo_dirty = false;

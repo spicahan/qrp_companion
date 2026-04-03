@@ -58,7 +58,6 @@ static int g_mix_phase;
 static NcoState g_cw_nco;
 static bool  g_cw_nco_active = false;
 static float g_cw_offset_hz = 0;
-static float g_soft_nco_hz = 0;
 
 // ── CW audio filter (300 Hz BW at 8 kHz) + sidetone NCO ────
 static constexpr int CW_FIR_TAPS = 65;
@@ -365,8 +364,7 @@ static void update_cw_ncos()
         g_sidetone_nco.inc = 0;
         return;
     }
-    float total_shift = g_cw_offset_hz + g_soft_nco_hz;
-    nco::setFreq(g_cw_nco, total_shift, (float)g_sample_rate);
+    nco::setFreq(g_cw_nco, g_cw_offset_hz, (float)g_sample_rate);
     float dec_rate = (float)g_sample_rate / AUDIO_DECIM;
     nco::setFreq(g_sidetone_nco, g_cw_offset_hz, dec_rate);
     g_cw_nco_active = true;
@@ -489,14 +487,6 @@ void dsp::setCwOffset(float offset_hz)
     update_cw_ncos();
 }
 
-void dsp::setSoftNcoCorrection(float hz)
-{
-    g_soft_nco_hz = hz;
-    if (g_cw_nco_active) update_cw_ncos();
-}
-
-float dsp::getSoftNcoCorrection() { return g_soft_nco_hz; }
-
 void dsp::setModeKnown(bool known) { g_mode_known = known; }
 void dsp::setApfEnabled(bool enabled) { g_apf_enabled = enabled; }
 bool dsp::isApfEnabled() { return g_apf_enabled; }
@@ -507,54 +497,45 @@ bool dsp::isApfEnabled() { return g_apf_enabled; }
 
 static void process_audio_8k(float di, float dq)
 {
-    float audio = 0;
-    if (!g_mode_known) {
-        // Mute until mode is determined
-    } else if (g_cw_nco_active) {
+    // Goertzel detector (runs on CW-filtered I/Q when active)
+    if (g_goertzel_running && g_cw_nco_active) {
         float filt_i, filt_q;
         if (g_apf_enabled)
             apf_fir_sample(di, dq, filt_i, filt_q);
         else
             cw_fir_sample(di, dq, filt_i, filt_q);
 
-        // Goertzel detector
-        if (g_goertzel_running) {
-            for (int b = 0; b < GOERTZEL_BINS; b++) {
-                float c = g_goertzel[b].coeff;
-                float s0_re = filt_i + c * g_goertzel[b].s1_re - g_goertzel[b].s2_re;
-                float s0_im = filt_q + c * g_goertzel[b].s1_im - g_goertzel[b].s2_im;
-                g_goertzel[b].s2_re = g_goertzel[b].s1_re;
-                g_goertzel[b].s2_im = g_goertzel[b].s1_im;
-                g_goertzel[b].s1_re = s0_re;
-                g_goertzel[b].s1_im = s0_im;
-            }
-            g_goertzel_count++;
-            if (g_goertzel_count >= g_goertzel_target) {
-                float max_power = -1;
-                int max_bin = GOERTZEL_BINS / 2;
-                for (int b = 0; b < GOERTZEL_BINS; b++) {
-                    float ck = g_goertzel[b].cos_k;
-                    float sk = g_goertzel[b].sin_k;
-                    float xr = g_goertzel[b].s1_re - g_goertzel[b].s2_re * ck + g_goertzel[b].s2_im * sk;
-                    float xi = g_goertzel[b].s1_im - g_goertzel[b].s2_im * ck - g_goertzel[b].s2_re * sk;
-                    float power = xr * xr + xi * xi;
-                    if (power > max_power) {
-                        max_power = power;
-                        max_bin = b;
-                    }
-                }
-                g_goertzel_result = (max_bin - GOERTZEL_BINS / 2) * GOERTZEL_BIN_HZ;
-                g_goertzel_running = false;
-            }
+        for (int b = 0; b < GOERTZEL_BINS; b++) {
+            float c = g_goertzel[b].coeff;
+            float s0_re = filt_i + c * g_goertzel[b].s1_re - g_goertzel[b].s2_re;
+            float s0_im = filt_q + c * g_goertzel[b].s1_im - g_goertzel[b].s2_im;
+            g_goertzel[b].s2_re = g_goertzel[b].s1_re;
+            g_goertzel[b].s2_im = g_goertzel[b].s1_im;
+            g_goertzel[b].s1_re = s0_re;
+            g_goertzel[b].s1_im = s0_im;
         }
-
-        float tone_i, tone_q;
-        nco::mixUp(g_sidetone_nco, filt_i, filt_q, tone_i, tone_q);
-        audio = tone_i;
-    } else {
-        // Non-CW: 3 kHz LPF on I stream
-        audio = ssb_fir_sample(di);
+        g_goertzel_count++;
+        if (g_goertzel_count >= g_goertzel_target) {
+            float max_power = -1;
+            int max_bin = GOERTZEL_BINS / 2;
+            for (int b = 0; b < GOERTZEL_BINS; b++) {
+                float ck = g_goertzel[b].cos_k;
+                float sk = g_goertzel[b].sin_k;
+                float xr = g_goertzel[b].s1_re - g_goertzel[b].s2_re * ck + g_goertzel[b].s2_im * sk;
+                float xi = g_goertzel[b].s1_im - g_goertzel[b].s2_im * ck - g_goertzel[b].s2_re * sk;
+                float power = xr * xr + xi * xi;
+                if (power > max_power) {
+                    max_power = power;
+                    max_bin = b;
+                }
+            }
+            g_goertzel_result = (max_bin - GOERTZEL_BINS / 2) * GOERTZEL_BIN_HZ;
+            g_goertzel_running = false;
+        }
     }
+
+    // Audio output: always 3 kHz LPF on I stream (QMX handles CW sidetone)
+    float audio = ssb_fir_sample(di);
     audio *= g_audio_gain;
     audio = tanhf(audio);
     g_audio_out_buf[g_audio_out_pos++] = audio;

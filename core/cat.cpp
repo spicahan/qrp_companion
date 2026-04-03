@@ -124,6 +124,13 @@ const char* cat::getModeStr()
 
 void cat::suppressPolling(bool suppress) { s_polling_suppressed = suppress; }
 
+void cat::setCwFilter(const char *bandwidth)
+{
+    char cmd[40];
+    snprintf(cmd, sizeof(cmd), "MMCW|CW passband=%s;", bandwidth);
+    send_cmd(cmd);
+}
+
 void cat::setIqMode(bool enable)
 {
     s_iq_enabled = enable;
@@ -134,7 +141,6 @@ void cat::setIqMode(bool enable)
 void cat::setVfoFreq(uint64_t freq_hz)
 {
     if (freq_hz == 0) return;
-    freq_hz = (freq_hz / 10) * 10;  // round to 10 Hz
     char cmd[24];
     snprintf(cmd, sizeof(cmd), "FA%011llu;", (unsigned long long)freq_hz);
     send_cmd(cmd);
