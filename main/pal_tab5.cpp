@@ -7,6 +7,10 @@
 #include <esp_timer.h>
 #include <esp_cache.h>
 #include <esp_heap_caps.h>
+#include <esp_wifi.h>
+#include <esp_netif.h>
+#include <esp_event.h>
+#include <nvs_flash.h>
 #include <driver/ppa.h>
 #include <cstring>
 
@@ -33,10 +37,34 @@ static void evt_push(const pal::TouchEvent &e)
     }
 }
 
+static void wifi_ap_init()
+{
+    nvs_flash_init();
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&wifi_cfg);
+
+    wifi_config_t ap_cfg = {};
+    strcpy((char *)ap_cfg.ap.ssid, "QRP-Companion");
+    ap_cfg.ap.ssid_len = strlen("QRP-Companion");
+    ap_cfg.ap.channel = 6;
+    ap_cfg.ap.max_connection = 2;
+    ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
+
+    esp_wifi_set_mode(WIFI_MODE_AP);
+    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    esp_wifi_start();
+}
+
 namespace pal {
 
 bool init(int width, int height)
 {
+    wifi_ap_init();
+
     auto cfg = M5.config();
     M5.begin(cfg);
 
@@ -121,6 +149,8 @@ bool pollEvent(TouchEvent &evt)
     s_touch_read_this_frame = false;
     return false;
 }
+
+void injectEvent(const TouchEvent &evt) { evt_push(evt); }
 
 int64_t micros() { return esp_timer_get_time(); }
 void delayMs(int ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
