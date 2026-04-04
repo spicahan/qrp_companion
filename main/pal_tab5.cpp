@@ -63,10 +63,11 @@ namespace pal {
 
 bool init(int width, int height)
 {
-    wifi_ap_init();
-
     auto cfg = M5.config();
     M5.begin(cfg);
+
+    // WiFi AP init after M5.begin() — needs SPI bus to C6 coprocessor
+    wifi_ap_init();
 
     auto &dsp = M5.Display;
     dsp.setBrightness(128);
