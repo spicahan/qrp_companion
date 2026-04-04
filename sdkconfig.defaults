@@ -30,14 +30,12 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # USB Host for UAC audio input
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=2048
 
-# WiFi AP for web UI (ESP32-P4 uses ESP-Hosted via C6 coprocessor on SDIO)
-CONFIG_ESP_HOST_WIFI_ENABLED=y
-CONFIG_LWIP_LOCAL_HOSTNAME="qrp-companion"
-
-# ESP-Hosted: enable wifi_remote with esp_hosted transport
+# WiFi AP for web UI (ESP32-P4 uses esp_wifi_remote + esp_hosted via C6)
+# Do NOT set CONFIG_ESP_HOST_WIFI_ENABLED — it conflicts with esp_wifi_remote
 CONFIG_ESP_WIFI_REMOTE_ENABLED=y
 CONFIG_ESP_WIFI_REMOTE_LIBRARY_HOSTED=y
 CONFIG_ESP_HOSTED_ENABLED=y
+CONFIG_LWIP_LOCAL_HOSTNAME="qrp-companion"
 
 # ESP-Hosted SDIO transport (Tab5: P4 ↔ C6 via SDIO 4-bit @ 40MHz)
 CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6=y
