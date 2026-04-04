@@ -12,7 +12,8 @@ canvas{display:block;width:100vw;height:100vh}
 #hud{position:fixed;top:0;left:0;right:0;background:rgba(0,0,80,0.9);padding:6px 10px;font-size:13px;z-index:10;display:flex;justify-content:space-between}
 #hud span{color:#0f0}
 #freq{color:#0f0;font-size:16px;font-weight:bold}
-#btns{position:fixed;bottom:0;left:0;right:0;display:flex;z-index:10}
+#btns{position:fixed;bottom:0;left:0;right:0;z-index:10}
+#btns>div{display:flex}
 #btns button{flex:1;padding:14px 0;font-family:monospace;font-size:15px;font-weight:bold;border:1px solid #555;background:#222;color:#0ff;touch-action:manipulation}
 #btns button.active{background:#0ff;color:#000}
 #btns button.red{color:#f44}
@@ -27,10 +28,29 @@ canvas{display:block;width:100vw;height:100vh}
 </div>
 <canvas id="c"></canvas>
 <div id="btns">
-  <button id="bSpan">Span</button>
-  <button id="bFilter">Filter</button>
-  <button id="bZeroBt">ZeroBt</button>
-  <button id="bBand">Band</button>
+  <div id="panDefault">
+    <button onclick="showPanel('panSpan')">Span</button>
+    <button id="bFilter" onclick="sendButton('filter')">Filter</button>
+    <button onclick="sendButton('zerobt')">ZeroBt</button>
+    <button onclick="showPanel('panBand')">Band</button>
+  </div>
+  <div id="panSpan" style="display:none">
+    <button onclick="sendButton('span_0');showPanel('panDefault')">48k</button>
+    <button onclick="sendButton('span_1');showPanel('panDefault')">+/-12k</button>
+    <button onclick="sendButton('span_2');showPanel('panDefault')">+/-4k</button>
+    <button onclick="sendButton('span_3');showPanel('panDefault')">NonIQ</button>
+    <button class="red" onclick="showPanel('panDefault')">Back</button>
+  </div>
+  <div id="panBand" style="display:none">
+    <button onclick="sendButton('band_40');showPanel('panDefault')">40</button>
+    <button onclick="sendButton('band_30');showPanel('panDefault')">30</button>
+    <button onclick="sendButton('band_20');showPanel('panDefault')">20</button>
+    <button onclick="sendButton('band_17');showPanel('panDefault')">17</button>
+    <button onclick="sendButton('band_15');showPanel('panDefault')">15</button>
+    <button onclick="sendButton('band_12');showPanel('panDefault')">12</button>
+    <button onclick="sendButton('band_10');showPanel('panDefault')">10</button>
+    <button class="red" onclick="showPanel('panDefault')">Back</button>
+  </div>
 </div>
 
 <script>
@@ -146,6 +166,11 @@ connect();
 
 function sendCmd(buf){if(ws&&ws.readyState===1) ws.send(buf)}
 
+function showPanel(id){
+  for(const d of document.querySelectorAll('#btns>div')) d.style.display='none';
+  document.getElementById(id).style.display='flex';
+}
+
 function sendTouch(action,cssX,cssY){
   // CSS coords → normalized 0..1 within the spectrum+waterfall area
   // Use CSS display size (not canvas pixel size) since touch is in CSS coords
@@ -180,11 +205,7 @@ canvas.addEventListener("mousedown",e=>{md=true;const [x,y]=canvasXY(e);sendTouc
 canvas.addEventListener("mousemove",e=>{if(md){const [x,y]=canvasXY(e);sendTouch(1,x,y)}});
 canvas.addEventListener("mouseup",()=>{md=false;sendTouch(2,0,0)});
 
-// Buttons
-document.getElementById("bSpan").onclick=()=>sendButton("span");
-document.getElementById("bFilter").onclick=()=>sendButton("filter");
-document.getElementById("bZeroBt").onclick=()=>sendButton("zerobt");
-document.getElementById("bBand").onclick=()=>sendButton("band");
+// Filter button active state update handled in onmessage
 </script>
 </body>
 </html>

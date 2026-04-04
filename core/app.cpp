@@ -338,21 +338,28 @@ static void web_touch_cb(int action, int nx, int ny, int, int)
 
 static void web_button_cb(const char *id)
 {
-    if (strcmp(id, "span") == 0) {
-        int cur = ui::get_i32(ui::PROP_span_idx);
-        ui::set_i32(ui::PROP_span_idx, (cur + 1) % dsp::NUM_SPANS);
-    } else if (strcmp(id, "filter") == 0) {
+    if (strcmp(id, "filter") == 0) {
         if (ui::get_i32(ui::PROP_mode) == 3)
             ui::set_bool(ui::PROP_apf_enabled, !ui::get_bool(ui::PROP_apf_enabled));
     } else if (strcmp(id, "zerobt") == 0) {
         if (ui::get_i32(ui::PROP_mode) == 3)
             dsp::startGoertzel();
-    } else if (strcmp(id, "band") == 0) {
-        // Cycle through common bands
-        static const uint64_t bands[] = {7074000,10136000,14074000,18100000,21074000,24915000,28074000};
-        static int bidx = 0;
-        bidx = (bidx + 1) % 7;
-        ui::set_u64(ui::PROP_vfo_freq, bands[bidx], ui::FROM_UI);
+    } else if (strncmp(id, "span_", 5) == 0) {
+        int idx = id[5] - '0';
+        if (idx >= 0 && idx < dsp::NUM_SPANS)
+            ui::set_i32(ui::PROP_span_idx, idx);
+    } else if (strncmp(id, "band_", 5) == 0) {
+        static const struct { const char *name; uint64_t freq; } bands[] = {
+            {"40",7074000}, {"30",10136000}, {"20",14074000}, {"17",18100000},
+            {"15",21074000}, {"12",24915000}, {"10",28074000}
+        };
+        const char *bname = id + 5;
+        for (auto &b : bands) {
+            if (strcmp(bname, b.name) == 0) {
+                ui::set_u64(ui::PROP_vfo_freq, b.freq, ui::FROM_UI);
+                break;
+            }
+        }
     }
 }
 
