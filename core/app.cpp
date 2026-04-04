@@ -178,10 +178,8 @@ static void on_gain_change(ui::PropId, ui::Source) {
 }
 
 static void on_span_change(ui::PropId, ui::Source) {
-    int span = ui::get_i32(ui::PROP_span_idx);
-    dsp::setSpan(span);
+    dsp::setSpan(ui::get_i32(ui::PROP_span_idx));
     precompute_pixel_bin_map();
-    cat::setIqMode(span != dsp::NON_IQ_SPAN);
 }
 
 static void on_apf_change(ui::PropId, ui::Source) {
@@ -271,7 +269,6 @@ static void select_span(int idx) {
 static void btn_48k_press(ui::Button &)   { select_span(0); }
 static void btn_12k_press(ui::Button &)   { select_span(1); }
 static void btn_4k_press(ui::Button &)    { select_span(2); }
-static void btn_noniq_press(ui::Button &) { select_span(dsp::NON_IQ_SPAN); }
 
 // Band selection helpers
 static void tune_band(uint64_t freq) {
@@ -301,7 +298,7 @@ static void btn_dr_back_press(ui::Button &) {
 }
 
 static ui::Button btn_span, btn_filter, btn_zerobeat, btn_band, btn_dr;
-static ui::Button btn_48k, btn_12k, btn_4k, btn_noniq, btn_span_back;
+static ui::Button btn_48k, btn_12k, btn_4k, btn_span_back;
 static ui::Button btn_40, btn_30, btn_20, btn_17, btn_15, btn_12, btn_10, btn_back;
 static ui::Button btn_dr_default, btn_dr_back;
 
@@ -457,13 +454,12 @@ void app::init()
 
     // Init buttons
     make_button(btn_span,     "Span",   COL_CYAN,   COL_DGREY, btn_span_press);
-    make_button(btn_filter,   "Filter", COL_YELLOW, COL_DGREY, btn_filter_press, ui::PROP_apf_enabled, true);
+    make_button(btn_filter,   "APF",    COL_YELLOW, COL_DGREY, btn_filter_press, ui::PROP_apf_enabled, true);
     make_button(btn_zerobeat, "ZeroBt", COL_GREEN,  COL_DGREY, btn_zerobeat_press);
     make_button(btn_band,     "Band",   COL_WHITE,  COL_DGREY, btn_band_press);
     make_button(btn_48k, "48k",    COL_CYAN, COL_NAVY, btn_48k_press);
     make_button(btn_12k, "+/-12k", COL_CYAN, COL_NAVY, btn_12k_press);
     make_button(btn_4k,  "+/-4k",  COL_CYAN, COL_NAVY, btn_4k_press);
-    make_button(btn_noniq, "NonIQ", COL_CYAN, COL_NAVY, btn_noniq_press);
     make_button(btn_span_back, "Back", COL_RED, COL_DGREY, btn_back_press);
     make_button(btn_40,  "40",   COL_WHITE, COL_NAVY, btn_40_press);
     make_button(btn_30,  "30",   COL_WHITE, COL_NAVY, btn_30_press);
@@ -529,18 +525,16 @@ void app::init()
     panel_bottom_default.add(&btn_band);
     panel_bottom_default.add(&btn_dr);
 
-    // Span select panel (5 buttons)
-    int sbw = log_w / 5;
+    // Span select panel (4 buttons)
+    int sbw = log_w / 4;
     btn_48k.x = 0;        btn_48k.y = bot_y;  btn_48k.w = sbw;           btn_48k.h = BOTTOM_H;
     btn_12k.x = sbw;      btn_12k.y = bot_y;  btn_12k.w = sbw;           btn_12k.h = BOTTOM_H;
     btn_4k.x = 2*sbw;     btn_4k.y = bot_y;   btn_4k.w = sbw;            btn_4k.h = BOTTOM_H;
-    btn_noniq.x = 3*sbw;  btn_noniq.y = bot_y; btn_noniq.w = sbw;        btn_noniq.h = BOTTOM_H;
-    btn_span_back.x = 4*sbw; btn_span_back.y = bot_y; btn_span_back.w = log_w - 4*sbw; btn_span_back.h = BOTTOM_H;
+    btn_span_back.x = 3*sbw; btn_span_back.y = bot_y; btn_span_back.w = log_w - 3*sbw; btn_span_back.h = BOTTOM_H;
 
     panel_span_select.add(&btn_48k);
     panel_span_select.add(&btn_12k);
     panel_span_select.add(&btn_4k);
-    panel_span_select.add(&btn_noniq);
     panel_span_select.add(&btn_span_back);
 
     // Band select panel (8 buttons)
@@ -581,7 +575,6 @@ void app::init()
     dsp::setAudioOutCallback(audio_output_cb);
     pal::audioInputOpen(audio_input_cb);
     cat::init();
-    cat::setIqMode(true);  // default span is I/Q
 
     // Web UI server
     web::init(8080);

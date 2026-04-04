@@ -17,10 +17,7 @@ static int  s_rx_pos = 0;
 static int64_t s_last_poll = 0;
 static constexpr int64_t POLL_INTERVAL_US = 1000000; // 1 second
 static bool s_polling_suppressed = false;
-
-// I/Q mode: track desired state, send on first poll when connected
-static bool s_iq_enabled = true;
-static bool s_iq_sent = false;
+static bool s_iq_mode_sent = false;  // send Q91 once on first connected poll
 
 static void process_response(const char *resp, int len)
 {
@@ -63,7 +60,7 @@ void cat::init()
     s_cw_offset_queried = false;
     s_rx_pos = 0;
     s_last_poll = 0;
-    s_iq_sent = false;
+    s_iq_mode_sent = false;
 }
 
 void cat::poll()
@@ -74,10 +71,10 @@ void cat::poll()
     if (!s_polling_suppressed && now - s_last_poll >= POLL_INTERVAL_US) {
         s_last_poll = now;
         if (pal::catIsConnected()) {
-            // Send deferred I/Q mode command on first connected poll
-            if (!s_iq_sent) {
-                send_cmd(s_iq_enabled ? "Q91;" : "Q90;");
-                s_iq_sent = true;
+            // Enable I/Q mode + set CW filter once on first connected poll
+            if (!s_iq_mode_sent) {
+                send_cmd("Q91;MMCW|CW passband=250;");
+                s_iq_mode_sent = true;
             }
             // Query CW offset once when mode is CW and offset is unknown
             if (s_mode == 3 && s_cw_offset == 0 && !s_cw_offset_queried) {
@@ -129,13 +126,6 @@ void cat::setCwFilter(const char *bandwidth)
     char cmd[40];
     snprintf(cmd, sizeof(cmd), "MMCW|CW passband=%s;", bandwidth);
     send_cmd(cmd);
-}
-
-void cat::setIqMode(bool enable)
-{
-    s_iq_enabled = enable;
-    s_iq_sent = false;   // force re-send on next poll
-    send_cmd(enable ? "Q91;" : "Q90;");  // try immediately too
 }
 
 void cat::setVfoFreq(uint64_t freq_hz)

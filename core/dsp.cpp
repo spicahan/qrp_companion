@@ -16,8 +16,8 @@ static float *g_magnitude_db;
 
 // ── WOLA filter bank ─────────────────────────────────────────
 // Per-span P: wide spans (48k,±12k) use P=4 for sidelobe rejection,
-// narrow spans (±4k,NonIQ) use P=2 for lower spectral latency.
-static const int g_wola_p[dsp::NUM_SPANS] = { 4, 4, 2, 2 };
+// narrow span (±4k) uses P=2 for lower spectral latency.
+static const int g_wola_p[dsp::NUM_SPANS] = { 4, 4, 2 };
 
 struct WolaState {
     float *buf_i;                   // circular buffer I [M]
@@ -103,18 +103,10 @@ static int   g_goertzel_target = 0;
 static bool  g_goertzel_running = false;
 static float g_goertzel_result = 0;
 
-// ── Hilbert transform (real → analytic for Non-I/Q mode) ────
-static constexpr int HILBERT_TAPS = 255;
-static float g_hilbert_coeffs[HILBERT_TAPS];
-static float g_hilbert_delay[HILBERT_TAPS];
-static int   g_hilbert_pos = 0;
-static int   g_hard_decim_counter = 0;   // hard ↓6 counter for Non-I/Q
-
 // ── Span definitions ────────────────────────────────────────
-// 0=48k, 1=±12k, 2=±4k, 3=NonIQ
-static const int g_span_rates[dsp::NUM_SPANS]  = { 48000, 24000,  8000,  8000 };
-static const int g_hop_sizes[dsp::NUM_SPANS]   = {  2048,  1024,   320,   320 };  // N=512
-static const char *g_span_labels[dsp::NUM_SPANS] = { "48k", "+/-12k", "+/-4k", "NonIQ" };
+static const int g_span_rates[dsp::NUM_SPANS]  = { 48000, 24000,  8000 };
+static const int g_hop_sizes[dsp::NUM_SPANS]   = {  2048,  1024,   320 };  // N=512
+static const char *g_span_labels[dsp::NUM_SPANS] = { "48k", "+/-12k", "+/-4k" };
 static int g_cur_span = 0;
 
 // ── Audio output ────────────────────────────────────────────
@@ -173,43 +165,6 @@ static void generate_wola_prototype(float *w, int M, int fft_size)
     for (int n = 0; n < M; n++) sum += w[n];
     float scale = (float)fft_size / sum;
     for (int n = 0; n < M; n++) w[n] *= scale;
-}
-
-// ═════════════════════════════════════════════════════════════
-// Hilbert transform (Non-I/Q mode)
-// ═════════════════════════════════════════════════════════════
-
-static void design_hilbert(float *h, int N)
-{
-    const double a0 = 0.35875, a1 = 0.48829, a2 = 0.14128, a3 = 0.01168;
-    int center = (N - 1) / 2;
-    for (int n = 0; n < N; n++) {
-        int k = n - center;
-        if (k == 0 || (k & 1) == 0) {
-            h[n] = 0.0f;
-        } else {
-            double x = 2.0 * M_PI * n / (N - 1);
-            double win = a0 - a1 * cos(x) + a2 * cos(2 * x) - a3 * cos(3 * x);
-            h[n] = (float)((2.0 / (M_PI * k)) * win);
-        }
-    }
-}
-
-static void hilbert_process(float in, float &out_i, float &out_q)
-{
-    g_hilbert_delay[g_hilbert_pos] = in;
-    g_hilbert_pos = (g_hilbert_pos + 1) % HILBERT_TAPS;
-
-    float acc = 0;
-    int start = ((HILBERT_TAPS - 1) / 2) & 1 ? 0 : 1;
-    for (int k = start; k < HILBERT_TAPS; k += 2) {
-        int idx = (g_hilbert_pos + k) % HILBERT_TAPS;
-        acc += g_hilbert_delay[idx] * g_hilbert_coeffs[k];
-    }
-    out_q = -acc;
-
-    int delayed_idx = (g_hilbert_pos + (HILBERT_TAPS - 1) / 2) % HILBERT_TAPS;
-    out_i = g_hilbert_delay[delayed_idx];
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -392,12 +347,6 @@ void dsp::init(int sample_rate, int fft_size)
     design_fir_lowpass(g_d6_coeffs, D6_TAPS, 3500.0f, (float)sample_rate);
     decim_init(g_decim6, D6_TAPS, AUDIO_DECIM);
 
-    // Hilbert transform (Non-I/Q mode)
-    design_hilbert(g_hilbert_coeffs, HILBERT_TAPS);
-    memset(g_hilbert_delay, 0, sizeof(g_hilbert_delay));
-    g_hilbert_pos = 0;
-    g_hard_decim_counter = 0;
-
     g_cur_span = 0;
     g_audio_out_pos = 0;
 
@@ -534,58 +483,37 @@ void dsp::pushIQ(const float *iq, int num_frames)
         float I = iq[2 * i];
         float Q = iq[2 * i + 1];
 
-        if (g_cur_span == NON_IQ_SPAN) {
-            // ── Non-I/Q path: mono baseband → Hilbert → CW NCO → hard ↓6 ──
-            float hI, hQ;
-            hilbert_process(I, hI, hQ);
+        // fs/4 complex down-conversion
+        float oI, oQ;
+        switch (g_mix_phase) {
+            case 0: oI =  I; oQ =  Q; break;
+            case 1: oI =  Q; oQ = -I; break;
+            case 2: oI = -I; oQ = -Q; break;
+            case 3: oI = -Q; oQ =  I; break;
+        }
+        g_mix_phase = (g_mix_phase + 1) & 3;
 
-            if (g_cw_nco_active) {
-                float nI, nQ;
-                nco::mixDown(g_cw_nco, hI, hQ, nI, nQ);
-                hI = nI; hQ = nQ;
-            }
+        // CW offset NCO: shift CW sidetone to DC
+        if (g_cw_nco_active) {
+            float nI, nQ;
+            nco::mixDown(g_cw_nco, oI, oQ, nI, nQ);
+            oI = nI; oQ = nQ;
+        }
 
-            g_hard_decim_counter++;
-            if (g_hard_decim_counter >= AUDIO_DECIM) {
-                g_hard_decim_counter = 0;
-                wola_write(g_wola[NON_IQ_SPAN], hI, hQ);
-                process_audio_8k(hI, hQ);
-            }
-        } else {
-            // ── Normal I/Q path ──
+        // Fill 48k WOLA buffer (span 0)
+        wola_write(g_wola[0], oI, oQ);
 
-            // fs/4 complex down-conversion
-            float oI, oQ;
-            switch (g_mix_phase) {
-                case 0: oI =  I; oQ =  Q; break;
-                case 1: oI =  Q; oQ = -I; break;
-                case 2: oI = -I; oQ = -Q; break;
-                case 3: oI = -Q; oQ =  I; break;
-            }
-            g_mix_phase = (g_mix_phase + 1) & 3;
+        // ↓2: 48k → 24k (independent, for ±12k span)
+        float d2i, d2q;
+        if (decim_process(g_decim2, g_d2_coeffs, oI, oQ, d2i, d2q)) {
+            wola_write(g_wola[1], d2i, d2q);
+        }
 
-            // CW offset NCO: shift CW sidetone to DC
-            if (g_cw_nco_active) {
-                float nI, nQ;
-                nco::mixDown(g_cw_nco, oI, oQ, nI, nQ);
-                oI = nI; oQ = nQ;
-            }
-
-            // Fill 48k WOLA buffer (span 0)
-            wola_write(g_wola[0], oI, oQ);
-
-            // ↓2: 48k → 24k (independent, for ±12k span)
-            float d2i, d2q;
-            if (decim_process(g_decim2, g_d2_coeffs, oI, oQ, d2i, d2q)) {
-                wola_write(g_wola[1], d2i, d2q);
-            }
-
-            // ↓6: 48k → 8k (independent, for ±4k span + audio)
-            float d6i, d6q;
-            if (decim_process(g_decim6, g_d6_coeffs, oI, oQ, d6i, d6q)) {
-                wola_write(g_wola[2], d6i, d6q);
-                process_audio_8k(d6i, d6q);
-            }
+        // ↓6: 48k → 8k (independent, for ±4k span + audio)
+        float d6i, d6q;
+        if (decim_process(g_decim6, g_d6_coeffs, oI, oQ, d6i, d6q)) {
+            wola_write(g_wola[2], d6i, d6q);
+            process_audio_8k(d6i, d6q);
         }
     }
 }

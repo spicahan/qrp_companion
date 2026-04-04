@@ -18,9 +18,6 @@ void setVfoFreq(uint64_t freq_hz);
 // Suppress periodic polling (e.g. during drag-to-tune)
 void suppressPolling(bool suppress);
 
-// Enable/disable QMX I/Q mode (Q91; / Q90;)
-void setIqMode(bool enable);
-
 // Set QMX CW filter passband via MMCW|CW passband=<value>;
 // Valid values: "None", "50", "100", "150", "200", "250", "300", "400", "500"
 void setCwFilter(const char *bandwidth);
