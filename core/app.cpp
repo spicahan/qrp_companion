@@ -688,7 +688,7 @@ void app::tick()
             if (total_drag < 0) total_drag = -total_drag;
 
             if (total_drag < TAP_THRESHOLD && drag_start_freq > 0) {
-                int delta_px = evt.x - spec_x - g_vfo_x;
+                int delta_px = drag_start_x - spec_x - g_vfo_x;
                 int delta_hz = delta_px * dsp::getSpanRate() / spec_w;
                 uint64_t new_freq = ((int64_t)drag_start_freq + delta_hz) / 10 * 10;
                 if (new_freq > 0) {
