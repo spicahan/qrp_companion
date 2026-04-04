@@ -6,7 +6,7 @@ if(ESP_PLATFORM)
     return()
 endif()
 
-project(qrp_companion_desktop LANGUAGES CXX)
+project(qrp_companion_desktop LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_AUTOMOC ON)
@@ -24,6 +24,8 @@ add_executable(qrp_companion_desktop
     ../core/nco.cpp
     ../core/ui_state.cpp
     ../core/ui_widget.cpp
+    ../core/web.cpp
+    ../core/mongoose/mongoose.c
     fft_shim/fft.cpp
 )
 

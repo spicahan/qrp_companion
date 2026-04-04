@@ -136,6 +136,12 @@ bool pollEvent(TouchEvent &evt)
     return true;
 }
 
+void injectEvent(const TouchEvent &evt)
+{
+    std::lock_guard<std::mutex> lock(evt_mutex);
+    evt_queue.push(evt);
+}
+
 int64_t micros()
 {
     auto now = std::chrono::steady_clock::now();

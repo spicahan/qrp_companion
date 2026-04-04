@@ -35,6 +35,7 @@ void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
 
 // Input
 bool pollEvent(TouchEvent &evt);
+void injectEvent(const TouchEvent &evt);  // push event from web UI
 
 // Timing
 int64_t micros();
