@@ -10,7 +10,9 @@
 #include <esp_wifi.h>
 #include <esp_netif.h>
 #include <esp_event.h>
+#include <esp_log.h>
 #include <nvs_flash.h>
+#include <driver/gpio.h>
 #include <driver/ppa.h>
 #include <cstring>
 
@@ -37,15 +39,34 @@ static void evt_push(const pal::TouchEvent &e)
     }
 }
 
+static const char *TAG = "wifi_ap";
+
+// Tab5 requires lowest GPIO drive capability on SDIO pins (matching factory demo)
+static void set_sdio_gpio_drive()
+{
+    static const gpio_num_t sdio_gpios[] = {
+        GPIO_NUM_8, GPIO_NUM_9, GPIO_NUM_10, GPIO_NUM_11,
+        GPIO_NUM_12, GPIO_NUM_13, GPIO_NUM_15
+    };
+    for (auto gpio : sdio_gpios) {
+        gpio_set_drive_capability(gpio, GPIO_DRIVE_CAP_0);
+    }
+}
+
 static void wifi_ap_init()
 {
-    nvs_flash_init();
-    esp_netif_init();
-    esp_event_loop_create_default();
+    set_sdio_gpio_drive();
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&wifi_cfg);
+    esp_err_t err = esp_wifi_init(&wifi_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(err));
+        return;
+    }
 
     wifi_config_t ap_cfg = {};
     strcpy((char *)ap_cfg.ap.ssid, "QRP-Companion");
@@ -54,20 +75,27 @@ static void wifi_ap_init()
     ap_cfg.ap.max_connection = 2;
     ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
 
-    esp_wifi_set_mode(WIFI_MODE_AP);
-    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
-    esp_wifi_start();
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_LOGI(TAG, "WiFi AP started: SSID=QRP-Companion");
 }
 
 namespace pal {
+
+static void wifi_task(void *param)
+{
+    wifi_ap_init();
+    vTaskDelete(nullptr);
+}
 
 bool init(int width, int height)
 {
     auto cfg = M5.config();
     M5.begin(cfg);
 
-    // WiFi AP init after M5.begin() — needs SPI bus to C6 coprocessor
-    wifi_ap_init();
+    // Start WiFi in separate task (like factory demo)
+    xTaskCreate(wifi_task, "wifi", 4096, nullptr, 5, nullptr);
 
     auto &dsp = M5.Display;
     dsp.setBrightness(128);

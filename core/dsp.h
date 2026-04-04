@@ -13,8 +13,6 @@ void setAudioGain(float gain);  // linear gain for audio output
 float getAudioGain();
 void setCwOffset(float offset_hz); // set CW offset NCO frequency (0 to disable)
 void setModeKnown(bool known);     // enable audio output once mode is determined
-void setSoftNcoCorrection(float hz); // sub-10Hz fine correction added to CW NCO
-float getSoftNcoCorrection();
 
 // APF (Audio Peaking Filter) — very narrow CW filter, toggle with 300Hz filter
 void setApfEnabled(bool enabled);

@@ -11,7 +11,6 @@
     X(float,    audio_gain,   1000.0f)    \
     X(int,      span_idx,     1)          \
     X(int,      cw_offset,    0)          \
-    X(float,    soft_nco,     0.0f)       \
     X(float,    db_floor,     -110.0f)    \
     X(float,    db_ceil,      -30.0f)     \
     X(float,    fps,          0.0f)       \
