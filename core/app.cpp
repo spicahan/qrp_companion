@@ -321,14 +321,12 @@ static ui::Panel panel_header = { "default" };
 // ═══════════════════════════════════════════════════════════════
 // Web UI callbacks
 // ═══════════════════════════════════════════════════════════════
-static void web_touch_cb(int action, int x, int y, int dw, int dh)
+static void web_touch_cb(int action, int nx, int ny, int, int)
 {
-    // Map phone display coordinates to spectrum pixel coordinates
-    // Phone renders spectrum across full width, VFO marker at center or 3/4
-    int mapped_x = spec_x + x * spec_w / dw;
-    int mapped_y = spec_y + (y - 30) * (SPEC_H + GAP + wf_h) / (dh - 30 - 48);
+    // nx, ny: 0-10000 normalized within spectrum+waterfall area
+    int mapped_x = spec_x + nx * spec_w / 10000;
+    int mapped_y = spec_y + ny * (SPEC_H + GAP + wf_h) / 10000;
 
-    // Inject as touch event (reuses the same event processing)
     pal::TouchEvent evt;
     evt.x = mapped_x;
     evt.y = mapped_y;

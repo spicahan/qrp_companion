@@ -12,4 +12,5 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
     MG_ARCH=MG_ARCH_ESP32
     MG_OTA=MG_OTA_NONE
     MG_ENABLE_PACKED_FS=0
+    MG_ENABLE_LOG=0
 )

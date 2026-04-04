@@ -146,12 +146,19 @@ connect();
 
 function sendCmd(buf){if(ws&&ws.readyState===1) ws.send(buf)}
 
-function sendTouch(action,x,y){
-  const W=canvas.width, H=canvas.height;
-  const b=new ArrayBuffer(11); const v=new DataView(b);
+function sendTouch(action,cssX,cssY){
+  // CSS coords → normalized 0..1 within the spectrum+waterfall area
+  // Use CSS display size (not canvas pixel size) since touch is in CSS coords
+  const rect=canvas.getBoundingClientRect();
+  const W=rect.width, H=rect.height;
+  const btnH=48, hudH=30;
+  const specTop=hudH, specBot=H-btnH;
+  const nx=cssX/W, ny=(cssY-specTop)/(specBot-specTop);
+  // Send as fixed-point 0..10000
+  const b=new ArrayBuffer(7); const v=new DataView(b);
   v.setUint8(0,0x20); v.setUint8(1,action);
-  v.setUint16(2,x|0,true); v.setUint16(4,y|0,true);
-  v.setUint16(6,W|0,true); v.setUint16(8,H|0,true);
+  v.setUint16(2, Math.max(0,Math.min(10000,(nx*10000)|0)), true);
+  v.setUint16(4, Math.max(0,Math.min(10000,(ny*10000)|0)), true);
   sendCmd(b);
 }
 
@@ -163,13 +170,14 @@ function sendButton(id){
   sendCmd(b.buffer);
 }
 
-// Touch on canvas
-canvas.addEventListener("touchstart",e=>{e.preventDefault();const t=e.touches[0];sendTouch(0,t.clientX,t.clientY)});
-canvas.addEventListener("touchmove",e=>{e.preventDefault();const t=e.touches[0];sendTouch(1,t.clientX,t.clientY)});
+// Touch on canvas (use offsetX/Y for canvas-relative coords)
+function canvasXY(e){const r=canvas.getBoundingClientRect();return[e.clientX-r.left,e.clientY-r.top]}
+canvas.addEventListener("touchstart",e=>{e.preventDefault();const [x,y]=canvasXY(e.touches[0]);sendTouch(0,x,y)});
+canvas.addEventListener("touchmove",e=>{e.preventDefault();const [x,y]=canvasXY(e.touches[0]);sendTouch(1,x,y)});
 canvas.addEventListener("touchend",e=>{e.preventDefault();sendTouch(2,0,0)});
 let md=false;
-canvas.addEventListener("mousedown",e=>{md=true;sendTouch(0,e.clientX,e.clientY)});
-canvas.addEventListener("mousemove",e=>{if(md)sendTouch(1,e.clientX,e.clientY)});
+canvas.addEventListener("mousedown",e=>{md=true;const [x,y]=canvasXY(e);sendTouch(0,x,y)});
+canvas.addEventListener("mousemove",e=>{if(md){const [x,y]=canvasXY(e);sendTouch(1,x,y)}});
 canvas.addEventListener("mouseup",()=>{md=false;sendTouch(2,0,0)});
 
 // Buttons

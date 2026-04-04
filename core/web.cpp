@@ -46,14 +46,12 @@ static void handle_ws_message(struct mg_connection *c, struct mg_ws_message *wm)
         memcpy(buf + 1, data + 1, 8);
         mg_ws_send(c, (const char *)buf, 9, WEBSOCKET_OP_BINARY);
     }
-    else if (type == 0x20 && len >= 11 && s_touch_cb) {
-        // Touch: action(1) + x(2) + y(2) + display_w(2) + display_h(2)
+    else if (type == 0x20 && len >= 7 && s_touch_cb) {
+        // Touch: action(1) + norm_x(2) + norm_y(2)  (0-10000 fixed point)
         int action = data[1];
-        int x = data[2] | (data[3] << 8);
-        int y = data[4] | (data[5] << 8);
-        int dw = data[6] | (data[7] << 8);
-        int dh = data[8] | (data[9] << 8);
-        s_touch_cb(action, x, y, dw, dh);
+        int nx = data[2] | (data[3] << 8);  // 0-10000
+        int ny = data[4] | (data[5] << 8);  // 0-10000
+        s_touch_cb(action, nx, ny, 10000, 10000);
     }
     else if (type == 0x30 && len > 1 && s_button_cb) {
         // Button: name string (not null-terminated)

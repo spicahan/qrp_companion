@@ -29,6 +29,8 @@ add_executable(qrp_companion_desktop
     fft_shim/fft.cpp
 )
 
+target_compile_definitions(qrp_companion_desktop PRIVATE MG_ENABLE_LOG=0)
+
 target_include_directories(qrp_companion_desktop PRIVATE
     ../pal
     ../core
