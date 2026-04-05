@@ -284,10 +284,72 @@ void delayMs(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)
 int freeHeapKb() { return 0; }
 int freePsramKb() { return 0; }
 
-// Audio output — not needed for KiwiSDR (no local playback for now)
-bool audioOutputOpen(int) { return true; }
-void audioOutputWrite(const float *, int) {}
-void audioOutputClose() {}
+// Audio output via PortAudio (linear interpolation upsample to 48kHz)
+#include <portaudio.h>
+
+static constexpr int PA_OUT_RATE = 48000;
+static constexpr int AOUT_RING_SIZE = 8192;
+static float s_aout_ring[AOUT_RING_SIZE];
+static std::atomic<int> s_aout_head{0};
+static std::atomic<int> s_aout_tail{0};
+static int s_audio_out_rate = 0;
+static PaStream *s_pa_out = nullptr;
+
+static int pa_output_callback(const void *, void *output, unsigned long frameCount,
+                              const PaStreamCallbackTimeInfo *, PaStreamCallbackFlags, void *)
+{
+    float *out = (float *)output;
+    static float prev_sample = 0, cur_sample = 0;
+    static int phase = 0;
+    int upsample = (s_audio_out_rate > 0) ? (PA_OUT_RATE / s_audio_out_rate) : 4;
+    int head = s_aout_head.load(std::memory_order_acquire);
+    int tail = s_aout_tail.load(std::memory_order_relaxed);
+    for (unsigned long i = 0; i < frameCount; i++) {
+        if (phase == 0) {
+            prev_sample = cur_sample;
+            if (head != tail) {
+                cur_sample = s_aout_ring[tail];
+                tail = (tail + 1) % AOUT_RING_SIZE;
+            }
+        }
+        float t = (float)phase / (float)upsample;
+        out[i] = prev_sample + (cur_sample - prev_sample) * t;
+        phase = (phase + 1) % upsample;
+    }
+    s_aout_tail.store(tail, std::memory_order_release);
+    return paContinue;
+}
+
+bool audioOutputOpen(int sample_rate)
+{
+    s_audio_out_rate = sample_rate;
+    Pa_Initialize();
+    PaStreamParameters outParams{};
+    outParams.device = Pa_GetDefaultOutputDevice();
+    outParams.channelCount = 1;
+    outParams.sampleFormat = paFloat32;
+    outParams.suggestedLatency = 0.05;
+    Pa_OpenStream(&s_pa_out, nullptr, &outParams, PA_OUT_RATE, 256, 0, pa_output_callback, nullptr);
+    Pa_StartStream(s_pa_out);
+    return true;
+}
+
+void audioOutputWrite(const float *samples, int num_frames)
+{
+    int head = s_aout_head.load(std::memory_order_relaxed);
+    for (int i = 0; i < num_frames; i++) {
+        int next = (head + 1) % AOUT_RING_SIZE;
+        if (next == s_aout_tail.load(std::memory_order_acquire)) break;
+        s_aout_ring[head] = samples[i];
+        head = next;
+    }
+    s_aout_head.store(head, std::memory_order_release);
+}
+
+void audioOutputClose()
+{
+    if (s_pa_out) { Pa_StopStream(s_pa_out); Pa_CloseStream(s_pa_out); s_pa_out = nullptr; }
+}
 
 // Audio input — KiwiSDR I/Q stream
 bool audioInputOpen(AudioInputCallback cb) {

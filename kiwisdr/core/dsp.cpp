@@ -1,4 +1,5 @@
 #include "dsp.h"
+#include "nco.h"
 #include "dsps_fft2r.h"
 #include <cmath>
 #include <cstring>
@@ -31,6 +32,34 @@ static WolaState g_wola;
 // ── Span ─────────────────────────────────────────────────────
 static int g_cur_span = 0;
 
+// ── CW filter (300 Hz BW at 12 kHz) ─────────────────────────
+static constexpr int CW_FIR_TAPS = 65;
+static constexpr float CW_FIR_CUTOFF_HZ = 150.0f;
+static float g_cw_fir_coeffs[CW_FIR_TAPS];
+static float g_cw_fir_delay_i[CW_FIR_TAPS];
+static float g_cw_fir_delay_q[CW_FIR_TAPS];
+static int   g_cw_fir_pos = 0;
+
+// ── APF (40 Hz BW at 12 kHz) ────────────────────────────────
+static constexpr int APF_FIR_TAPS = 257;
+static constexpr float APF_FIR_CUTOFF_HZ = 20.0f;
+static float g_apf_fir_coeffs[APF_FIR_TAPS];
+static float g_apf_fir_delay_i[APF_FIR_TAPS];
+static float g_apf_fir_delay_q[APF_FIR_TAPS];
+static int   g_apf_fir_pos = 0;
+static bool  g_apf_enabled = false;
+
+// ── Sidetone NCO ────────────────────────────────────────────
+static NcoState g_sidetone_nco;
+static float g_cw_offset_hz = 0;
+
+// ── SSB filter (3 kHz LPF at 12 kHz) ────────────────────────
+static constexpr int SSB_FIR_TAPS = 65;
+static constexpr float SSB_FIR_CUTOFF_HZ = 2800.0f;
+static float g_ssb_fir_coeffs[SSB_FIR_TAPS];
+static float g_ssb_fir_delay[SSB_FIR_TAPS];
+static int   g_ssb_fir_pos = 0;
+
 // ── Audio output ─────────────────────────────────────────────
 static constexpr int AUDIO_OUT_BUF_SIZE = 64;
 static float g_audio_out_buf[AUDIO_OUT_BUF_SIZE];
@@ -38,7 +67,6 @@ static int   g_audio_out_pos = 0;
 static dsp::AudioOutCallback g_audio_out_cb = nullptr;
 static float g_audio_gain = 1000.0f;
 static bool  g_mode_known = false;
-static bool  g_apf_enabled = false;
 
 // ── Goertzel ─────────────────────────────────────────────────
 static constexpr int GOERTZEL_BINS = 1001;
@@ -59,6 +87,20 @@ static float g_goertzel_result = 0;
 // Filter design
 // ═══════════════════════════════════════════════════════════
 
+static void design_fir_lowpass(float *h, int N, float cutoff_hz, float sample_rate)
+{
+    float fc = cutoff_hz / sample_rate;
+    int M = (N - 1) / 2;
+    for (int n = 0; n < N; n++) {
+        float w = 0.54f - 0.46f * cosf(2.0f * (float)M_PI * n / (N - 1));
+        if (n == M) h[n] = 2.0f * fc * w;
+        else { float x = (float)(n - M); h[n] = sinf(2.0f * (float)M_PI * fc * x) / ((float)M_PI * x) * w; }
+    }
+    float sum = 0;
+    for (int n = 0; n < N; n++) sum += h[n];
+    if (sum > 0) for (int n = 0; n < N; n++) h[n] /= sum;
+}
+
 static void generate_wola_prototype(float *w, int M, int fft_size)
 {
     const double a0 = 0.35875, a1 = 0.48829, a2 = 0.14128, a3 = 0.01168;
@@ -77,6 +119,53 @@ static void generate_wola_prototype(float *w, int M, int fft_size)
     for (int n = 0; n < M; n++) sum += w[n];
     float scale = (float)fft_size / sum;
     for (int n = 0; n < M; n++) w[n] *= scale;
+}
+
+// ═══════════════════════════════════════════════════════════
+// Audio filters
+// ═══════════════════════════════════════════════════════════
+
+static void cw_fir_sample(float in_i, float in_q, float &out_i, float &out_q)
+{
+    g_cw_fir_delay_i[g_cw_fir_pos] = in_i;
+    g_cw_fir_delay_q[g_cw_fir_pos] = in_q;
+    g_cw_fir_pos = (g_cw_fir_pos + 1) % CW_FIR_TAPS;
+    float acc_i = 0, acc_q = 0;
+    int idx = g_cw_fir_pos;
+    for (int k = 0; k < CW_FIR_TAPS; k++) {
+        acc_i += g_cw_fir_delay_i[idx] * g_cw_fir_coeffs[k];
+        acc_q += g_cw_fir_delay_q[idx] * g_cw_fir_coeffs[k];
+        idx = (idx + 1) % CW_FIR_TAPS;
+    }
+    out_i = acc_i; out_q = acc_q;
+}
+
+static void apf_fir_sample(float in_i, float in_q, float &out_i, float &out_q)
+{
+    g_apf_fir_delay_i[g_apf_fir_pos] = in_i;
+    g_apf_fir_delay_q[g_apf_fir_pos] = in_q;
+    g_apf_fir_pos = (g_apf_fir_pos + 1) % APF_FIR_TAPS;
+    float acc_i = 0, acc_q = 0;
+    int idx = g_apf_fir_pos;
+    for (int k = 0; k < APF_FIR_TAPS; k++) {
+        acc_i += g_apf_fir_delay_i[idx] * g_apf_fir_coeffs[k];
+        acc_q += g_apf_fir_delay_q[idx] * g_apf_fir_coeffs[k];
+        idx = (idx + 1) % APF_FIR_TAPS;
+    }
+    out_i = acc_i; out_q = acc_q;
+}
+
+static float ssb_fir_sample(float in)
+{
+    g_ssb_fir_delay[g_ssb_fir_pos] = in;
+    g_ssb_fir_pos = (g_ssb_fir_pos + 1) % SSB_FIR_TAPS;
+    float acc = 0;
+    int idx = g_ssb_fir_pos;
+    for (int k = 0; k < SSB_FIR_TAPS; k++) {
+        acc += g_ssb_fir_delay[idx] * g_ssb_fir_coeffs[k];
+        idx = (idx + 1) % SSB_FIR_TAPS;
+    }
+    return acc;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -148,6 +237,27 @@ void dsp::init(int sample_rate, int fft_size)
 
     g_audio_out_pos = 0;
 
+    // Audio filters at 12 kHz
+    float sr = (float)sample_rate;
+    design_fir_lowpass(g_cw_fir_coeffs, CW_FIR_TAPS, CW_FIR_CUTOFF_HZ, sr);
+    memset(g_cw_fir_delay_i, 0, sizeof(g_cw_fir_delay_i));
+    memset(g_cw_fir_delay_q, 0, sizeof(g_cw_fir_delay_q));
+    g_cw_fir_pos = 0;
+
+    design_fir_lowpass(g_apf_fir_coeffs, APF_FIR_TAPS, APF_FIR_CUTOFF_HZ, sr);
+    memset(g_apf_fir_delay_i, 0, sizeof(g_apf_fir_delay_i));
+    memset(g_apf_fir_delay_q, 0, sizeof(g_apf_fir_delay_q));
+    g_apf_fir_pos = 0;
+
+    design_fir_lowpass(g_ssb_fir_coeffs, SSB_FIR_TAPS, SSB_FIR_CUTOFF_HZ, sr);
+    memset(g_ssb_fir_delay, 0, sizeof(g_ssb_fir_delay));
+    g_ssb_fir_pos = 0;
+
+    // Sidetone NCO
+    nco::init();
+    g_sidetone_nco.phase = 0;
+    g_sidetone_nco.inc = 0;
+
     dsps_fft2r_init_fc32(nullptr, fft_size);
 
     for (int i = 0; i < g_num_bins; i++)
@@ -158,7 +268,11 @@ void dsp::setAudioOutCallback(AudioOutCallback cb) { g_audio_out_cb = cb; }
 int  dsp::getDecimatedRate() { return g_sample_rate; }  // 12kHz, no decimation
 void dsp::setAudioGain(float gain) { g_audio_gain = gain; }
 float dsp::getAudioGain() { return g_audio_gain; }
-void dsp::setCwOffset(float) {}  // not needed — KiwiSDR centers on VFO
+void dsp::setCwOffset(float offset_hz) {
+    g_cw_offset_hz = offset_hz;
+    if (offset_hz > 0)
+        nco::setFreq(g_sidetone_nco, offset_hz, (float)g_sample_rate);
+}
 void dsp::setModeKnown(bool known) { g_mode_known = known; }
 void dsp::setApfEnabled(bool enabled) { g_apf_enabled = enabled; }
 bool dsp::isApfEnabled() { return g_apf_enabled; }
@@ -197,12 +311,21 @@ void dsp::pushIQ(const float *iq, int num_frames)
         // Direct to WOLA (no mixer, no decimation — 12kHz is our native rate)
         wola_write(g_wola, I, Q);
 
-        // Goertzel detector (runs on raw I/Q at 12kHz)
-        if (g_goertzel_running) {
+        // CW filter runs continuously (for Goertzel + CW audio)
+        float filt_i = I, filt_q = Q;
+        if (g_cw_offset_hz > 0) {
+            if (g_apf_enabled)
+                apf_fir_sample(I, Q, filt_i, filt_q);
+            else
+                cw_fir_sample(I, Q, filt_i, filt_q);
+        }
+
+        // Goertzel detector (on CW-filtered I/Q)
+        if (g_goertzel_running && g_cw_offset_hz > 0) {
             for (int b = 0; b < GOERTZEL_BINS; b++) {
                 float c = g_goertzel[b].coeff;
-                float s0_re = I + c * g_goertzel[b].s1_re - g_goertzel[b].s2_re;
-                float s0_im = Q + c * g_goertzel[b].s1_im - g_goertzel[b].s2_im;
+                float s0_re = filt_i + c * g_goertzel[b].s1_re - g_goertzel[b].s2_re;
+                float s0_im = filt_q + c * g_goertzel[b].s1_im - g_goertzel[b].s2_im;
                 g_goertzel[b].s2_re = g_goertzel[b].s1_re;
                 g_goertzel[b].s2_im = g_goertzel[b].s1_im;
                 g_goertzel[b].s1_re = s0_re;
@@ -225,8 +348,18 @@ void dsp::pushIQ(const float *iq, int num_frames)
             }
         }
 
-        // Audio output: I channel directly (KiwiSDR already filtered)
-        float audio = I * g_audio_gain;
+        // Audio output
+        float audio;
+        if (g_cw_offset_hz > 0) {
+            // CW mode: sidetone NCO mixes filtered I/Q up to audible frequency
+            float tone_i, tone_q;
+            nco::mixUp(g_sidetone_nco, filt_i, filt_q, tone_i, tone_q);
+            audio = tone_i;
+        } else {
+            // SSB/DIGI: 3 kHz LPF on I stream
+            audio = ssb_fir_sample(I);
+        }
+        audio *= g_audio_gain;
         audio = tanhf(audio);
         g_audio_out_buf[g_audio_out_pos++] = audio;
         if (g_audio_out_pos >= AUDIO_OUT_BUF_SIZE) {

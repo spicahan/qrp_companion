@@ -605,7 +605,7 @@ void app::tick()
     ui::set_i32(ui::PROP_cw_offset, cat::getCwOffset(), ui::FROM_RADIO);
 
     // VFO marker position
-    g_vfo_x = (dsp::getSpan() == 0) ? spec_w * 3 / 4 : spec_w / 2;
+    g_vfo_x = spec_w / 2;  // KiwiSDR: VFO always at center
 
     // --- Goertzel result → VFO at 1Hz resolution ---
     if (!dsp::isGoertzelRunning() && dsp::getGoertzelResult() != 0) {
