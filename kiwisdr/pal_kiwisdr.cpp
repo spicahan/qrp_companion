@@ -227,16 +227,27 @@ static void kiwi_set_freq(uint64_t freq_hz) {
 
 namespace pal {
 
-bool init(int width, int height) {
+bool init(int width, int height, const char *kiwi_server) {
     fb_w = width;
     fb_h = height;
     fb_buffer = new uint16_t[width * height]();
     g_widget = new FbWidget(width, height);
     g_widget->show();
 
-    // Init KiwiSDR Mongoose client
+    // Parse server address "host:port"
+    const char *default_server = "palomar-1.proxy.kiwisdr.com:8073";
+    if (!kiwi_server) kiwi_server = default_server;
+    std::string srv(kiwi_server);
+    std::string host = srv;
+    int port = 8073;
+    auto colon = srv.rfind(':');
+    if (colon != std::string::npos) {
+        host = srv.substr(0, colon);
+        port = std::stoi(srv.substr(colon + 1));
+    }
+
     mg_mgr_init(&s_kiwi_mgr);
-    kiwi_connect("palomar-1.proxy.kiwisdr.com", 8073);
+    kiwi_connect(host.c_str(), port);
 
     return true;
 }

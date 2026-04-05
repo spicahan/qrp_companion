@@ -14,7 +14,7 @@ struct DisplayInfo {
 };
 
 // Lifecycle
-bool init(int width, int height);
+bool init(int width, int height, const char *kiwi_server = nullptr);
 void shutdown();
 
 // Display
