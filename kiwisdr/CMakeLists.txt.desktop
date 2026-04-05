@@ -1,0 +1,36 @@
+cmake_minimum_required(VERSION 3.16)
+
+if(ESP_PLATFORM)
+    project(desktop_skip NONE)
+    return()
+endif()
+
+project(qrp_kiwisdr LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_AUTOMOC ON)
+
+find_package(Qt5 REQUIRED COMPONENTS Widgets)
+
+add_executable(qrp_kiwisdr
+    main_desktop.cpp
+    pal_kiwisdr.cpp
+    core/app.cpp
+    core/dsp.cpp
+    core/cat.cpp
+    core/nco.cpp
+    core/ui_state.cpp
+    core/ui_widget.cpp
+    core/mongoose/mongoose.c
+    fft_shim/fft.cpp
+)
+
+target_compile_definitions(qrp_kiwisdr PRIVATE MG_ENABLE_LOG=0)
+
+target_include_directories(qrp_kiwisdr PRIVATE
+    .
+    core
+    fft_shim
+)
+
+target_link_libraries(qrp_kiwisdr Qt5::Widgets)

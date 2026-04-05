@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>QRP Companion</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;color:#0f0;font-family:monospace;overflow:hidden;touch-action:none}
+canvas{display:block;width:100vw;height:100vh}
+#hud{position:fixed;top:0;left:0;right:0;background:rgba(0,0,80,0.9);padding:6px 10px;font-size:13px;z-index:10;display:flex;justify-content:space-between}
+#hud span{color:#0f0}
+#freq{color:#0f0;font-size:16px;font-weight:bold}
+#btns{position:fixed;bottom:0;left:0;right:0;z-index:10}
+#btns>div{display:flex}
+#btns button{flex:1;padding:14px 0;font-family:monospace;font-size:15px;font-weight:bold;border:1px solid #555;background:#222;color:#0ff;touch-action:manipulation}
+#btns button.active{background:#0ff;color:#000}
+#btns button.red{color:#f44}
+</style>
+</head>
+<body>
+<div id="hud">
+  <span id="span">--</span>
+  <span id="freq">---.---.---</span>
+  <span id="mode">---</span>
+  <span>RTT:<b id="rtt">--</b>ms</span>
+</div>
+<canvas id="c"></canvas>
+<div id="btns">
+  <div id="panDefault">
+    <button onclick="showPanel('panSpan')">Span</button>
+    <button id="bFilter" onclick="sendButton('filter')">APF</button>
+    <button onclick="sendButton('zerobt')">ZeroBt</button>
+    <button onclick="showPanel('panBand')">Band</button>
+  </div>
+  <div id="panSpan" style="display:none">
+    <button onclick="sendButton('span_0');showPanel('panDefault')">48k</button>
+    <button onclick="sendButton('span_1');showPanel('panDefault')">+/-12k</button>
+    <button onclick="sendButton('span_2');showPanel('panDefault')">+/-4k</button>
+    <button class="red" onclick="showPanel('panDefault')">Back</button>
+  </div>
+  <div id="panBand" style="display:none">
+    <button onclick="sendButton('band_40');showPanel('panDefault')">40</button>
+    <button onclick="sendButton('band_30');showPanel('panDefault')">30</button>
+    <button onclick="sendButton('band_20');showPanel('panDefault')">20</button>
+    <button onclick="sendButton('band_17');showPanel('panDefault')">17</button>
+    <button onclick="sendButton('band_15');showPanel('panDefault')">15</button>
+    <button onclick="sendButton('band_12');showPanel('panDefault')">12</button>
+    <button onclick="sendButton('band_10');showPanel('panDefault')">10</button>
+    <button class="red" onclick="showPanel('panDefault')">Back</button>
+  </div>
+</div>
+
+<script>
+const N=512, WF=256, SPEC_FRAC=0.35;
+const canvas=document.getElementById("c"), ctx=canvas.getContext("2d");
+let spectrum=new Uint8Array(N), wfBuf=[], vfoFreq=0, mode=0, spanRate=0, apf=false;
+let rttSamples=[], ws=null;
+
+// Color LUT
+const specColor=i=>{const v=i/255;return v<.5?`rgb(${v*510|0},255,0)`:`rgb(255,${(1-v)*510|0},0)`};
+const wfLUT=new Array(256);
+for(let i=0;i<256;i++){
+  const r=i<85?0:i<170?(i-85)*3:255;
+  const g=i<85?0:i<170?(i-85)*3:255-(i-170)*3;
+  const b=i<85?i*3:i<170?255-(i-85)*3:0;
+  wfLUT[i]=`rgb(${r},${g},${b})`;
+}
+
+function resize(){canvas.width=innerWidth;canvas.height=innerHeight}
+resize(); addEventListener("resize",resize);
+
+function render(){
+  const W=canvas.width, H=canvas.height;
+  const btnH=48, hudH=30;
+  const specH=((H-btnH-hudH)*SPEC_FRAC)|0;
+  const wfY=hudH+specH+2, wfH=H-btnH-wfY;
+  const px=W/N;
+
+  ctx.fillStyle="#000"; ctx.fillRect(0,0,W,H);
+
+  // Spectrum
+  for(let i=0;i<N;i++){
+    const v=spectrum[i]/255, bh=(v*specH)|0;
+    const x=(i*px)|0, bw=Math.max(1,((i+1)*px|0)-(i*px|0));
+    ctx.fillStyle=specColor(spectrum[i]);
+    ctx.fillRect(x, hudH+specH-bh, bw, bh);
+  }
+
+  // VFO marker at center (narrow spans) or 3/4 (48k)
+  const markerX = spanRate>=48000 ? (W*3/4)|0 : (W/2)|0;
+  ctx.fillStyle="rgba(255,255,255,0.7)";
+  ctx.fillRect(markerX, hudH, 1, specH);
+
+  // Separator
+  ctx.fillStyle="#0f0"; ctx.fillRect(0, hudH+specH, W, 2);
+
+  // Waterfall
+  const nLines=Math.min(wfBuf.length, (wfH/2)|0);
+  for(let row=0;row<nLines;row++){
+    const line=wfBuf[row]; if(!line) continue;
+    const y=wfY+row*2;
+    for(let i=0;i<N;i++){
+      const x=(i*px)|0, bw=Math.max(1,((i+1)*px|0)-(i*px|0));
+      ctx.fillStyle=wfLUT[line[i]];
+      ctx.fillRect(x, y, bw, 2);
+    }
+  }
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+// Format frequency
+function fmtFreq(f){
+  if(!f) return "---.---.---";
+  const mhz=(f/1e6)|0, khz=((f%1e6)/1e3)|0, hz=f%1000;
+  return `${mhz}.${String(khz).padStart(3,'0')}.${String(hz).padStart(3,'0')}`;
+}
+const modeStr=m=>({1:"LSB",2:"USB",3:"CW",6:"DIGI"}[m]||"---");
+
+function updateHud(){
+  document.getElementById("freq").textContent=modeStr(mode)+" "+fmtFreq(vfoFreq);
+  const avg=rttSamples.length?rttSamples.reduce((a,b)=>a+b)/rttSamples.length:0;
+  document.getElementById("rtt").textContent=avg.toFixed(0);
+}
+setInterval(updateHud, 200);
+
+// WebSocket
+function connect(){
+  const url=`ws://${location.hostname}:${location.port}/ws`;
+  ws=new WebSocket(url);
+  ws.binaryType="arraybuffer";
+  ws.onopen=()=>{
+    setInterval(()=>{
+      if(ws.readyState!==1) return;
+      const b=new ArrayBuffer(9); const v=new DataView(b);
+      v.setUint8(0,0x10); v.setFloat64(1,performance.now(),true);
+      ws.send(b);
+    }, 200);
+  };
+  ws.onmessage=e=>{
+    if(!(e.data instanceof ArrayBuffer)) return;
+    const v=new DataView(e.data), t=v.getUint8(0);
+    if(t===0x01 && e.data.byteLength>=23+N){
+      // Spectrum: type(1) + bins(2) + rate(4) + vfo(8) + mode(1) + apf(1) + pad(6) = 23
+      spanRate=v.getInt32(3,true);
+      vfoFreq=Number(v.getBigUint64(7,true));
+      mode=v.getUint8(15);
+      apf=!!v.getUint8(16);
+      spectrum=new Uint8Array(e.data, 23, N);
+      wfBuf.unshift(spectrum.slice());
+      if(wfBuf.length>WF) wfBuf.length=WF;
+      document.getElementById("bFilter").className=apf?"active":"";
+    } else if(t===0x11 && e.data.byteLength>=9){
+      const rtt=performance.now()-v.getFloat64(1,true);
+      rttSamples.push(rtt);
+      if(rttSamples.length>20) rttSamples.shift();
+    }
+  };
+  ws.onclose=()=>setTimeout(connect, 1000);
+  ws.onerror=()=>ws.close();
+}
+connect();
+
+function sendCmd(buf){if(ws&&ws.readyState===1) ws.send(buf)}
+
+function showPanel(id){
+  for(const d of document.querySelectorAll('#btns>div')) d.style.display='none';
+  document.getElementById(id).style.display='flex';
+}
+
+function sendTouch(action,cssX,cssY){
+  // CSS coords → normalized 0..1 within the spectrum+waterfall area
+  // Use CSS display size (not canvas pixel size) since touch is in CSS coords
+  const rect=canvas.getBoundingClientRect();
+  const W=rect.width, H=rect.height;
+  const btnH=48, hudH=30;
+  const specTop=hudH, specBot=H-btnH;
+  const nx=cssX/W, ny=(cssY-specTop)/(specBot-specTop);
+  // Send as fixed-point 0..10000
+  const b=new ArrayBuffer(7); const v=new DataView(b);
+  v.setUint8(0,0x20); v.setUint8(1,action);
+  v.setUint16(2, Math.max(0,Math.min(10000,(nx*10000)|0)), true);
+  v.setUint16(4, Math.max(0,Math.min(10000,(ny*10000)|0)), true);
+  sendCmd(b);
+}
+
+function sendButton(id){
+  const enc=new TextEncoder();
+  const name=enc.encode(id);
+  const b=new Uint8Array(1+name.length);
+  b[0]=0x30; b.set(name,1);
+  sendCmd(b.buffer);
+}
+
+// Touch on canvas (use offsetX/Y for canvas-relative coords)
+function canvasXY(e){const r=canvas.getBoundingClientRect();return[e.clientX-r.left,e.clientY-r.top]}
+canvas.addEventListener("touchstart",e=>{e.preventDefault();const [x,y]=canvasXY(e.touches[0]);sendTouch(0,x,y)});
+canvas.addEventListener("touchmove",e=>{e.preventDefault();const [x,y]=canvasXY(e.touches[0]);sendTouch(1,x,y)});
+canvas.addEventListener("touchend",e=>{e.preventDefault();sendTouch(2,0,0)});
+let md=false;
+canvas.addEventListener("mousedown",e=>{md=true;const [x,y]=canvasXY(e);sendTouch(0,x,y)});
+canvas.addEventListener("mousemove",e=>{if(md){const [x,y]=canvasXY(e);sendTouch(1,x,y)}});
+canvas.addEventListener("mouseup",()=>{md=false;sendTouch(2,0,0)});
+
+// Filter button active state update handled in onmessage
+</script>
+</body>
+</html>
