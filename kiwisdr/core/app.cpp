@@ -187,22 +187,15 @@ static void on_apf_change(ui::PropId, ui::Source) {
     // cat::setCwFilter(apf ? "50" : "250");
 }
 
-static void on_mode_change(ui::PropId, ui::Source src) {
+static void on_mode_change(ui::PropId, ui::Source) {
     int mode = ui::get_i32(ui::PROP_mode);
-    int offset = ui::get_i32(ui::PROP_cw_offset);
-    if (mode == 3 && offset > 0) {
-        dsp::setCwOffset((float)offset);
-        dsp::setModeKnown(true);
-        // CW mode: mute local playback (use QMX's own audio output)
-        ui::set_f32(ui::PROP_audio_gain, 0.1f, ui::FROM_DSP);  // mute in CW
-    } else if (mode > 0) {
+    dsp::setDemodMode(mode);
+    // CW (3): 600Hz sidetone via NCO. USB (2) / LSB (1): no NCO.
+    if (mode == 3) {
+        dsp::setCwOffset(600.0f);
+    } else {
         dsp::setCwOffset(0);
-        dsp::setModeKnown(true);
     }
-}
-
-static void on_cwofs_change(ui::PropId, ui::Source) {
-    on_mode_change(ui::PROP_mode, ui::FROM_RADIO);  // re-evaluate
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -214,15 +207,24 @@ static void fmt_span(char *buf, int len) {
     snprintf(buf, len, "%-9s", dsp::getSpanLabel());
 }
 
+static const char* local_mode_str() {
+    switch (ui::get_i32(ui::PROP_mode)) {
+        case 1: return "LSB";
+        case 2: return "USB";
+        case 3: return "CW";
+        default: return "---";
+    }
+}
+
 static void fmt_freq(char *buf, int len) {
     uint64_t vfo = ui::get_u64(ui::PROP_vfo_freq);
     if (vfo > 0) {
         int mhz = (int)(vfo / 1000000);
         int khz = (int)((vfo % 1000000) / 1000);
         int hz  = (int)(vfo % 1000);
-        snprintf(buf, len, "%-4s %d.%03d.%03d", cat::getModeStr(), mhz, khz, hz);
+        snprintf(buf, len, "%-4s %d.%03d.%03d", local_mode_str(), mhz, khz, hz);
     } else {
-        snprintf(buf, len, "%-4s ---.---.---", cat::getModeStr());
+        snprintf(buf, len, "%-4s ---.---.---", local_mode_str());
     }
     int blen = strlen(buf);
     while (blen < 24) buf[blen++] = ' ';
@@ -240,6 +242,15 @@ static ui::Band header_band, bottom_band, right_band;
 
 static void btn_span_press(ui::Button &) {
     bottom_band.setLayout("span_select");
+}
+
+static void btn_mode_press(ui::Button &) {
+    // Cycle: CW (3) → USB (2) → LSB (1) → CW
+    int mode = ui::get_i32(ui::PROP_mode);
+    if (mode == 3) mode = 2;       // CW → USB
+    else if (mode == 2) mode = 1;  // USB → LSB
+    else mode = 3;                 // LSB/unknown → CW
+    ui::set_i32(ui::PROP_mode, mode, ui::FROM_UI);
 }
 
 static void btn_filter_press(ui::Button &) {
@@ -296,7 +307,7 @@ static void btn_dr_back_press(ui::Button &) {
     right_band.setLayout("default");
 }
 
-static ui::Button btn_span, btn_filter, btn_zerobeat, btn_band, btn_dr;
+static ui::Button btn_span, btn_mode, btn_filter, btn_zerobeat, btn_band, btn_dr;
 static ui::Button btn_48k, btn_12k, btn_4k, btn_span_back;
 static ui::Button btn_40, btn_30, btn_20, btn_17, btn_15, btn_12, btn_10, btn_back;
 static ui::Button btn_dr_default, btn_dr_back;
@@ -406,14 +417,14 @@ void app::init()
     ui::set_f32(ui::PROP_audio_gain, 5.0f, ui::FROM_INIT);  // KiwiSDR: samples already normalized
     ui::set_f32(ui::PROP_db_floor, SPEC_DB_FLOOR, ui::FROM_INIT);
     ui::set_f32(ui::PROP_db_ceil, SPEC_DB_CEIL, ui::FROM_INIT);
-    ui::set_i32(ui::PROP_span_idx, 1, ui::FROM_INIT);
+    ui::set_i32(ui::PROP_span_idx, 0, ui::FROM_INIT);  // single span
+    ui::set_i32(ui::PROP_mode, 3, ui::FROM_INIT);      // default CW
 
     ui::on_change(ui::PROP_vfo_freq,    on_vfo_change);
     ui::on_change(ui::PROP_audio_gain,  on_gain_change);
     ui::on_change(ui::PROP_span_idx,    on_span_change);
     ui::on_change(ui::PROP_apf_enabled, on_apf_change);
     ui::on_change(ui::PROP_mode,        on_mode_change);
-    ui::on_change(ui::PROP_cw_offset,   on_cwofs_change);
 
     // --- DSP ---
     dsp::init(SAMPLE_RATE, FFT_SIZE);
@@ -453,6 +464,7 @@ void app::init()
 
     // Init buttons
     make_button(btn_span,     "Span",   COL_CYAN,   COL_DGREY, btn_span_press);
+    make_button(btn_mode,     "Mode",   COL_WHITE,  COL_DGREY, btn_mode_press);
     make_button(btn_filter,   "APF",    COL_YELLOW, COL_DGREY, btn_filter_press, ui::PROP_apf_enabled, true);
     make_button(btn_zerobeat, "ZeroBt", COL_GREEN,  COL_DGREY, btn_zerobeat_press);
     make_button(btn_band,     "Band",   COL_WHITE,  COL_DGREY, btn_band_press);
@@ -510,15 +522,17 @@ void app::init()
 
     // --- Layout: Bottom band ---
     int bot_y = log_h - BOTTOM_H;
-    int bw = log_w / 5;
+    int bw = log_w / 6;
 
-    btn_span.x = 0;       btn_span.y = bot_y;   btn_span.w = bw;   btn_span.h = BOTTOM_H;
-    btn_filter.x = bw;    btn_filter.y = bot_y;  btn_filter.w = bw; btn_filter.h = BOTTOM_H;
-    btn_zerobeat.x = 2*bw; btn_zerobeat.y = bot_y; btn_zerobeat.w = bw; btn_zerobeat.h = BOTTOM_H;
-    btn_band.x = 3*bw;    btn_band.y = bot_y;    btn_band.w = bw;   btn_band.h = BOTTOM_H;
-    btn_dr.x = 4*bw;      btn_dr.y = bot_y;      btn_dr.w = log_w - 4*bw; btn_dr.h = BOTTOM_H;
+    btn_span.x = 0;        btn_span.y = bot_y;     btn_span.w = bw;            btn_span.h = BOTTOM_H;
+    btn_mode.x = bw;       btn_mode.y = bot_y;     btn_mode.w = bw;            btn_mode.h = BOTTOM_H;
+    btn_filter.x = 2*bw;   btn_filter.y = bot_y;   btn_filter.w = bw;          btn_filter.h = BOTTOM_H;
+    btn_zerobeat.x = 3*bw; btn_zerobeat.y = bot_y; btn_zerobeat.w = bw;        btn_zerobeat.h = BOTTOM_H;
+    btn_band.x = 4*bw;     btn_band.y = bot_y;     btn_band.w = bw;            btn_band.h = BOTTOM_H;
+    btn_dr.x = 5*bw;       btn_dr.y = bot_y;       btn_dr.w = log_w - 5*bw;    btn_dr.h = BOTTOM_H;
 
     panel_bottom_default.add(&btn_span);
+    panel_bottom_default.add(&btn_mode);
     panel_bottom_default.add(&btn_filter);
     panel_bottom_default.add(&btn_zerobeat);
     panel_bottom_default.add(&btn_band);
@@ -600,7 +614,7 @@ void app::tick()
 
     // --- CAT → properties ---
     cat::poll();
-    ui::set_i32(ui::PROP_mode, cat::getMode(), ui::FROM_RADIO);
+    // Mode set locally (not from CAT) — don't override
     ui::set_u64(ui::PROP_vfo_freq, cat::getVfoFreq(), ui::FROM_RADIO);
     ui::set_i32(ui::PROP_cw_offset, cat::getCwOffset(), ui::FROM_RADIO);
 

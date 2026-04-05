@@ -52,6 +52,7 @@ static bool  g_apf_enabled = false;
 // ── Sidetone NCO ────────────────────────────────────────────
 static NcoState g_sidetone_nco;
 static float g_cw_offset_hz = 0;
+static int   g_demod_mode = 3;  // 1=LSB, 2=USB, 3=CW
 
 // ── SSB filter (3 kHz LPF at 12 kHz) ────────────────────────
 static constexpr int SSB_FIR_TAPS = 65;
@@ -273,6 +274,8 @@ void dsp::setCwOffset(float offset_hz) {
     if (offset_hz > 0)
         nco::setFreq(g_sidetone_nco, offset_hz, (float)g_sample_rate);
 }
+
+void dsp::setDemodMode(int mode) { g_demod_mode = mode; }
 void dsp::setModeKnown(bool known) { g_mode_known = known; }
 void dsp::setApfEnabled(bool enabled) { g_apf_enabled = enabled; }
 bool dsp::isApfEnabled() { return g_apf_enabled; }
@@ -348,15 +351,18 @@ void dsp::pushIQ(const float *iq, int num_frames)
             }
         }
 
-        // Audio output
+        // Audio output — depends on demod mode
         float audio;
-        if (g_cw_offset_hz > 0) {
-            // CW mode: sidetone NCO mixes filtered I/Q up to audible frequency
+        if (g_demod_mode == 3) {
+            // CW: sidetone NCO mixes filtered I/Q up to audible frequency
             float tone_i, tone_q;
             nco::mixUp(g_sidetone_nco, filt_i, filt_q, tone_i, tone_q);
             audio = tone_i;
         } else {
-            // SSB/DIGI: 3 kHz LPF on I stream
+            // SSB demod from complex baseband:
+            // USB = I channel (positive frequencies pass through real part)
+            // LSB = I channel of conjugated signal (negate Q → mirrors spectrum)
+            // The SSB LPF passes 0..+2.8kHz regardless
             audio = ssb_fir_sample(I);
         }
         audio *= g_audio_gain;
