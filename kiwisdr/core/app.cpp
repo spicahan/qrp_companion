@@ -29,7 +29,7 @@ static uint16_t COL_NAVY, COL_DGREY, COL_BLACK, COL_WHITE;
 static uint16_t COL_CYAN, COL_GREEN, COL_YELLOW, COL_RED;
 
 // DSP
-static constexpr int SAMPLE_RATE = 48000;
+static constexpr int SAMPLE_RATE = 12000;  // KiwiSDR I/Q rate
 static constexpr int FFT_SIZE    = 512;
 static int64_t last_dsp_time;
 
@@ -194,7 +194,7 @@ static void on_mode_change(ui::PropId, ui::Source src) {
         dsp::setCwOffset((float)offset);
         dsp::setModeKnown(true);
         // CW mode: mute local playback (use QMX's own audio output)
-        ui::set_f32(ui::PROP_audio_gain, 100.0f, ui::FROM_DSP);
+        ui::set_f32(ui::PROP_audio_gain, 0.1f, ui::FROM_DSP);  // mute in CW
     } else if (mode > 0) {
         dsp::setCwOffset(0);
         dsp::setModeKnown(true);
@@ -403,7 +403,7 @@ void app::init()
 
     // --- UI property system ---
     ui::init();
-    ui::set_f32(ui::PROP_audio_gain, 1000.0f, ui::FROM_INIT);
+    ui::set_f32(ui::PROP_audio_gain, 5.0f, ui::FROM_INIT);  // KiwiSDR: samples already normalized
     ui::set_f32(ui::PROP_db_floor, SPEC_DB_FLOOR, ui::FROM_INIT);
     ui::set_f32(ui::PROP_db_ceil, SPEC_DB_CEIL, ui::FROM_INIT);
     ui::set_i32(ui::PROP_span_idx, 1, ui::FROM_INIT);
@@ -475,7 +475,7 @@ void app::init()
     // Init sliders
     slider_gain.type = ui::W_SLIDER;
     slider_gain.bind = ui::PROP_audio_gain;
-    slider_gain.min_val = 100.0f; slider_gain.max_val = 10000.0f;
+    slider_gain.min_val = 0.1f; slider_gain.max_val = 50.0f;  // KiwiSDR range
     slider_gain.logarithmic = true; slider_gain.unit = "dB";
 
     slider_ceil.type = ui::W_SLIDER;
@@ -667,6 +667,9 @@ void app::tick()
             if (total_drag < TAP_THRESHOLD && drag_start_freq > 0) {
                 int delta_px = drag_start_x - spec_x - g_vfo_x;
                 int delta_hz = delta_px * dsp::getSpanRate() / spec_w;
+                printf("[tap] x=%d spec_x=%d vfo_x=%d delta_px=%d delta_hz=%d freq=%llu\n",
+                       drag_start_x, spec_x, g_vfo_x, delta_px, delta_hz,
+                       (unsigned long long)drag_start_freq);
                 uint64_t new_freq = ((int64_t)drag_start_freq + delta_hz) / 10 * 10;
                 if (new_freq > 0) {
                     ui::set_u64(ui::PROP_vfo_freq, new_freq, ui::FROM_UI);

@@ -59,7 +59,7 @@ static bool s_kiwi_got_rate = false;
 static pal::AudioInputCallback s_audio_cb = nullptr;
 
 // KiwiSDR I/Q ring buffer (int16 BE → float I/Q)
-static constexpr int KIWI_IQ_RING = 16384;
+static constexpr int KIWI_IQ_RING = 32768;  // ~2.7s at 12kHz
 static float s_iq_ring[KIWI_IQ_RING * 2]; // interleaved I/Q
 static std::atomic<int> s_iq_head{0};
 static std::atomic<int> s_iq_tail{0};
@@ -166,27 +166,73 @@ static void kiwi_connect(const char *host, int port) {
     s_kiwi_conn = mg_ws_connect(&s_kiwi_mgr, url, kiwi_ev_handler, nullptr, nullptr);
 }
 
-// Drain I/Q ring → push to DSP
+// Jitter buffer: drain I/Q ring at steady clock rate, absorbing TCP bursts
+static bool s_jitter_started = false;
+static int64_t s_drain_start_us = 0;
+static int64_t s_samples_drained = 0;
+static constexpr float PREBUFFER_SEC = 1.0f;  // buffer 1s before starting
+
+static int64_t now_us() {
+    auto t = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::microseconds>(t).count();
+}
+
 static void kiwi_drain_iq() {
     int head = s_iq_head.load();
     int tail = s_iq_tail.load();
-    if (head == tail) return;
-
-    // Compute available samples
     int avail = (head - tail + KIWI_IQ_RING) % KIWI_IQ_RING;
-    if (avail <= 0) return;
 
-    // Process in chunks
+    // Pre-buffer phase: wait until we have enough data
+    if (!s_jitter_started) {
+        int needed = (int)(s_kiwi_sample_rate * PREBUFFER_SEC);
+        if (avail < needed) return;
+        s_jitter_started = true;
+        s_drain_start_us = now_us();
+        s_samples_drained = 0;
+        printf("[kiwi] jitter buffer ready (%d samples buffered)\n", avail);
+    }
+
+    // Calculate how many samples should have been drained by now
+    int64_t elapsed_us = now_us() - s_drain_start_us;
+    int64_t target = (int64_t)(elapsed_us * (double)s_kiwi_sample_rate / 1000000.0);
+    int64_t to_drain = target - s_samples_drained;
+
+    if (to_drain <= 0) return;  // ahead of schedule, wait
+
+    static int64_t last_debug = 0;
+    int64_t now = now_us();
+    if (now - last_debug > 2000000) {  // every 2s
+        printf("[jitter] avail=%d target=%lld drained=%lld to_drain=%lld rate=%.1f\n",
+               avail, (long long)target, (long long)s_samples_drained,
+               (long long)to_drain, s_kiwi_sample_rate);
+        last_debug = now;
+    }
+
+    if (to_drain > avail) {
+        if (avail == 0) return;
+        printf("[jitter] UNDERRUN: need %lld have %d\n", (long long)to_drain, avail);
+        s_drain_start_us = now_us();
+        s_samples_drained = 0;
+        to_drain = avail > 512 ? 512 : avail;
+    } else if (to_drain > 1024) {
+        printf("[jitter] DRIFT: to_drain=%lld, resetting\n", (long long)to_drain);
+        s_drain_start_us = now_us() - (int64_t)(512 * 1000000.0 / s_kiwi_sample_rate);
+        s_samples_drained = 0;
+        to_drain = 512;
+    }
+
+    // Drain at the calculated steady rate
     float buf[1024];
-    while (avail > 0) {
-        int chunk = avail > 512 ? 512 : avail;
+    while (to_drain > 0) {
+        int chunk = to_drain > 512 ? 512 : (int)to_drain;
         for (int i = 0; i < chunk; i++) {
             buf[i * 2]     = s_iq_ring[tail * 2];
             buf[i * 2 + 1] = s_iq_ring[tail * 2 + 1];
             tail = (tail + 1) % KIWI_IQ_RING;
         }
         if (s_audio_cb) s_audio_cb(buf, chunk);
-        avail -= chunk;
+        to_drain -= chunk;
+        s_samples_drained += chunk;
     }
     s_iq_tail.store(tail);
 }
@@ -194,20 +240,7 @@ static void kiwi_drain_iq() {
 // Keepalive timer
 static int64_t s_last_keepalive = 0;
 
-static void kiwi_poll() {
-    mg_mgr_poll(&s_kiwi_mgr, 0);
-    kiwi_drain_iq();
-
-    // Keepalive every second
-    if (s_kiwi_conn && s_kiwi_streaming) {
-        auto now = std::chrono::steady_clock::now().time_since_epoch();
-        int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
-        if (ms - s_last_keepalive > 1000) {
-            kiwi_send(s_kiwi_conn, "SET keepalive");
-            s_last_keepalive = ms;
-        }
-    }
-}
+// kiwi_poll moved to background thread (kiwi_thread_func)
 
 // ── KiwiSDR frequency control ──
 static float s_kiwi_freq_khz = 14074.0f;
@@ -218,6 +251,24 @@ static void kiwi_set_freq(uint64_t freq_hz) {
         char cmd[128];
         snprintf(cmd, sizeof(cmd), "SET mod=iq low_cut=-5000 high_cut=5000 freq=%.3f", s_kiwi_freq_khz);
         kiwi_send(s_kiwi_conn, cmd);
+    }
+}
+
+// Background thread for continuous WebSocket I/O + audio feed
+static std::atomic<bool> s_kiwi_thread_running{false};
+
+static void kiwi_thread_func() {
+    while (s_kiwi_thread_running) {
+        mg_mgr_poll(&s_kiwi_mgr, 1);  // 1ms — tight polling for smooth data flow
+        kiwi_drain_iq();
+        if (s_kiwi_conn && s_kiwi_streaming) {
+            auto now = std::chrono::steady_clock::now().time_since_epoch();
+            int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+            if (ms - s_last_keepalive > 1000) {
+                kiwi_send(s_kiwi_conn, "SET keepalive");
+                s_last_keepalive = ms;
+            }
+        }
     }
 }
 
@@ -249,6 +300,10 @@ bool init(int width, int height, const char *kiwi_server) {
     mg_mgr_init(&s_kiwi_mgr);
     kiwi_connect(host.c_str(), port);
 
+    // Start background thread for WebSocket I/O + audio feed
+    s_kiwi_thread_running = true;
+    std::thread(kiwi_thread_func).detach();
+
     return true;
 }
 
@@ -260,7 +315,6 @@ int getFramebufferStride() { return fb_w; }
 bool isRotated() { return false; }
 void commitFrame() {
     if (g_widget) g_widget->commitUpdate();
-    kiwi_poll();
 }
 
 int getExtendedHeight() { return fb_h; }
@@ -315,12 +369,16 @@ static int pa_output_callback(const void *, void *output, unsigned long frameCou
     int upsample = (s_audio_out_rate > 0) ? (PA_OUT_RATE / s_audio_out_rate) : 4;
     int head = s_aout_head.load(std::memory_order_acquire);
     int tail = s_aout_tail.load(std::memory_order_relaxed);
+    static int underrun_count = 0;
+    static int callback_count = 0;
     for (unsigned long i = 0; i < frameCount; i++) {
         if (phase == 0) {
             prev_sample = cur_sample;
             if (head != tail) {
                 cur_sample = s_aout_ring[tail];
                 tail = (tail + 1) % AOUT_RING_SIZE;
+            } else {
+                underrun_count++;
             }
         }
         float t = (float)phase / (float)upsample;
@@ -328,6 +386,12 @@ static int pa_output_callback(const void *, void *output, unsigned long frameCou
         phase = (phase + 1) % upsample;
     }
     s_aout_tail.store(tail, std::memory_order_release);
+    callback_count++;
+    if (callback_count % 500 == 0) {  // ~every 2.7s at 48kHz/256
+        int fill = (s_aout_head.load() - tail + AOUT_RING_SIZE) % AOUT_RING_SIZE;
+        printf("[pa] ring_fill=%d underruns=%d upsample=%d\n", fill, underrun_count, upsample);
+        underrun_count = 0;
+    }
     return paContinue;
 }
 
