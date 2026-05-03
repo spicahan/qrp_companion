@@ -6,8 +6,15 @@
 
 static uint64_t s_vfo_freq = 0;
 static int      s_mode = 0;
-static int      s_cw_offset = 0;       // CW sidetone offset in Hz
-static bool     s_cw_offset_queried = false;
+static int      s_cw_offset = 0;       // most recent MMCW|CW OFFSET response
+
+// CW offset cache per filter — QMX changes the offset when the filter
+// changes if the previous center frequency isn't available in the new filter
+// (see QMX operation manual, "CW Filters" section, pages 30–33).
+// Probe both at startup and apply the matching value on APF toggle.
+static int      s_cw_offset_50 = 0;    // offset under 50Hz APF filter
+static int      s_cw_offset_250 = 0;   // offset under 250Hz CW filter
+static bool     s_apf_filter_active = false;  // true = 50Hz, false = 250Hz
 
 // RX accumulator
 static char s_rx_buf[128];
@@ -18,6 +25,16 @@ static int64_t s_last_poll = 0;
 static constexpr int64_t POLL_INTERVAL_US = 1000000; // 1 second
 static bool s_polling_suppressed = false;
 static bool s_iq_mode_sent = false;  // send Q91 once on first connected poll
+
+// Probe state machine — runs once when CW mode is first detected.
+// Phase progression (1 second per phase):
+//   0: send query for current (250Hz) offset
+//   1: capture 250Hz offset response, then idle
+//   2: switch to 50Hz filter
+//   3: query offset (will be 50Hz value)
+//   4: capture 50Hz offset response, then restore 250Hz filter
+//   5: probe complete — normal polling resumes
+static int s_probe_phase = 0;
 
 static void process_response(const char *resp, int len)
 {
@@ -57,10 +74,59 @@ void cat::init()
     s_vfo_freq = 0;
     s_mode = 0;
     s_cw_offset = 0;
-    s_cw_offset_queried = false;
+    s_cw_offset_50 = 0;
+    s_cw_offset_250 = 0;
+    s_apf_filter_active = false;
     s_rx_pos = 0;
     s_last_poll = 0;
     s_iq_mode_sent = false;
+    s_probe_phase = 0;
+}
+
+// Run one step of the CW offset probe (called from poll() at 1Hz).
+// Returns true if a command was sent.
+static bool run_probe_step()
+{
+    switch (s_probe_phase) {
+        case 0:
+            // Initial state: query current offset (passband=250 was set at init)
+            s_cw_offset = 0;
+            send_cmd("FA;MD;MMCW|CW OFFSET;");
+            s_probe_phase = 1;
+            return true;
+        case 1:
+            // Wait one cycle for response, then capture as 250Hz offset
+            if (s_cw_offset > 0) {
+                s_cw_offset_250 = s_cw_offset;
+                s_probe_phase = 2;
+            }
+            send_cmd("FA;MD;");
+            return true;
+        case 2:
+            // Switch to 50Hz filter
+            send_cmd("FA;MD;MMCW|CW passband=50;");
+            s_probe_phase = 3;
+            return true;
+        case 3:
+            // Query offset (now under 50Hz filter)
+            s_cw_offset = 0;
+            send_cmd("FA;MD;MMCW|CW OFFSET;");
+            s_probe_phase = 4;
+            return true;
+        case 4:
+            // Capture 50Hz offset, then restore default 250Hz filter
+            if (s_cw_offset > 0) {
+                s_cw_offset_50 = s_cw_offset;
+            }
+            send_cmd("FA;MD;MMCW|CW passband=250;");
+            // After restoring filter, snap s_cw_offset back to 250Hz value
+            // so any code reading s_cw_offset directly stays consistent.
+            s_cw_offset = s_cw_offset_250;
+            s_probe_phase = 5;
+            return true;
+        default:
+            return false;  // probe done
+    }
 }
 
 void cat::poll()
@@ -76,11 +142,12 @@ void cat::poll()
                 send_cmd("Q91;MMCW|CW passband=250;");
                 s_iq_mode_sent = true;
             }
-            // Query CW offset once when mode is CW and offset is unknown
-            if (s_mode == 3 && s_cw_offset == 0 && !s_cw_offset_queried) {
-                send_cmd("FA;MD;MMCW|CW OFFSET;");
-                s_cw_offset_queried = true;
-            } else {
+            // Run probe state machine when CW mode detected
+            else if (s_mode == 3 && s_probe_phase < 5) {
+                run_probe_step();
+            }
+            // Normal polling
+            else {
                 send_cmd("FA;MD;");
             }
         }
@@ -106,7 +173,15 @@ void cat::poll()
 
 uint64_t cat::getVfoFreq() { return s_vfo_freq; }
 int      cat::getMode()    { return s_mode; }
-int      cat::getCwOffset(){ return s_cw_offset; }
+
+// Returns the CW offset matching the currently active filter.
+// Falls back to the last MMCW|CW OFFSET response if probe hasn't completed.
+int cat::getCwOffset()
+{
+    if (s_apf_filter_active && s_cw_offset_50 > 0) return s_cw_offset_50;
+    if (!s_apf_filter_active && s_cw_offset_250 > 0) return s_cw_offset_250;
+    return s_cw_offset;
+}
 
 const char* cat::getModeStr()
 {
@@ -126,6 +201,8 @@ void cat::setCwFilter(const char *bandwidth)
     char cmd[40];
     snprintf(cmd, sizeof(cmd), "MMCW|CW passband=%s;", bandwidth);
     send_cmd(cmd);
+    // Track which filter is now active so getCwOffset() returns the right cached value
+    s_apf_filter_active = (strcmp(bandwidth, "50") == 0);
 }
 
 void cat::setVfoFreq(uint64_t freq_hz)
