@@ -4,17 +4,22 @@
 #include <cstdlib>
 #include <cstdio>
 
+// Force a deterministic QMX CW filter configuration so APF toggling
+// (50Hz↔250Hz) never shifts the CW offset:
+//   - Choose filters: enable only 50Hz and 250Hz (disable the rest)
+//   - CW center: 625 Hz (the lowest center common to both 50Hz and 250Hz
+//     filter lists — switching passband preserves the center)
+//   - CW offset: 625 Hz (matches center; explicit in case Auto-offset/tone
+//     is disabled on the user's QMX)
+//   - CW passband: 250 Hz (default, APF off)
+// 50Hz centers : {625, 675, 725, 775, 825}
+// 250Hz centers: {525, 575, 625, 675, 725, 775, 825, 875, 925}
+// Note: MM set commands persist in EEPROM; this overwrites the user's
+// CW filter configuration. Q* commands are volatile (Q91 for I/Q mode).
+static constexpr int CW_OFFSET_HZ = 625;
+
 static uint64_t s_vfo_freq = 0;
 static int      s_mode = 0;
-static int      s_cw_offset = 0;       // most recent MMCW|CW OFFSET response
-
-// CW offset cache per filter — QMX changes the offset when the filter
-// changes if the previous center frequency isn't available in the new filter
-// (see QMX operation manual, "CW Filters" section, pages 30–33).
-// Probe both at startup and apply the matching value on APF toggle.
-static int      s_cw_offset_50 = 0;    // offset under 50Hz APF filter
-static int      s_cw_offset_250 = 0;   // offset under 250Hz CW filter
-static bool     s_apf_filter_active = false;  // true = 50Hz, false = 250Hz
 
 // RX accumulator
 static char s_rx_buf[128];
@@ -24,17 +29,14 @@ static int  s_rx_pos = 0;
 static int64_t s_last_poll = 0;
 static constexpr int64_t POLL_INTERVAL_US = 1000000; // 1 second
 static bool s_polling_suppressed = false;
-static bool s_iq_mode_sent = false;  // send Q91 once on first connected poll
 
-// Probe state machine — runs once when CW mode is first detected.
-// Phase progression (1 second per phase):
-//   0: send query for current (250Hz) offset
-//   1: capture 250Hz offset response, then idle
-//   2: switch to 50Hz filter
-//   3: query offset (will be 50Hz value)
-//   4: capture 50Hz offset response, then restore 250Hz filter
-//   5: probe complete — normal polling resumes
-static int s_probe_phase = 0;
+// Setup state machine. The setup is split across multiple poll cycles
+// to avoid overflowing the QMX serial input buffer with one huge chain.
+//   0: send Q91 + ensure 50/250 enabled (so subsequent passband=250 is valid)
+//   1: send passband=250 + center=625 + offset=625
+//   2: disable the other filters
+//   3: done — normal polling
+static int s_setup_phase = 0;
 
 static void process_response(const char *resp, int len)
 {
@@ -52,15 +54,8 @@ static void process_response(const char *resp, int len)
         int mode = resp[2] - '0';
         if (mode >= 1 && mode <= 9) s_mode = mode;
     }
-    // MM response: "MM650" (CW offset, always 3 digits)
-    else if (len >= 5 && resp[0] == 'M' && resp[1] == 'M') {
-        int offset = 0;
-        for (int i = 2; i < len; i++) {
-            if (resp[i] >= '0' && resp[i] <= '9')
-                offset = offset * 10 + (resp[i] - '0');
-        }
-        if (offset > 0) s_cw_offset = offset;
-    }
+    // MM responses are not parsed — CW offset is forced to a known value
+    // by our setup commands, so we don't need to query it back.
 }
 
 static void send_cmd(const char *cmd)
@@ -73,60 +68,9 @@ void cat::init()
 {
     s_vfo_freq = 0;
     s_mode = 0;
-    s_cw_offset = 0;
-    s_cw_offset_50 = 0;
-    s_cw_offset_250 = 0;
-    s_apf_filter_active = false;
     s_rx_pos = 0;
     s_last_poll = 0;
-    s_iq_mode_sent = false;
-    s_probe_phase = 0;
-}
-
-// Run one step of the CW offset probe (called from poll() at 1Hz).
-// Returns true if a command was sent.
-static bool run_probe_step()
-{
-    switch (s_probe_phase) {
-        case 0:
-            // Initial state: query current offset (passband=250 was set at init)
-            s_cw_offset = 0;
-            send_cmd("FA;MD;MMCW|CW OFFSET;");
-            s_probe_phase = 1;
-            return true;
-        case 1:
-            // Wait one cycle for response, then capture as 250Hz offset
-            if (s_cw_offset > 0) {
-                s_cw_offset_250 = s_cw_offset;
-                s_probe_phase = 2;
-            }
-            send_cmd("FA;MD;");
-            return true;
-        case 2:
-            // Switch to 50Hz filter
-            send_cmd("FA;MD;MMCW|CW passband=50;");
-            s_probe_phase = 3;
-            return true;
-        case 3:
-            // Query offset (now under 50Hz filter)
-            s_cw_offset = 0;
-            send_cmd("FA;MD;MMCW|CW OFFSET;");
-            s_probe_phase = 4;
-            return true;
-        case 4:
-            // Capture 50Hz offset, then restore default 250Hz filter
-            if (s_cw_offset > 0) {
-                s_cw_offset_50 = s_cw_offset;
-            }
-            send_cmd("FA;MD;MMCW|CW passband=250;");
-            // After restoring filter, snap s_cw_offset back to 250Hz value
-            // so any code reading s_cw_offset directly stays consistent.
-            s_cw_offset = s_cw_offset_250;
-            s_probe_phase = 5;
-            return true;
-        default:
-            return false;  // probe done
-    }
+    s_setup_phase = 0;
 }
 
 void cat::poll()
@@ -137,18 +81,45 @@ void cat::poll()
     if (!s_polling_suppressed && now - s_last_poll >= POLL_INTERVAL_US) {
         s_last_poll = now;
         if (pal::catIsConnected()) {
-            // Enable I/Q mode + set CW filter once on first connected poll
-            if (!s_iq_mode_sent) {
-                send_cmd("Q91;MMCW|CW passband=250;");
-                s_iq_mode_sent = true;
-            }
-            // Run probe state machine when CW mode detected
-            else if (s_mode == 3 && s_probe_phase < 5) {
-                run_probe_step();
-            }
-            // Normal polling
-            else {
-                send_cmd("FA;MD;");
+            switch (s_setup_phase) {
+                case 0:
+                    // Enable I/Q + ensure both 50Hz and 250Hz filters are
+                    // enabled BEFORE selecting passband=250 (so the selection
+                    // is guaranteed to land on an enabled filter).
+                    send_cmd(
+                        "Q91;"
+                        "MMCW|Choose filters|0=ENABLED;"   // 50 Hz
+                        "MMCW|Choose filters|4=ENABLED;"   // 250 Hz
+                    );
+                    s_setup_phase = 1;
+                    break;
+                case 1:
+                    // Now set passband, center, and offset to a deterministic
+                    // configuration. Order matters: passband first because
+                    // changing passband may auto-snap the center.
+                    send_cmd(
+                        "MMCW|CW passband=250;"
+                        "MMCW|CW center=625;"
+                        "MMCW|CW offset=625;"
+                    );
+                    s_setup_phase = 2;
+                    break;
+                case 2:
+                    // Now safe to disable other filters (we're already on 250).
+                    send_cmd(
+                        "MMCW|Choose filters|1=DISABLED;"  // 100
+                        "MMCW|Choose filters|2=DISABLED;"  // 150
+                        "MMCW|Choose filters|3=DISABLED;"  // 200
+                        "MMCW|Choose filters|5=DISABLED;"  // 300
+                        "MMCW|Choose filters|6=DISABLED;"  // 400
+                        "MMCW|Choose filters|7=DISABLED;"  // 500
+                    );
+                    s_setup_phase = 3;
+                    printf("[cat] QMX configured: 50/250 only, center=625, offset=625\n");
+                    break;
+                default:
+                    send_cmd("FA;MD;");
+                    break;
             }
         }
     }
@@ -174,13 +145,10 @@ void cat::poll()
 uint64_t cat::getVfoFreq() { return s_vfo_freq; }
 int      cat::getMode()    { return s_mode; }
 
-// Returns the CW offset matching the currently active filter.
-// Falls back to the last MMCW|CW OFFSET response if probe hasn't completed.
+// CW offset is forced by setup; always return 625 Hz in CW mode.
 int cat::getCwOffset()
 {
-    if (s_apf_filter_active && s_cw_offset_50 > 0) return s_cw_offset_50;
-    if (!s_apf_filter_active && s_cw_offset_250 > 0) return s_cw_offset_250;
-    return s_cw_offset;
+    return (s_mode == 3) ? CW_OFFSET_HZ : 0;
 }
 
 const char* cat::getModeStr()
@@ -201,8 +169,8 @@ void cat::setCwFilter(const char *bandwidth)
     char cmd[40];
     snprintf(cmd, sizeof(cmd), "MMCW|CW passband=%s;", bandwidth);
     send_cmd(cmd);
-    // Track which filter is now active so getCwOffset() returns the right cached value
-    s_apf_filter_active = (strcmp(bandwidth, "50") == 0);
+    // No need to update an offset cache — the QMX is configured so that
+    // the center stays 625 Hz across both 50/250 filter selections.
 }
 
 void cat::setVfoFreq(uint64_t freq_hz)
@@ -212,6 +180,5 @@ void cat::setVfoFreq(uint64_t freq_hz)
     snprintf(cmd, sizeof(cmd), "FA%011llu;", (unsigned long long)freq_hz);
     send_cmd(cmd);
     s_vfo_freq = freq_hz;  // optimistic update
-    // Reset poll timer to give QMX time to process before next poll
     s_last_poll = pal::micros();
 }
