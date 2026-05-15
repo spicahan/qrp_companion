@@ -181,6 +181,26 @@ bool pollEvent(TouchEvent &evt)
 
 void injectEvent(const TouchEvent &evt) { evt_push(evt); }
 
+// Battery (M5Unified Tab5: INA226 bus voltage → 2S Li-Po SoC, CHG_STAT pin)
+static int  s_battery_level = -1;
+static bool s_battery_charging = false;
+
+void pollBattery()
+{
+    int32_t lvl = M5.Power.getBatteryLevel();
+    s_battery_level = (lvl < 0) ? -1 : (int)lvl;
+    // Charging detection: use battery current sign rather than CHG_STAT pin.
+    // The charger IC's STAT line can linger HIGH for a moment after unplug,
+    // but the INA226 shunt current immediately reflects actual power flow.
+    // Tab5 INA226 polarity: negative when charging, positive when discharging
+    // (opposite of the M5Unified docstring; verified empirically).
+    int32_t i_ma = M5.Power.getBatteryCurrent();
+    s_battery_charging = (i_ma < -30);  // 30 mA threshold ignores topping-up noise
+}
+
+int  getBatteryLevel() { return s_battery_level; }
+bool isCharging()      { return s_battery_charging; }
+
 int64_t micros() { return esp_timer_get_time(); }
 void delayMs(int ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
 int freeHeapKb() { return (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024); }

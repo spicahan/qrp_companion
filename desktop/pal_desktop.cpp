@@ -142,6 +142,11 @@ void injectEvent(const TouchEvent &evt)
     evt_queue.push(evt);
 }
 
+// Battery — desktop stub (no battery hardware to query)
+void pollBattery() {}
+int  getBatteryLevel() { return -1; }
+bool isCharging() { return false; }
+
 int64_t micros()
 {
     auto now = std::chrono::steady_clock::now();

@@ -25,10 +25,8 @@ static int      s_mode = 0;
 static char s_rx_buf[128];
 static int  s_rx_pos = 0;
 
-// Polling timer
-static int64_t s_last_poll = 0;
-static constexpr int64_t POLL_INTERVAL_US = 1000000; // 1 second
 static bool s_polling_suppressed = false;
+static int  s_skip_ticks = 0;  // delay next tick1Hz (set by setVfoFreq)
 
 // Setup state machine. The setup is split across multiple poll cycles
 // to avoid overflowing the QMX serial input buffer with one huge chain.
@@ -69,76 +67,76 @@ void cat::init()
     s_vfo_freq = 0;
     s_mode = 0;
     s_rx_pos = 0;
-    s_last_poll = 0;
     s_setup_phase = 0;
+    s_skip_ticks = 0;
 }
 
+// Drain any pending RX bytes — called every frame from app::tick.
 void cat::poll()
 {
-    int64_t now = pal::micros();
-
-    // Periodic polling (suppressed during drag-to-tune)
-    if (!s_polling_suppressed && now - s_last_poll >= POLL_INTERVAL_US) {
-        s_last_poll = now;
-        if (pal::catIsConnected()) {
-            switch (s_setup_phase) {
-                case 0:
-                    // Enable I/Q + ensure both 50Hz and 250Hz filters are
-                    // enabled BEFORE selecting passband=250 (so the selection
-                    // is guaranteed to land on an enabled filter).
-                    send_cmd(
-                        "Q91;"
-                        "MMCW|Choose filters|0=ENABLED;"   // 50 Hz
-                        "MMCW|Choose filters|4=ENABLED;"   // 250 Hz
-                    );
-                    s_setup_phase = 1;
-                    break;
-                case 1:
-                    // Now set passband, center, and offset to a deterministic
-                    // configuration. Order matters: passband first because
-                    // changing passband may auto-snap the center.
-                    send_cmd(
-                        "MMCW|CW passband=250;"
-                        "MMCW|CW center=625;"
-                        "MMCW|CW offset=625;"
-                    );
-                    s_setup_phase = 2;
-                    break;
-                case 2:
-                    // Now safe to disable other filters (we're already on 250).
-                    send_cmd(
-                        "MMCW|Choose filters|1=DISABLED;"  // 100
-                        "MMCW|Choose filters|2=DISABLED;"  // 150
-                        "MMCW|Choose filters|3=DISABLED;"  // 200
-                        "MMCW|Choose filters|5=DISABLED;"  // 300
-                        "MMCW|Choose filters|6=DISABLED;"  // 400
-                        "MMCW|Choose filters|7=DISABLED;"  // 500
-                    );
-                    s_setup_phase = 3;
-                    printf("[cat] QMX configured: 50/250 only, center=625, offset=625\n");
-                    break;
-                default:
-                    send_cmd("FA;MD;");
-                    break;
-            }
-        }
-    }
-
-    // Read and parse any available responses
     char tmp[64];
     int n = pal::catRecv(tmp, sizeof(tmp));
-    if (n > 0) {
-        for (int i = 0; i < n; i++) {
-            char c = tmp[i];
-            if (c == ';') {
-                s_rx_buf[s_rx_pos] = '\0';
-                if (s_rx_pos > 0)
-                    process_response(s_rx_buf, s_rx_pos);
-                s_rx_pos = 0;
-            } else if (s_rx_pos < (int)sizeof(s_rx_buf) - 2) {
-                s_rx_buf[s_rx_pos++] = c;
-            }
+    if (n <= 0) return;
+    for (int i = 0; i < n; i++) {
+        char c = tmp[i];
+        if (c == ';') {
+            s_rx_buf[s_rx_pos] = '\0';
+            if (s_rx_pos > 0)
+                process_response(s_rx_buf, s_rx_pos);
+            s_rx_pos = 0;
+        } else if (s_rx_pos < (int)sizeof(s_rx_buf) - 2) {
+            s_rx_buf[s_rx_pos++] = c;
         }
+    }
+}
+
+// Periodic CAT command sends — called once per second from app::tick.
+// Honors suppressPolling() (set during drag-to-tune) and a short
+// post-setVfoFreq cooldown to avoid racing FA-set with FA-query.
+void cat::tick1Hz()
+{
+    if (s_polling_suppressed || !pal::catIsConnected()) return;
+    if (s_skip_ticks > 0) { s_skip_ticks--; return; }
+
+    switch (s_setup_phase) {
+        case 0:
+            // Enable I/Q + ensure both 50Hz and 250Hz filters are
+            // enabled BEFORE selecting passband=250 (so the selection
+            // is guaranteed to land on an enabled filter).
+            send_cmd(
+                "Q91;"
+                "MMCW|Choose filters|0=ENABLED;"   // 50 Hz
+                "MMCW|Choose filters|4=ENABLED;"   // 250 Hz
+            );
+            s_setup_phase = 1;
+            break;
+        case 1:
+            // Now set passband, center, and offset to a deterministic
+            // configuration. Order matters: passband first because
+            // changing passband may auto-snap the center.
+            send_cmd(
+                "MMCW|CW passband=250;"
+                "MMCW|CW center=625;"
+                "MMCW|CW offset=625;"
+            );
+            s_setup_phase = 2;
+            break;
+        case 2:
+            // Now safe to disable other filters (we're already on 250).
+            send_cmd(
+                "MMCW|Choose filters|1=DISABLED;"  // 100
+                "MMCW|Choose filters|2=DISABLED;"  // 150
+                "MMCW|Choose filters|3=DISABLED;"  // 200
+                "MMCW|Choose filters|5=DISABLED;"  // 300
+                "MMCW|Choose filters|6=DISABLED;"  // 400
+                "MMCW|Choose filters|7=DISABLED;"  // 500
+            );
+            s_setup_phase = 3;
+            printf("[cat] QMX configured: 50/250 only, center=625, offset=625\n");
+            break;
+        default:
+            send_cmd("FA;MD;");
+            break;
     }
 }
 
@@ -180,5 +178,5 @@ void cat::setVfoFreq(uint64_t freq_hz)
     snprintf(cmd, sizeof(cmd), "FA%011llu;", (unsigned long long)freq_hz);
     send_cmd(cmd);
     s_vfo_freq = freq_hz;  // optimistic update
-    s_last_poll = pal::micros();
+    s_skip_ticks = 1;      // give QMX time to apply before next FA query
 }

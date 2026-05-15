@@ -4,7 +4,8 @@
 namespace cat {
 
 void init();
-void poll();           // Called from app::tick — handles send/receive timing
+void poll();           // RX accumulation. Call every frame from app::tick.
+void tick1Hz();        // Periodic CAT command sends. Call once per second.
 
 uint64_t getVfoFreq(); // Current VFO frequency in Hz, 0 if unknown
 int      getMode();    // 1=LSB 2=USB 3=CW 6=DIGI, 0=unknown

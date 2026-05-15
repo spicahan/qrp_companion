@@ -234,7 +234,16 @@ static void fmt_fps(char *buf, int len) {
     snprintf(buf, len, "%4.0fFPS", ui::get_f32(ui::PROP_fps));
 }
 
-static ui::Label lbl_span, lbl_freq, lbl_fps;
+static void fmt_battery(char *buf, int len) {
+    int level = pal::getBatteryLevel();
+    if (level < 0) {
+        snprintf(buf, len, "BAT --%% ");
+    } else {
+        snprintf(buf, len, "BAT %3d%%%c", level, pal::isCharging() ? '+' : ' ');
+    }
+}
+
+static ui::Label lbl_span, lbl_freq, lbl_fps, lbl_battery;
 
 // --- Bands (declared before handlers so all handlers can reference them) ---
 static ui::Band header_band, bottom_band, right_band;
@@ -440,14 +449,16 @@ void app::init()
     };
 
     int hdr_ty = (HEADER_H - 16) / 2;  // center scale-2 text (16px) in header
-    make_label(lbl_span,  8, hdr_ty, fmt_span, COL_CYAN, COL_NAVY, 2, 9);
-    make_label(lbl_fps,   log_w - 200, hdr_ty, fmt_fps, COL_GREEN, COL_NAVY, 2, 12);
+    make_label(lbl_span,    8,           hdr_ty, fmt_span,    COL_CYAN,  COL_NAVY, 2, 9);
+    make_label(lbl_battery, log_w - 360, hdr_ty, fmt_battery, COL_GREEN, COL_NAVY, 2, 9);
+    make_label(lbl_fps,     log_w - 200, hdr_ty, fmt_fps,     COL_GREEN, COL_NAVY, 2, 12);
 
     int freq_tw = draw::textWidth("CW  14.070.02+3.0       ", 2);
     make_label(lbl_freq, (log_w - freq_tw) / 2, hdr_ty, fmt_freq, COL_GREEN, COL_NAVY, 2, 24);
 
     panel_header.add(&lbl_span);
     panel_header.add(&lbl_freq);
+    panel_header.add(&lbl_battery);
     panel_header.add(&lbl_fps);
     header_band.x = 0; header_band.y = 0; header_band.w = log_w; header_band.h = HEADER_H;
     header_band.addPanel(&panel_header);
@@ -600,7 +611,16 @@ void app::tick()
     }
 
     // --- CAT → properties ---
-    cat::poll();
+    cat::poll();  // RX every frame
+
+    // 1Hz slow tick — periodic CAT commands and battery readout
+    static int64_t last_slow_tick = 0;
+    if (t0 - last_slow_tick >= 1000000) {
+        last_slow_tick = t0;
+        cat::tick1Hz();
+        pal::pollBattery();
+    }
+
     ui::set_i32(ui::PROP_mode, cat::getMode(), ui::FROM_RADIO);
     ui::set_u64(ui::PROP_vfo_freq, cat::getVfoFreq(), ui::FROM_RADIO);
     ui::set_i32(ui::PROP_cw_offset, cat::getCwOffset(), ui::FROM_RADIO);

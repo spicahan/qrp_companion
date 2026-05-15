@@ -37,6 +37,13 @@ void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
 bool pollEvent(TouchEvent &evt);
 void injectEvent(const TouchEvent &evt);  // push event from web UI
 
+// Battery / power. pollBattery() refreshes cached values from hardware
+// (call once per second from app::tick — I2C reads aren't free).
+// Getters return cached values cheaply; safe to call every frame.
+void pollBattery();
+int  getBatteryLevel();    // 0-100, or -1 if unknown / unsupported
+bool isCharging();
+
 // Timing
 int64_t micros();
 void    delayMs(int ms);
