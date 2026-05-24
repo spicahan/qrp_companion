@@ -273,6 +273,7 @@ void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
 
 // Audio output via M5.Speaker
 static int s_audio_out_rate = 0;
+static bool s_audio_muted = false;
 
 bool audioOutputOpen(int sample_rate)
 {
@@ -302,7 +303,7 @@ void audioOutputWrite(const float *samples, int num_frames)
         int chunk = remaining > SPKR_BUF_SIZE ? SPKR_BUF_SIZE : remaining;
         int16_t *buf = s_spkr_bufs[s_spkr_buf_idx];
         for (int i = 0; i < chunk; i++) {
-            float s = p[i];
+            float s = s_audio_muted ? 0.0f : p[i];
             if (s > 1.0f) s = 1.0f;
             if (s < -1.0f) s = -1.0f;
             buf[i] = (int16_t)(s * 32767.0f);
@@ -313,6 +314,9 @@ void audioOutputWrite(const float *samples, int num_frames)
         remaining -= chunk;
     }
 }
+
+void audioSetMuted(bool muted) { s_audio_muted = muted; }
+bool audioIsMuted() { return s_audio_muted; }
 
 void audioOutputClose()
 {
