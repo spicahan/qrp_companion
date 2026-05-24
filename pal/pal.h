@@ -61,6 +61,8 @@ void audioInputClose();
 // Audio output (mono, 24-bit quality, configurable sample rate)
 bool audioOutputOpen(int sample_rate);
 void audioOutputWrite(const float *samples, int num_frames); // mono float [-1,1]
+void audioSetMuted(bool muted);
+bool audioIsMuted();
 void audioOutputClose();
 
 } // namespace pal

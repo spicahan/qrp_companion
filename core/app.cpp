@@ -56,6 +56,8 @@ static uint64_t drag_start_freq;
 static int   drag_current_x;
 static bool  drag_vfo_dirty = false;
 
+static void update_mute_button_label();
+
 
 
 // ═══════════════════════════════════════════════════════════════
@@ -175,6 +177,11 @@ static void on_vfo_change(ui::PropId, ui::Source src) {
 
 static void on_gain_change(ui::PropId, ui::Source) {
     dsp::setAudioGain(ui::get_f32(ui::PROP_audio_gain));
+}
+
+static void on_audio_mute_change(ui::PropId, ui::Source) {
+    pal::audioSetMuted(ui::get_bool(ui::PROP_audio_muted));
+    update_mute_button_label();
 }
 
 static void on_span_change(ui::PropId, ui::Source) {
@@ -297,7 +304,11 @@ static void btn_dr_back_press(ui::Button &) {
     right_band.setLayout("default");
 }
 
-static ui::Button btn_span, btn_filter, btn_zerobeat, btn_band, btn_dr;
+static void btn_mute_press(ui::Button &) {
+    ui::set_bool(ui::PROP_audio_muted, !ui::get_bool(ui::PROP_audio_muted));
+}
+
+static ui::Button btn_span, btn_filter, btn_zerobeat, btn_band, btn_dr, btn_mute;
 static ui::Button btn_48k, btn_12k, btn_4k, btn_span_back;
 static ui::Button btn_40, btn_30, btn_20, btn_17, btn_15, btn_12, btn_10, btn_back;
 static ui::Button btn_dr_default, btn_dr_back;
@@ -314,6 +325,11 @@ static ui::Panel panel_right_default  = { "default" };
 static ui::Panel panel_right_dr       = { "dr_sliders" };
 
 static ui::Panel panel_header = { "default" };
+
+static void update_mute_button_label()
+{
+    btn_mute.label = pal::audioIsMuted() ? "Audio Muted" : "Mute Audio";
+}
 
 // ═══════════════════════════════════════════════════════════════
 // Web UI callbacks
@@ -411,6 +427,7 @@ void app::init()
 
     ui::on_change(ui::PROP_vfo_freq,    on_vfo_change);
     ui::on_change(ui::PROP_audio_gain,  on_gain_change);
+    ui::on_change(ui::PROP_audio_muted, on_audio_mute_change);
     ui::on_change(ui::PROP_span_idx,    on_span_change);
     ui::on_change(ui::PROP_apf_enabled, on_apf_change);
     ui::on_change(ui::PROP_mode,        on_mode_change);
@@ -470,8 +487,10 @@ void app::init()
     make_button(btn_10,  "10",   COL_WHITE, COL_NAVY, btn_10_press);
     make_button(btn_back,"Back", COL_RED,   COL_DGREY, btn_back_press);
     make_button(btn_dr,  "DR",   COL_WHITE, COL_DGREY, btn_dr_press);
+    make_button(btn_mute, "Mute Audio", COL_WHITE, COL_DGREY, btn_mute_press, ui::PROP_audio_muted, true);
     make_button(btn_dr_default, "Default", COL_CYAN, COL_DGREY, btn_dr_default_press);
     make_button(btn_dr_back,    "Back",    COL_RED,  COL_DGREY, btn_dr_back_press);
+    update_mute_button_label();
 
     // Init sliders
     slider_gain.type = ui::W_SLIDER;
@@ -511,19 +530,21 @@ void app::init()
 
     // --- Layout: Bottom band ---
     int bot_y = log_h - BOTTOM_H;
-    int bw = log_w / 5;
+    int bw = log_w / 6;
 
     btn_span.x = 0;       btn_span.y = bot_y;   btn_span.w = bw;   btn_span.h = BOTTOM_H;
     btn_filter.x = bw;    btn_filter.y = bot_y;  btn_filter.w = bw; btn_filter.h = BOTTOM_H;
     btn_zerobeat.x = 2*bw; btn_zerobeat.y = bot_y; btn_zerobeat.w = bw; btn_zerobeat.h = BOTTOM_H;
     btn_band.x = 3*bw;    btn_band.y = bot_y;    btn_band.w = bw;   btn_band.h = BOTTOM_H;
-    btn_dr.x = 4*bw;      btn_dr.y = bot_y;      btn_dr.w = log_w - 4*bw; btn_dr.h = BOTTOM_H;
+    btn_dr.x = 4*bw;      btn_dr.y = bot_y;      btn_dr.w = bw;     btn_dr.h = BOTTOM_H;
+    btn_mute.x = 5*bw;    btn_mute.y = bot_y;    btn_mute.w = log_w - 5*bw; btn_mute.h = BOTTOM_H;
 
     panel_bottom_default.add(&btn_span);
     panel_bottom_default.add(&btn_filter);
     panel_bottom_default.add(&btn_zerobeat);
     panel_bottom_default.add(&btn_band);
     panel_bottom_default.add(&btn_dr);
+    panel_bottom_default.add(&btn_mute);
 
     // Span select panel (4 buttons)
     int sbw = log_w / 4;

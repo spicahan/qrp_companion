@@ -277,6 +277,7 @@ void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
 // --- Audio output via PortAudio ---
 static PaStream *s_pa_out_stream = nullptr;
 static int s_audio_out_rate = 0;
+static bool s_audio_muted = false;
 static constexpr int PA_OUT_RATE = 48000;
 
 // Ring buffer for audio output (6kHz input → 48kHz PortAudio output)
@@ -389,11 +390,14 @@ void audioOutputWrite(const float *samples, int num_frames)
         int next = (head + 1) % AOUT_RING_SIZE;
         if (next == s_aout_tail.load(std::memory_order_acquire))
             break;
-        s_aout_ring[head] = samples[i];
+        s_aout_ring[head] = s_audio_muted ? 0.0f : samples[i];
         head = next;
     }
     s_aout_head.store(head, std::memory_order_release);
 }
+
+void audioSetMuted(bool muted) { s_audio_muted = muted; }
+bool audioIsMuted() { return s_audio_muted; }
 
 void audioOutputClose()
 {
