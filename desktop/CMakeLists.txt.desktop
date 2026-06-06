@@ -24,12 +24,8 @@ add_executable(qrp_companion_desktop
     ../core/nco.cpp
     ../core/ui_state.cpp
     ../core/ui_widget.cpp
-    ../core/web.cpp
-    ../core/mongoose/mongoose.c
     fft_shim/fft.cpp
 )
-
-target_compile_definitions(qrp_companion_desktop PRIVATE MG_ENABLE_LOG=0)
 
 target_include_directories(qrp_companion_desktop PRIVATE
     ../pal

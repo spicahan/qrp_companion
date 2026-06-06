@@ -3,7 +3,6 @@
 #include "draw.h"
 #include "dsp.h"
 #include "cat.h"
-#include "web.h"
 #include "ui_state.h"
 #include "ui_widget.h"
 #include <cstdio>
@@ -341,51 +340,6 @@ static void update_mute_button_label()
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Web UI callbacks
-// ═══════════════════════════════════════════════════════════════
-static void web_touch_cb(int action, int nx, int ny, int, int)
-{
-    // nx, ny: 0-10000 normalized within spectrum+waterfall area
-    int mapped_x = spec_x + nx * spec_w / 10000;
-    int mapped_y = spec_y + ny * (SPEC_H + GAP + wf_h) / 10000;
-
-    pal::TouchEvent evt;
-    evt.x = mapped_x;
-    evt.y = mapped_y;
-    evt.action = (action == 0) ? pal::TouchEvent::DOWN
-               : (action == 1) ? pal::TouchEvent::MOVE
-               : pal::TouchEvent::UP;
-    pal::injectEvent(evt);
-}
-
-static void web_button_cb(const char *id)
-{
-    if (strcmp(id, "filter") == 0) {
-        if (ui::get_i32(ui::PROP_mode) == 3)
-            ui::set_bool(ui::PROP_apf_enabled, !ui::get_bool(ui::PROP_apf_enabled));
-    } else if (strcmp(id, "zerobt") == 0) {
-        if (ui::get_i32(ui::PROP_mode) == 3)
-            dsp::startGoertzel();
-    } else if (strncmp(id, "span_", 5) == 0) {
-        int idx = id[5] - '0';
-        if (idx >= 0 && idx < dsp::NUM_SPANS)
-            ui::set_i32(ui::PROP_span_idx, idx);
-    } else if (strncmp(id, "band_", 5) == 0) {
-        static const struct { const char *name; uint64_t freq; } bands[] = {
-            {"40",7074000}, {"30",10136000}, {"20",14074000}, {"17",18100000},
-            {"15",21074000}, {"12",24915000}, {"10",28074000}
-        };
-        const char *bname = id + 5;
-        for (auto &b : bands) {
-            if (strcmp(bname, b.name) == 0) {
-                ui::set_u64(ui::PROP_vfo_freq, b.freq, ui::FROM_UI);
-                break;
-            }
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════
 // Audio callbacks
 // ═══════════════════════════════════════════════════════════════
 static void audio_output_cb(const float *samples, int count) {
@@ -607,11 +561,6 @@ void app::init()
     dsp::setAudioOutCallback(audio_output_cb);
     pal::audioInputOpen(audio_input_cb);
     cat::init();
-
-    // Web UI server
-    web::init(8080);
-    web::setTouchCallback(web_touch_cb);
-    web::setButtonCallback(web_button_cb);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -673,30 +622,7 @@ void app::tick()
             wf_pixels_t[lx * WF_MAX_LINES + wf_head] = waterfall_color_from_db(mag[fft_bin]);
         }
         if (wf_count < WF_MAX_LINES) wf_count++;
-
-        // Stream spectrum to web clients
-        if (web::hasClients()) {
-            float floor = ui::get_f32(ui::PROP_db_floor);
-            float ceil  = ui::get_f32(ui::PROP_db_ceil);
-            float range = ceil - floor;
-            uint8_t web_bins[512];
-            for (int i = 0; i < num_bins && i < 512; i++) {
-                int fft_bin = dsp::displayBin(i);
-                float norm = (mag[fft_bin] - floor) / range;
-                if (norm < 0) norm = 0;
-                if (norm > 1) norm = 1;
-                web_bins[i] = (uint8_t)(norm * 255);
-            }
-            web::sendSpectrum(web_bins, num_bins,
-                              dsp::getSpanRate(),
-                              ui::get_u64(ui::PROP_vfo_freq),
-                              ui::get_i32(ui::PROP_mode),
-                              ui::get_bool(ui::PROP_apf_enabled));
-        }
     }
-
-    // --- Web server poll ---
-    web::poll();
 
     // --- Touch events ---
     static constexpr int TAP_THRESHOLD = 5;
