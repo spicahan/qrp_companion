@@ -312,6 +312,17 @@ static void btn_dr_back_press(ui::Button &) {
     right_band.setLayout("default");
 }
 
+// TEMPORARY (debug): deliberately crash to validate that the panic backtrace
+// reaches the USB-C serial console (idf.py monitor). Reachable only via the DR
+// sub-panel so it can't be hit by accident during normal use. Remove before release.
+static void btn_crash_press(ui::Button &) {
+    printf("\n\n*** DEBUG: crash button pressed - forcing a panic now ***\n");
+    fflush(stdout);
+    volatile int *null_ptr = (volatile int *)0;
+    *null_ptr = 0xDEAD;   // primary: null-pointer store -> Store access fault + backtrace
+    __builtin_trap();     // fallback: guaranteed illegal-instruction panic if the store didn't fault
+}
+
 static void btn_mute_press(ui::Button &) {
     ui::set_bool(ui::PROP_audio_muted, !ui::get_bool(ui::PROP_audio_muted));
 }
@@ -320,6 +331,7 @@ static ui::Button btn_span, btn_filter, btn_zerobeat, btn_band, btn_dr, btn_mute
 static ui::Button btn_48k, btn_12k, btn_4k, btn_span_back;
 static ui::Button btn_40, btn_30, btn_20, btn_17, btn_15, btn_12, btn_10, btn_back;
 static ui::Button btn_dr_default, btn_dr_back;
+static ui::Button btn_crash;  // TEMPORARY debug crash trigger
 
 static ui::Panel panel_bottom_default = { "default" };
 static ui::Panel panel_span_select    = { "span_select" };
@@ -455,6 +467,7 @@ void app::init()
     make_button(btn_mute, "Mute Audio", COL_WHITE, COL_DGREY, btn_mute_press, ui::PROP_audio_muted, true);
     make_button(btn_dr_default, "Default", COL_CYAN, COL_DGREY, btn_dr_default_press);
     make_button(btn_dr_back,    "Back",    COL_RED,  COL_DGREY, btn_dr_back_press);
+    make_button(btn_crash,      "CRASH",   COL_RED,  COL_DGREY, btn_crash_press);
     update_mute_button_label();
 
     // Init sliders
@@ -543,11 +556,13 @@ void app::init()
     panel_band_select.add(&btn_10);
     panel_band_select.add(&btn_back);
 
-    // DR mode bottom panel (2 buttons)
-    int drw = log_w / 2;
-    btn_dr_default.x = 0;   btn_dr_default.y = bot_y; btn_dr_default.w = drw;          btn_dr_default.h = BOTTOM_H;
-    btn_dr_back.x = drw;    btn_dr_back.y = bot_y;    btn_dr_back.w = log_w - drw;     btn_dr_back.h = BOTTOM_H;
+    // DR mode bottom panel (3 buttons: Default | CRASH(temp) | Back)
+    int drw = log_w / 3;
+    btn_dr_default.x = 0;     btn_dr_default.y = bot_y; btn_dr_default.w = drw;           btn_dr_default.h = BOTTOM_H;
+    btn_crash.x = drw;        btn_crash.y = bot_y;      btn_crash.w = drw;                btn_crash.h = BOTTOM_H;
+    btn_dr_back.x = 2*drw;    btn_dr_back.y = bot_y;    btn_dr_back.w = log_w - 2*drw;    btn_dr_back.h = BOTTOM_H;
     panel_dr_bottom.add(&btn_dr_default);
+    panel_dr_bottom.add(&btn_crash);
     panel_dr_bottom.add(&btn_dr_back);
 
     bottom_band.x = 0; bottom_band.y = bot_y; bottom_band.w = log_w; bottom_band.h = BOTTOM_H;
