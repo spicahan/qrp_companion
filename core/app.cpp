@@ -285,18 +285,14 @@ static void btn_48k_press(ui::Button &)   { select_span(0); }
 static void btn_12k_press(ui::Button &)   { select_span(1); }
 static void btn_4k_press(ui::Button &)    { select_span(2); }
 
-// Band selection helpers
-static void tune_band(uint64_t freq) {
-    ui::set_u64(ui::PROP_vfo_freq, freq);
+// Band selection — one handler for every dynamically built band button.
+// The button's `tag` carries the QMX BN index discovered by enumeration.
+// BN also restores that band's last-used frequency (band stack), which the
+// old FA-based buttons could not do.
+static void btn_band_select_press(ui::Button &self) {
+    cat::setBandIndex(self.tag);
     bottom_band.setLayout("default");
 }
-static void btn_40_press(ui::Button &) { tune_band(7074000); }
-static void btn_30_press(ui::Button &) { tune_band(10136000); }
-static void btn_20_press(ui::Button &) { tune_band(14074000); }
-static void btn_17_press(ui::Button &) { tune_band(18100000); }
-static void btn_15_press(ui::Button &) { tune_band(21074000); }
-static void btn_12_press(ui::Button &) { tune_band(24915000); }
-static void btn_10_press(ui::Button &) { tune_band(28074000); }
 
 // Dynamic range (DR) mode
 static void btn_dr_press(ui::Button &) {
@@ -329,7 +325,12 @@ static void btn_mute_press(ui::Button &) {
 
 static ui::Button btn_span, btn_filter, btn_zerobeat, btn_band, btn_dr, btn_mute;
 static ui::Button btn_48k, btn_12k, btn_4k, btn_span_back;
-static ui::Button btn_40, btn_30, btn_20, btn_17, btn_15, btn_12, btn_10, btn_back;
+// Band buttons are built at runtime from the QMX band table (one per
+// configured band), plus Back. Sized to fill the bar so a 5-band QMX gets
+// fat buttons and a 12-band QMX+ still fits on one row.
+static ui::Button btn_bands[cat::MAX_BANDS];
+static ui::Button btn_back;
+static ui::Label  lbl_band_err;   // shown instead when enumeration found nothing
 static ui::Button btn_dr_default, btn_dr_back;
 static ui::Button btn_crash;  // TEMPORARY debug crash trigger
 
@@ -359,6 +360,63 @@ static void audio_output_cb(const float *samples, int count) {
 }
 static void audio_input_cb(const float *iq_samples, int num_frames) {
     dsp::pushIQ(iq_samples, num_frames);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Dynamic band menu
+// ═══════════════════════════════════════════════════════════════
+// Built from the QMX "Band config." table once CAT enumeration completes, so
+// the menu matches the radio actually connected (QMX vs QMX+ vs custom band
+// sets). Requires firmware with BN + the Band config. grid — if enumeration
+// yields nothing we say so rather than guessing with a hardcoded list.
+static void fmt_band_err(char *buf, int len) {
+    snprintf(buf, len, "No bands from radio - please update firmware");
+}
+
+static void rebuild_band_panel()
+{
+    int n = cat::getBandCount();
+    int bot_y = log_h - BOTTOM_H;
+
+    panel_band_select.clear();
+
+    if (n <= 0) {
+        // Enumeration not finished, or firmware too old to answer.
+        panel_band_select.add(&lbl_band_err);
+        btn_back.x = log_w - log_w / 6; btn_back.y = bot_y;
+        btn_back.w = log_w / 6;         btn_back.h = BOTTOM_H;
+        panel_band_select.add(&btn_back);
+        return;
+    }
+
+    // n band buttons + Back, sized to fill the bar. 5 bands -> fat buttons,
+    // 12 bands -> ~98px each, still a comfortable touch target.
+    if (n > cat::MAX_BANDS) n = cat::MAX_BANDS;
+    int slots = n + 1;
+    int bw = log_w / slots;
+    int cur = cat::getBandIndex();
+
+    for (int i = 0; i < n; i++) {
+        const cat::BandInfo *bi = cat::getBand(i);
+        if (!bi) continue;
+        ui::Button &b = btn_bands[i];
+        b.type  = ui::W_BUTTON;
+        b.label = bi->name;          // points into cat's static table
+        b.color = COL_WHITE;
+        b.bg    = COL_NAVY;
+        b.scale = 2;
+        b.on_press = btn_band_select_press;
+        b.bind = ui::PROP_COUNT;
+        b.show_as_toggle = false;
+        b.tag = bi->index;           // BN index for this band
+        b.highlight = (bi->index == cur);
+        b.x = i * bw; b.y = bot_y; b.w = bw; b.h = BOTTOM_H;
+        panel_band_select.add(&b);
+    }
+
+    btn_back.x = n * bw; btn_back.y = bot_y;
+    btn_back.w = log_w - n * bw; btn_back.h = BOTTOM_H;
+    panel_band_select.add(&btn_back);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -455,14 +513,6 @@ void app::init()
     make_button(btn_12k, "+/-12k", COL_CYAN, COL_NAVY, btn_12k_press);
     make_button(btn_4k,  "+/-4k",  COL_CYAN, COL_NAVY, btn_4k_press);
     make_button(btn_span_back, "Back", COL_RED, COL_DGREY, btn_back_press);
-    make_button(btn_40,  "40",   COL_WHITE, COL_NAVY, btn_40_press);
-    make_button(btn_30,  "30",   COL_WHITE, COL_NAVY, btn_30_press);
-    make_button(btn_20,  "20",   COL_WHITE, COL_NAVY, btn_20_press);
-    make_button(btn_17,  "17",   COL_WHITE, COL_NAVY, btn_17_press);
-    make_button(btn_15,  "15",   COL_WHITE, COL_NAVY, btn_15_press);
-    make_button(btn_12,  "12",   COL_WHITE, COL_NAVY, btn_12_press);
-    make_button(btn_10,  "10",   COL_WHITE, COL_NAVY, btn_10_press);
-    make_button(btn_back,"Back", COL_RED,   COL_DGREY, btn_back_press);
     make_button(btn_dr,  "DR",   COL_WHITE, COL_DGREY, btn_dr_press);
     make_button(btn_mute, "Mute Audio", COL_WHITE, COL_DGREY, btn_mute_press, ui::PROP_audio_muted, true);
     make_button(btn_dr_default, "Default", COL_CYAN, COL_DGREY, btn_dr_default_press);
@@ -536,25 +586,13 @@ void app::init()
     panel_span_select.add(&btn_4k);
     panel_span_select.add(&btn_span_back);
 
-    // Band select panel (8 buttons)
-    int bbw = log_w / 8;
-    btn_40.x = 0;      btn_40.y = bot_y; btn_40.w = bbw; btn_40.h = BOTTOM_H;
-    btn_30.x = bbw;    btn_30.y = bot_y; btn_30.w = bbw; btn_30.h = BOTTOM_H;
-    btn_20.x = 2*bbw;  btn_20.y = bot_y; btn_20.w = bbw; btn_20.h = BOTTOM_H;
-    btn_17.x = 3*bbw;  btn_17.y = bot_y; btn_17.w = bbw; btn_17.h = BOTTOM_H;
-    btn_15.x = 4*bbw;  btn_15.y = bot_y; btn_15.w = bbw; btn_15.h = BOTTOM_H;
-    btn_12.x = 5*bbw;  btn_12.y = bot_y; btn_12.w = bbw; btn_12.h = BOTTOM_H;
-    btn_10.x = 6*bbw;  btn_10.y = bot_y; btn_10.w = bbw; btn_10.h = BOTTOM_H;
-    btn_back.x = 7*bbw; btn_back.y = bot_y; btn_back.w = log_w - 7*bbw; btn_back.h = BOTTOM_H;
-
-    panel_band_select.add(&btn_40);
-    panel_band_select.add(&btn_30);
-    panel_band_select.add(&btn_20);
-    panel_band_select.add(&btn_17);
-    panel_band_select.add(&btn_15);
-    panel_band_select.add(&btn_12);
-    panel_band_select.add(&btn_10);
-    panel_band_select.add(&btn_back);
+    // Band select panel is built at runtime from the QMX band table once CAT
+    // enumeration finishes (see rebuild_band_panel()); until then it shows the
+    // "please update firmware" label.
+    make_label(lbl_band_err, 16, bot_y + (BOTTOM_H - 16) / 2, fmt_band_err,
+               COL_RED, COL_DGREY, 2, 40);
+    make_button(btn_back, "Back", COL_RED, COL_DGREY, btn_back_press);
+    rebuild_band_panel();
 
     // DR mode bottom panel (3 buttons: Default | CRASH(temp) | Back)
     int drw = log_w / 3;
@@ -604,6 +642,18 @@ void app::tick()
         last_slow_tick = t0;
         cat::tick1Hz();
         pal::pollBattery();
+
+        // Rebuild the band menu when the table first arrives, and re-highlight
+        // when the radio changes band (band can also be changed on the rig).
+        static int last_band_count = -1;
+        static int last_band_index = -2;
+        if (cat::getBandCount() != last_band_count ||
+            cat::getBandIndex() != last_band_index) {
+            last_band_count = cat::getBandCount();
+            last_band_index = cat::getBandIndex();
+            rebuild_band_panel();
+            bottom_band.dirty = true;   // repaint (button count/labels changed)
+        }
     }
 
     ui::set_i32(ui::PROP_mode, cat::getMode(), ui::FROM_RADIO);

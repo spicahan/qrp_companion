@@ -23,4 +23,25 @@ void suppressPolling(bool suppress);
 // Valid values: "None", "50", "100", "150", "200", "250", "300", "400", "500"
 void setCwFilter(const char *bandwidth);
 
+// ── Bands ───────────────────────────────────────────────────────────
+// The QMX "Band config." table has 16 columns; the column index is the value
+// the BN command takes. We enumerate the table at startup (a few columns per
+// 1 Hz tick) so the UI reflects the bands this particular radio actually has —
+// QMX and QMX+ differ, and users can customise the table.
+// Requires firmware with BN + the Band config. grid; there is no fallback.
+static constexpr int MAX_BANDS = 16;
+
+struct BandInfo {
+    int  index;      // BN index (column in the Band config. table)
+    char name[8];    // band name in metres, e.g. "40", "160"
+};
+
+int  getBandCount();              // configured bands found (0 until enumerated)
+const BandInfo* getBand(int i);   // i in [0, getBandCount()), else nullptr
+bool isBandEnumDone();            // true once the table has been swept
+int  getBandIndex();              // current BN index, -1 if unknown
+
+// Switch band by BN index. The QMX restores that band's last-used frequency.
+void setBandIndex(int index);
+
 } // namespace cat

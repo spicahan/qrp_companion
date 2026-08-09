@@ -49,6 +49,12 @@ struct Button : Widget {
     PropId bind;           // PROP_COUNT = no binding
     bool show_as_toggle;   // if true, color changes based on bound bool
 
+    // Generic per-button payload so one handler can serve many buttons
+    // (e.g. dynamically built band buttons carry their QMX band index).
+    int tag = 0;
+    // Draw inverted regardless of `bind` (e.g. mark the active band).
+    bool highlight = false;
+
     void draw(const draw::Framebuf &fb) override;
     bool onTouch(int tx, int ty, int action) override;
 };
@@ -70,11 +76,13 @@ private:
 
 // ── Panel: a named layout of widgets ──
 struct Panel {
+    static constexpr int MAX_WIDGETS = 20;  // 16 QMX band slots + Back + margin
     const char *id;          // unique name for state machine transitions
-    Widget *widgets[16];
+    Widget *widgets[MAX_WIDGETS];
     int count = 0;
 
-    void add(Widget *w) { if (count < 16) widgets[count++] = w; }
+    void add(Widget *w) { if (count < MAX_WIDGETS) widgets[count++] = w; }
+    void clear() { count = 0; }
     void draw(const draw::Framebuf &fb);
     bool onTouch(int tx, int ty, int action);
 };

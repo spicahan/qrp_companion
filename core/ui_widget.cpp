@@ -30,6 +30,11 @@ void Button::draw(const draw::Framebuf &fb)
             b = color;  // inverted
         }
     }
+    // Explicit highlight (e.g. the band the radio is currently on)
+    if (highlight) {
+        fg = draw::rgb565(0, 0, 0);
+        b = color;  // inverted
+    }
     draw::fillRect(fb, x, y, w, h, b);
     draw::drawRect(fb, x, y, w, h, draw::rgb565(80, 80, 80));
     // Center label in button
