@@ -29,17 +29,27 @@ static int      s_band_index = -1;   // current BN index, -1 = unknown
 // into this table, so enumerating it is the only way to learn which bands a
 // particular QMX/QMX+ (or custom build) actually has.
 // Queries are chained a few per 1 Hz tick so the UI never blocks.
-static cat::BandInfo s_bands[cat::MAX_BANDS];
-static int  s_band_count = 0;
-static int  s_enum_col   = 0;      // next column to request
-static int  s_enum_pending = 0;    // responses still expected this batch
-static int  s_enum_next_slot = 0;  // column each pending response maps to
+// Names are stored BY COLUMN, not appended, so a retried or duplicated reply
+// overwrites the same slot instead of shifting every later band. Getting this
+// wrong would be silent and dangerous: a shifted table means the "20" button
+// switches the radio to some other band.
+// One persistent record per column; name[0]=='\0' means unconfigured/not read.
+// Persistent (not a shared temporary) because the UI keeps `name` as a label
+// pointer for the lifetime of the button.
+static cat::BandInfo s_band_slots[cat::MAX_BANDS];
+static int  s_enum_col   = 0;      // first column of the batch in flight
+static int  s_enum_pending = 0;    // responses still outstanding for it
+static int  s_enum_next_slot = 0;  // column the next reply maps to
+static int  s_enum_retries = 0;
+static bool s_enum_inflight = false;
 static bool s_enum_done  = false;
 static constexpr int ENUM_BATCH = 4;   // columns queried per tick
+static constexpr int ENUM_MAX_RETRIES = 2;
 
 // RX accumulator
 static char s_rx_buf[128];
 static int  s_rx_pos = 0;
+static int  s_esc_state = 0;   // ANSI CSI filter: 0=text, 1=saw ESC, 2=in CSI
 
 static bool s_polling_suppressed = false;
 static int  s_skip_ticks = 0;  // delay next tick1Hz (set by setVfoFreq)
@@ -87,13 +97,15 @@ static void process_response(const char *resp, int len)
             if (resp[i] >= '0' && resp[i] <= '9') name = name * 10 + (resp[i] - '0');
         }
         // Band names are metres: 6..2200. Clamp so the formatted name always
-        // fits BandInfo::name (the compiler can then prove no truncation).
-        if (name > 0 && s_band_count < cat::MAX_BANDS) {
+        // fits the buffer (lets the compiler prove no truncation).
+        if (col >= 0 && col < cat::MAX_BANDS) {
             if (name > 9999) name = 9999;
-            s_bands[s_band_count].index = col;
-            snprintf(s_bands[s_band_count].name, sizeof(s_bands[s_band_count].name), "%u",
-                     (unsigned)name);
-            s_band_count++;
+            s_band_slots[col].index = col;
+            if (name > 0)
+                snprintf(s_band_slots[col].name, sizeof(s_band_slots[col].name),
+                         "%u", (unsigned)name);
+            else
+                s_band_slots[col].name[0] = '\0';   // unconfigured slot
         }
     }
     // Other MM responses are ignored — CW offset is forced to a known value
@@ -114,11 +126,14 @@ void cat::init()
     s_setup_phase = 0;
     s_skip_ticks = 0;
     s_band_index = -1;
-    s_band_count = 0;
+    for (int c = 0; c < MAX_BANDS; c++) { s_band_slots[c].index = c; s_band_slots[c].name[0] = '\0'; }
     s_enum_col = 0;
     s_enum_pending = 0;
     s_enum_next_slot = 0;
+    s_enum_retries = 0;
+    s_enum_inflight = false;
     s_enum_done = false;
+    s_esc_state = 0;
 }
 
 // Drain any pending RX bytes — called every frame from app::tick.
@@ -129,6 +144,24 @@ void cat::poll()
     if (n <= 0) return;
     for (int i = 0; i < n; i++) {
         char c = tmp[i];
+
+        // MM *set* commands make the QMX repaint its terminal screen, emitting
+        // ANSI escape sequences such as "\e[1;254H\e[2;254H\e[0;0H". Those
+        // contain semicolons, so feeding them to the ';' framing below splits
+        // them into junk AND leaves a trailing fragment ("0H") in the buffer
+        // that then prefixes the next real response ("0HMM160"), silently
+        // eating it. That is why 160m (the first band queried) went missing.
+        // Strip CSI sequences here so every parser downstream sees clean text.
+        if (s_esc_state == 1) {                     // saw ESC
+            s_esc_state = (c == '[') ? 2 : 0;       // CSI intro, else 2-char esc
+            continue;
+        }
+        if (s_esc_state == 2) {                     // inside CSI parameters
+            if (c >= '@' && c <= '~') s_esc_state = 0;   // final byte ends it
+            continue;
+        }
+        if (c == 0x1b) { s_esc_state = 1; continue; }
+
         if (c == ';') {
             s_rx_buf[s_rx_pos] = '\0';
             if (s_rx_pos > 0)
@@ -189,21 +222,38 @@ void cat::tick1Hz()
             // settling into normal polling. Chained MM queries are answered in
             // order, so a whole batch costs one round trip.
             if (!s_enum_done) {
+                // Only advance once the batch in flight was fully answered.
+                // A short reply would otherwise mis-align the remaining
+                // columns; retry the same batch instead (replies are written
+                // by column, so a retry is idempotent).
+                if (s_enum_inflight) {
+                    if (s_enum_pending > 0 && s_enum_retries < ENUM_MAX_RETRIES) {
+                        s_enum_retries++;           // short reply — re-ask
+                    } else {
+                        if (s_enum_pending > 0)
+                            printf("[cat] band enum: giving up on cols %d..%d\n",
+                                   s_enum_col, s_enum_col + ENUM_BATCH - 1);
+                        s_enum_col += ENUM_BATCH;   // batch settled, move on
+                        s_enum_retries = 0;
+                    }
+                }
+
+                if (s_enum_col >= cat::MAX_BANDS) {
+                    s_enum_done = true;
+                    printf("[cat] band enumeration done: %d bands\n", getBandCount());
+                    break;
+                }
+
                 char cmd[256];
                 int n = 0;
                 s_enum_next_slot = s_enum_col;
                 s_enum_pending = 0;
-                for (int i = 0; i < ENUM_BATCH && s_enum_col < cat::MAX_BANDS; i++) {
+                for (int i = 0; i < ENUM_BATCH && (s_enum_col + i) < cat::MAX_BANDS; i++) {
                     n += snprintf(cmd + n, sizeof(cmd) - n,
-                                  "MMBand config.|Band name (m)[%d];", s_enum_col);
-                    s_enum_col++;
+                                  "MMBand config.|Band name (m)[%d];", s_enum_col + i);
                     s_enum_pending++;
                 }
-                if (n > 0) send_cmd(cmd);
-                if (s_enum_col >= cat::MAX_BANDS) {
-                    s_enum_done = true;
-                    printf("[cat] band enumeration done: %d bands\n", s_band_count);
-                }
+                if (n > 0) { send_cmd(cmd); s_enum_inflight = true; }
                 break;
             }
             send_cmd("FA;MD;BN;");
@@ -234,26 +284,42 @@ const char* cat::getModeStr()
 void cat::suppressPolling(bool suppress) { s_polling_suppressed = suppress; }
 
 // ── Band table / selection ──────────────────────────────────────────
-int  cat::getBandCount() { return s_band_count; }
 bool cat::isBandEnumDone() { return s_enum_done; }
 int  cat::getBandIndex() { return s_band_index; }
 
+int cat::getBandCount()
+{
+    int n = 0;
+    for (int c = 0; c < MAX_BANDS; c++)
+        if (s_band_slots[c].name[0]) n++;
+    return n;
+}
+
+// Returns the i-th *configured* band, carrying its real column (= BN index),
+// so gaps in the table can never shift what a button switches to.
 const cat::BandInfo* cat::getBand(int i)
 {
-    if (i < 0 || i >= s_band_count) return nullptr;
-    return &s_bands[i];
+    if (i < 0) return nullptr;
+    int n = 0;
+    for (int c = 0; c < MAX_BANDS; c++) {
+        if (!s_band_slots[c].name[0]) continue;
+        if (n == i) return &s_band_slots[c];
+        n++;
+    }
+    return nullptr;
 }
 
 void cat::setBandIndex(int index)
 {
     if (index < 0 || index >= MAX_BANDS) return;
-    char cmd[16];
-    snprintf(cmd, sizeof(cmd), "BN%d;", index);
+    // Chain FA;MD; so the header shows the new band's frequency immediately
+    // rather than up to a second later. The QMX processes the chain in order,
+    // so FA already reports the band-stack frequency BN just restored
+    // (verified: "BN3;FA;MD;" -> "FA00007074000;MD6;").
+    char cmd[24];
+    snprintf(cmd, sizeof(cmd), "BN%d;FA;MD;", index);
     send_cmd(cmd);
     s_band_index = index;   // optimistic; corrected by the next BN; poll
-    // The QMX restores that band's last-used frequency (band stack), so let it
-    // settle before the next FA query rather than racing it.
-    s_skip_ticks = 1;
 }
 
 void cat::setCwFilter(const char *bandwidth)
