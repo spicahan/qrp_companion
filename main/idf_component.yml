@@ -1,6 +1,6 @@
 dependencies:
-  espressif/esp-dsp: "*"
+  espressif/esp-dsp: '*'
   usb_host_uac:
-    version: "1.2.*"
-  espressif/usb: "*"
-  espressif/usb_host_cdc_acm: "^2.2.0"
+    version: 1.2.*
+  espressif/usb: '*'
+  espressif/usb_host_cdc_acm: ^2.2.0

@@ -1,0 +1,46 @@
+#pragma once
+#include <stdbool.h>
+#include <stddef.h>
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// "PC link": exposes the Tab5's USB-C port to a PC as a virtual COM port
+// (eventually a CAT pass-through to the QMX, for loggers such as N1MM).
+//
+// USB topology on the Tab5 (ESP32-P4 has 2 OTG peripherals + USB-Serial-JTAG,
+// with 1 UTMI PHY and 1 internal FSLS PHY):
+//
+//   USB-A  -> OTG High-Speed (UTMI PHY)      : USB host, QMX audio + CAT
+//   USB-C  -> USB-Serial-JTAG (dedicated pads): console + flashing + THIS link
+//   n/a    -> OTG Full-Speed (internal PHY)   : NOT USABLE, see below
+//
+// We deliberately do NOT use TinyUSB on the OTG Full-Speed port, even though it
+// installs cleanly and would give us a "real" CDC-ACM device. On ESP32-P4 the
+// internal FSLS PHY is not wired to the USB-C connector at all -- it is muxed
+// onto GPIO26/GPIO27 (see esp-idf soc/esp32p4/usb_dwc_periph.c), and on the
+// Tab5 those two pins belong to the ES8388 audio codec. Bringing that PHY up
+// silently reconfigures both pins as USB D-/D+ at 40mA drive, so the device
+// never enumerates over USB-C *and* audio breaks. The USB-C data lines go to
+// the USB-Serial-JTAG peripheral's dedicated pads, which is why flashing and
+// the console work there.
+//
+// So the PC-facing port is USB-Serial-JTAG itself, which already enumerates as
+// a CDC-ACM serial device. The cost: while the link is up, USB-C carries CAT
+// bytes only, so log output is suppressed to avoid corrupting the stream
+// (the primary console is UART0 and is unaffected). That is why this is not
+// started at boot -- leaving it off by default keeps USB-C console and crash
+// dumps working exactly as before.
+
+esp_err_t pc_link_start(void);   // take over USB-C serial for the PC
+bool      pc_link_running(void);
+
+// Loopback diagnostics (step 1): bytes echoed back to the PC.
+size_t    pc_link_rx_count(void);
+size_t    pc_link_tx_count(void);
+
+#ifdef __cplusplus
+}
+#endif

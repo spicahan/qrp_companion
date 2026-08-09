@@ -308,6 +308,15 @@ static void btn_dr_back_press(ui::Button &) {
     right_band.setLayout("default");
 }
 
+// PC link: bring up the USB CDC device on USB-C so a PC can talk to us as a
+// virtual COM port. One-way on purpose — starting it takes the USB-C port away
+// from USB-Serial-JTAG (console / crash dumps / esptool auto-reset), so it is
+// opt-in and only cleared by a reboot.
+static void btn_pclink_press(ui::Button &) {
+    if (pal::pcLinkSupported() && !pal::pcLinkRunning())
+        pal::pcLinkStart();
+}
+
 static void btn_mute_press(ui::Button &) {
     ui::set_bool(ui::PROP_audio_muted, !ui::get_bool(ui::PROP_audio_muted));
 }
@@ -320,7 +329,7 @@ static ui::Button btn_48k, btn_12k, btn_4k, btn_span_back;
 static ui::Button btn_bands[cat::MAX_BANDS];
 static ui::Button btn_back;
 static ui::Label  lbl_band_err;   // shown instead when enumeration found nothing
-static ui::Button btn_dr_default, btn_dr_back;
+static ui::Button btn_dr_default, btn_dr_back, btn_pclink;
 
 static ui::Panel panel_bottom_default = { "default" };
 static ui::Panel panel_span_select    = { "span_select" };
@@ -513,6 +522,7 @@ void app::init()
     make_button(btn_mute, "Mute Audio", COL_WHITE, COL_DGREY, btn_mute_press, ui::PROP_audio_muted, true);
     make_button(btn_dr_default, "Default", COL_CYAN, COL_DGREY, btn_dr_default_press);
     make_button(btn_dr_back,    "Back",    COL_RED,  COL_DGREY, btn_dr_back_press);
+    make_button(btn_pclink,     "PC Link", COL_CYAN, COL_DGREY, btn_pclink_press);
     update_mute_button_label();
 
     // Init sliders
@@ -589,11 +599,13 @@ void app::init()
     make_button(btn_back, "Back", COL_RED, COL_DGREY, btn_back_press);
     rebuild_band_panel();
 
-    // DR mode bottom panel (2 buttons)
-    int drw = log_w / 2;
-    btn_dr_default.x = 0;   btn_dr_default.y = bot_y; btn_dr_default.w = drw;          btn_dr_default.h = BOTTOM_H;
-    btn_dr_back.x = drw;    btn_dr_back.y = bot_y;    btn_dr_back.w = log_w - drw;     btn_dr_back.h = BOTTOM_H;
+    // DR mode bottom panel (Default | PC Link | Back)
+    int drw = log_w / 3;
+    btn_dr_default.x = 0;      btn_dr_default.y = bot_y; btn_dr_default.w = drw;         btn_dr_default.h = BOTTOM_H;
+    btn_pclink.x = drw;        btn_pclink.y = bot_y;     btn_pclink.w = drw;             btn_pclink.h = BOTTOM_H;
+    btn_dr_back.x = 2*drw;     btn_dr_back.y = bot_y;    btn_dr_back.w = log_w - 2*drw;  btn_dr_back.h = BOTTOM_H;
     panel_dr_bottom.add(&btn_dr_default);
+    panel_dr_bottom.add(&btn_pclink);
     panel_dr_bottom.add(&btn_dr_back);
 
     bottom_band.x = 0; bottom_band.y = bot_y; bottom_band.w = log_w; bottom_band.h = BOTTOM_H;
@@ -652,6 +664,13 @@ void app::tick()
             last_enum_done  = cat::isBandEnumDone();
             rebuild_band_panel();
             bottom_band.dirty = true;   // repaint (button count/labels changed)
+        }
+
+        // Show PC-link state on its button (inverted = CDC device is up)
+        bool pclink = pal::pcLinkRunning();
+        if (pclink != btn_pclink.highlight) {
+            btn_pclink.highlight = pclink;
+            bottom_band.dirty = true;
         }
     }
 

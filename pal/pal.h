@@ -44,6 +44,14 @@ void pollBattery();
 int  getBatteryLevel();    // 0-100, or -1 if unknown / unsupported
 bool isCharging();
 
+// "PC link": expose the device to a PC as a USB CDC virtual COM port (for
+// CAT pass-through to loggers). Not available on every platform.
+// Starting it takes over the USB-C port, so it is opt-in at runtime rather
+// than started at boot — see main/pc_link.h for the full rationale.
+bool pcLinkSupported();
+bool pcLinkRunning();
+void pcLinkStart();
+
 // Timing
 int64_t micros();
 void    delayMs(int ms);

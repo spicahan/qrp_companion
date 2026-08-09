@@ -147,6 +147,11 @@ void pollBattery() {}
 int  getBatteryLevel() { return -1; }
 bool isCharging() { return false; }
 
+// PC link — desktop stub (the PC *is* the host here; nothing to expose)
+bool pcLinkSupported() { return false; }
+bool pcLinkRunning() { return false; }
+void pcLinkStart() {}
+
 int64_t micros()
 {
     auto now = std::chrono::steady_clock::now();

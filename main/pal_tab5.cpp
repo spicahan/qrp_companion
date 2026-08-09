@@ -1,6 +1,7 @@
 #include "pal.h"
 #include "uac_host.h"
 #include "cat_host.h"
+#include "pc_link.h"
 
 #include <M5Unified.h>
 #include <lgfx/v1/platforms/esp32p4/Panel_DSI.hpp>
@@ -143,6 +144,11 @@ void pollBattery()
 
 int  getBatteryLevel() { return s_battery_level; }
 bool isCharging()      { return s_battery_charging; }
+
+// PC link (USB CDC device on USB-C) — see main/pc_link.h
+bool pcLinkSupported() { return true; }
+bool pcLinkRunning()   { return pc_link_running(); }
+void pcLinkStart()     { pc_link_start(); }
 
 int64_t micros() { return esp_timer_get_time(); }
 void delayMs(int ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
