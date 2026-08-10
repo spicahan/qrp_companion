@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "usb/cdc_acm_host.h"
 #include "usb/usb_host.h"
+#include "pc_link.h"
 
 static const char *TAG = "cat";
 
@@ -51,6 +52,67 @@ static void cdc_event_callback(const cdc_acm_host_dev_event_data_t *event, void 
             cdc_acm_host_close(s_cdc_handle);
             s_cdc_handle = NULL;
         }
+    }
+}
+
+// ---- PC pass-through port (QMX USB 2) -------------------------------------
+
+static cdc_acm_dev_hdl_t s_pc_handle = NULL;
+
+// QMX -> PC. Straight relay; the QMX already addressed this reply to the port
+// the PC's command came in on, so there is nothing to demultiplex here.
+static bool pc_rx_callback(const uint8_t *data, size_t len, void *user_ctx)
+{
+    pc_link_from_qmx(data, len);
+    return false;
+}
+
+static void pc_event_callback(const cdc_acm_host_dev_event_data_t *event, void *user_ctx)
+{
+    if (event->type == CDC_ACM_HOST_DEVICE_DISCONNECTED) {
+        ESP_LOGI(TAG, "CDC(PC) disconnected");
+        if (s_pc_handle) {
+            cdc_acm_host_close(s_pc_handle);
+            s_pc_handle = NULL;
+        }
+    }
+}
+
+int cat_host_pc_is_connected(void) { return s_pc_handle != NULL; }
+
+int cat_host_pc_send(const char *data, int len)
+{
+    if (!s_pc_handle) return -1;
+    esp_err_t err = cdc_acm_host_data_tx_blocking(s_pc_handle, (const uint8_t *)data, len, 100);
+    return (err == ESP_OK) ? len : -1;
+}
+
+static void try_open_pc_cdc(void)
+{
+    if (s_pc_handle || !s_cdc_handle) return;   // our own port comes first
+
+    cdc_acm_host_device_config_t cfg = {
+        .connection_timeout_ms = 500,
+        .out_buffer_size = 64,
+        .in_buffer_size = 128,
+        .event_cb = pc_event_callback,
+        .data_cb = pc_rx_callback,
+        .user_arg = NULL,
+    };
+
+    esp_err_t err = cdc_acm_host_open(QMX_VID, QMX_PID, QMX_CDC_IF_PC, &cfg, &s_pc_handle);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "CDC(PC) opened: QMX itf %d", QMX_CDC_IF_PC);
+        return;
+    }
+    // Only a warning: one serial port is the QMX default, and everything except
+    // the pass-through works fine without the second one.
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        ESP_LOGW(TAG, "PC pass-through port (itf %d) unavailable: %s -- set QMX "
+                      "'USB serial ports' to 2 and restart the radio",
+                 QMX_CDC_IF_PC, esp_err_to_name(err));
     }
 }
 
@@ -143,6 +205,10 @@ static void cat_connect_task(void *arg)
     while (1) {
         if (!s_cdc_handle)
             try_open_cdc();
+        // Opened lazily and independently: the pass-through port only exists
+        // when the operator has enabled two USB serial ports on the QMX.
+        if (s_cdc_handle && !s_pc_handle && pc_link_running())
+            try_open_pc_cdc();
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }

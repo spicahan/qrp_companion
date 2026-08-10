@@ -1,4 +1,5 @@
 #include "pc_link.h"
+#include "cat_host.h"
 
 #include "driver/usb_serial_jtag.h"
 #include "freertos/FreeRTOS.h"
@@ -27,6 +28,7 @@ static TaskHandle_t s_task     = NULL;
 static volatile bool   s_dtr = false;
 static volatile bool   s_rts = false;
 static volatile size_t s_line_changes = 0;
+static size_t          s_dropped_bytes = 0;
 
 // While the link is up the USB-C port carries CAT bytes, so anything the log
 // subsystem emits would be injected straight into the PC's serial stream. Drop
@@ -38,9 +40,21 @@ static int quiet_vprintf(const char *fmt, va_list ap)
     return 0;
 }
 
-// Step 1: pure loopback. Whatever the PC sends is echoed straight back, which
-// proves the USB-C serial path works end to end while the QMX stays connected
-// on the USB-A host port. The CAT pass-through replaces this echo later.
+// QMX -> PC. Called from the CAT host's RX callback for the USB 2 port.
+void pc_link_from_qmx(const uint8_t *data, size_t len)
+{
+    if (!s_running || !data || len == 0) return;
+    size_t sent = 0;
+    for (int spin = 0; sent < len && spin < 64; ++spin) {
+        int w = usb_serial_jtag_write_bytes(data + sent, len - sent, pdMS_TO_TICKS(20));
+        if (w > 0) sent += (size_t)w;
+    }
+    s_tx_bytes += sent;
+}
+
+// PC <-> QMX relay. Bytes are moved verbatim: the PC owns the QMX's USB 2 CAT
+// port and the QMX answers it directly, so nothing here has to parse CAT,
+// match responses to requests, or arbitrate against our own polling on USB 1.
 static void pc_link_task(void *arg)
 {
     (void)arg;
@@ -69,16 +83,13 @@ static void pc_link_task(void *arg)
         if (rx <= 0) continue;
         s_rx_bytes += (size_t)rx;
 
-        // write_bytes can accept less than requested when the TX ring is full,
-        // so loop until the whole chunk is away. The spin cap stops us wedging
-        // here forever if the host stops draining.
-        int sent = 0;
-        for (int spin = 0; sent < rx && spin < 64; ++spin) {
-            int w = usb_serial_jtag_write_bytes(buf + sent, (size_t)(rx - sent),
-                                                pdMS_TO_TICKS(20));
-            if (w > 0) sent += w;
-        }
-        s_tx_bytes += (size_t)sent;
+        // PC -> QMX. If the pass-through port isn't open (QMX still set to one
+        // USB serial port), drop the bytes rather than echoing them: a logger
+        // must never mistake its own command for a reply from the radio.
+        if (cat_host_pc_is_connected())
+            cat_host_pc_send((const char *)buf, rx);
+        else
+            s_dropped_bytes += (size_t)rx;
     }
 }
 
@@ -106,8 +117,8 @@ esp_err_t pc_link_start(void)
     USB_SERIAL_JTAG.chip_rst.usb_uart_chip_rst_dis = 1;
     USB_SERIAL_JTAG.config_update.config_update = 1;
 
-    ESP_LOGI(TAG, "PC link up: USB-C serial (loopback). Console logs suppressed "
-                  "on USB-C until reboot.");
+    ESP_LOGI(TAG, "PC link up: USB-C serial relays to QMX USB 2. Console logs "
+                  "suppressed on USB-C until reboot.");
 
     esp_log_level_set("*", ESP_LOG_NONE);
     esp_log_set_vprintf(quiet_vprintf);

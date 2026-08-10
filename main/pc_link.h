@@ -56,7 +56,11 @@ bool      pc_link_dtr(void);
 bool      pc_link_rts(void);
 size_t    pc_link_line_changes(void);
 
-// Loopback diagnostics (step 1): bytes echoed back to the PC.
+// QMX -> PC. Called by the CAT host when the QMX's USB 2 port yields bytes.
+// Safe to call before the link is up; the data is simply dropped.
+void      pc_link_from_qmx(const uint8_t *data, size_t len);
+
+// Byte counters. rx = PC -> QMX, tx = QMX -> PC.
 size_t    pc_link_rx_count(void);
 size_t    pc_link_tx_count(void);
 
