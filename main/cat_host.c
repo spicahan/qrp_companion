@@ -54,7 +54,12 @@ static void cdc_event_callback(const cdc_acm_host_dev_event_data_t *event, void 
     }
 }
 
-static int s_cdc_iface_hint = -1;
+// Every CDC-Comm interface the device exposes, in ascending order. With QMX
+// "USB serial ports" = 2 there are two (0 and 5), so a single "last one wins"
+// hint would point at USB 2 -- the port reserved for the PC pass-through.
+#define MAX_COMM_IFACES 8
+static uint8_t s_comm_ifaces[MAX_COMM_IFACES];
+static int     s_comm_count = 0;
 
 static void cdc_new_dev_cb(usb_device_handle_t usb_dev)
 {
@@ -69,8 +74,13 @@ static void cdc_new_dev_cb(usb_device_handle_t usb_dev)
         if (dtype == USB_B_DESCRIPTOR_TYPE_INTERFACE && len >= 9) {
             const usb_intf_desc_t *intf = (const usb_intf_desc_t *)(p + offset);
             if (intf->bInterfaceClass == USB_CLASS_COMM) {
-                s_cdc_iface_hint = intf->bInterfaceNumber;
-                ESP_LOGI(TAG, "CDC interface %d detected", s_cdc_iface_hint);
+                bool known = false;
+                for (int i = 0; i < s_comm_count; i++)
+                    if (s_comm_ifaces[i] == intf->bInterfaceNumber) known = true;
+                if (!known && s_comm_count < MAX_COMM_IFACES) {
+                    s_comm_ifaces[s_comm_count++] = intf->bInterfaceNumber;
+                    ESP_LOGI(TAG, "CDC interface %d detected", intf->bInterfaceNumber);
+                }
             }
         }
         offset += len;
@@ -92,23 +102,32 @@ static esp_err_t try_open_cdc(void)
 
     esp_err_t err = cdc_acm_host_open(QMX_VID, QMX_PID, QMX_CDC_IF, &dev_cfg, &s_cdc_handle);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "CDC opened: QMX");
-        // Dump the config descriptor so we can see the interface layout. With
-        // QMX "USB serial ports" set to 2 this reveals the second CDC function's
-        // communication interface index, which the PC pass-through opens as its
-        // own port (QMX then arbitrates the two CAT masters itself).
+        ESP_LOGI(TAG, "CDC opened: QMX itf %d", QMX_CDC_IF);
+        // Dump the config descriptor so the interface layout is visible in the
+        // log; this is what tells us where the PC pass-through port lives.
         cdc_acm_host_desc_print(s_cdc_handle);
         return ESP_OK;
     }
+    ESP_LOGW(TAG, "open QMX itf %d failed: %s", QMX_CDC_IF, esp_err_to_name(err));
 
-    if (s_cdc_iface_hint >= 0) {
+    // Fall back only to interfaces we positively know are CDC-Comm, lowest
+    // first, never the pass-through's. Opening a *data* interface (the old
+    // blind 0..6 scan happily grabbed itf 6) silently steals half of USB 2.
+    for (int i = 0; i < s_comm_count; i++) {
+        uint8_t itf = s_comm_ifaces[i];
+        if (itf == QMX_CDC_IF_PC) continue;     // reserved for the PC pass-through
         err = cdc_acm_host_open(CDC_HOST_ANY_VID, CDC_HOST_ANY_PID,
-                                (uint8_t)s_cdc_iface_hint, &dev_cfg, &s_cdc_handle);
-        if (err == ESP_OK) { ESP_LOGI(TAG, "CDC opened: hint iface %d", s_cdc_iface_hint); return ESP_OK; }
+                                itf, &dev_cfg, &s_cdc_handle);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "CDC opened: comm itf %d", itf);
+            cdc_acm_host_desc_print(s_cdc_handle);
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "open comm itf %d failed: %s", itf, esp_err_to_name(err));
     }
 
-    for (int iface = 0; iface <= 6; iface++) {
-        if (iface == QMX_CDC_IF_PC) continue;   // reserved for the PC pass-through
+    // Only if we never saw a descriptor (non-QMX device, callback missed).
+    for (int iface = 0; s_comm_count == 0 && iface <= 4; iface++) {
         err = cdc_acm_host_open(CDC_HOST_ANY_VID, CDC_HOST_ANY_PID,
                                 (uint8_t)iface, &dev_cfg, &s_cdc_handle);
         if (err == ESP_OK) { ESP_LOGI(TAG, "CDC opened: scan iface %d", iface); return ESP_OK; }
