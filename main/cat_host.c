@@ -14,6 +14,15 @@ static const char *TAG = "cat";
 #define QMX_PID     0xA34C
 #define QMX_CDC_IF  0
 
+// When the QMX has "USB serial ports" set to 2 it exposes a second, fully
+// equivalent CAT channel. Verified interface map on firmware 1_04_004:
+//   0 CDC-comm / 1 CDC-data   -> USB 1 (ours)
+//   2,3,4 audio               -> UAC stream
+//   5 CDC-comm / 6 CDC-data   -> USB 2 (reserved for the PC pass-through)
+// The blind scan below must never grab USB 2, or the pass-through loses its
+// port to our own CAT layer.
+#define QMX_CDC_IF_PC  5
+
 static cdc_acm_dev_hdl_t s_cdc_handle = NULL;
 
 // RX ring buffer filled by CDC callback, drained by cat_host_recv
@@ -82,7 +91,15 @@ static esp_err_t try_open_cdc(void)
     };
 
     esp_err_t err = cdc_acm_host_open(QMX_VID, QMX_PID, QMX_CDC_IF, &dev_cfg, &s_cdc_handle);
-    if (err == ESP_OK) { ESP_LOGI(TAG, "CDC opened: QMX"); return ESP_OK; }
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "CDC opened: QMX");
+        // Dump the config descriptor so we can see the interface layout. With
+        // QMX "USB serial ports" set to 2 this reveals the second CDC function's
+        // communication interface index, which the PC pass-through opens as its
+        // own port (QMX then arbitrates the two CAT masters itself).
+        cdc_acm_host_desc_print(s_cdc_handle);
+        return ESP_OK;
+    }
 
     if (s_cdc_iface_hint >= 0) {
         err = cdc_acm_host_open(CDC_HOST_ANY_VID, CDC_HOST_ANY_PID,
@@ -90,7 +107,8 @@ static esp_err_t try_open_cdc(void)
         if (err == ESP_OK) { ESP_LOGI(TAG, "CDC opened: hint iface %d", s_cdc_iface_hint); return ESP_OK; }
     }
 
-    for (int iface = 0; iface <= 5; iface++) {
+    for (int iface = 0; iface <= 6; iface++) {
+        if (iface == QMX_CDC_IF_PC) continue;   // reserved for the PC pass-through
         err = cdc_acm_host_open(CDC_HOST_ANY_VID, CDC_HOST_ANY_PID,
                                 (uint8_t)iface, &dev_cfg, &s_cdc_handle);
         if (err == ESP_OK) { ESP_LOGI(TAG, "CDC opened: scan iface %d", iface); return ESP_OK; }
