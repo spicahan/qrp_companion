@@ -200,8 +200,10 @@ static void on_mode_change(ui::PropId, ui::Source src) {
     if (mode == 3 && offset > 0) {
         dsp::setCwOffset((float)offset);
         dsp::setModeKnown(true);
-        // CW mode: mute local playback (use QMX's own audio output)
-        ui::set_f32(ui::PROP_audio_gain, 100.0f, ui::FROM_DSP);
+        // Local CW playback used to be forced quiet here because the DSP fed
+        // the raw 3 kHz path and there was no way to silence it on demand.
+        // It now reproduces the QMX's CW passband and pitch, and there is a
+        // dedicated Mute button, so leave the operator's gain alone.
     } else if (mode > 0) {
         dsp::setCwOffset(0);
         dsp::setModeKnown(true);

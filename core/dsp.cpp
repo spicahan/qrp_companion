@@ -188,7 +188,43 @@ static void cw_fir_sample(float in_i, float in_q, float &out_i, float &out_q)
     out_q = acc_q;
 }
 
-// apf_fir_sample removed — APF now handled by QMX via CAT
+// CW audio filter: reproduces the QMX's own CW passband locally, so the Tab5's
+// playback sounds like the radio's. The signal sits at DC here (g_cw_nco moved
+// it there at 48k), so a complex lowpass of BW/2 is the bandpass.
+//
+// Kept separate from g_cw_fir_* on purpose: that one is fixed at 500 Hz because
+// the Goertzel zero-beat searches +/-500 Hz through it, and narrowing it to
+// 25 Hz would blind the search.
+//
+// Tap counts trade skirt sharpness against group delay ((N-1)/2 samples):
+//   250 Hz  -> N=511  ~63 Hz transition,  255 samples = 32 ms
+//    50 Hz  -> N=1023 ~31 Hz transition,  511 samples = 64 ms
+// Narrow CW filters ring; 1/BW is 20 ms for the 50 Hz setting before any
+// filter design enters into it, so this is the right order of magnitude.
+static constexpr int CWAUD_FIR_MAX_TAPS = 1023;
+static float g_cwaud_coeffs[CWAUD_FIR_MAX_TAPS];
+static float g_cwaud_delay_i[CWAUD_FIR_MAX_TAPS];
+static float g_cwaud_delay_q[CWAUD_FIR_MAX_TAPS];
+static int   g_cwaud_taps = 511;
+static int   g_cwaud_pos  = 0;
+
+static void cwaud_fir_sample(float in_i, float in_q, float &out_i, float &out_q)
+{
+    const int N = g_cwaud_taps;
+    g_cwaud_delay_i[g_cwaud_pos] = in_i;
+    g_cwaud_delay_q[g_cwaud_pos] = in_q;
+    g_cwaud_pos = (g_cwaud_pos + 1) % N;
+
+    float acc_i = 0, acc_q = 0;
+    int idx = g_cwaud_pos;
+    for (int k = 0; k < N; k++) {
+        acc_i += g_cwaud_delay_i[idx] * g_cwaud_coeffs[k];
+        acc_q += g_cwaud_delay_q[idx] * g_cwaud_coeffs[k];
+        idx = (idx + 1) % N;
+    }
+    out_i = acc_i;
+    out_q = acc_q;
+}
 
 static float ssb_fir_sample(float in)
 {
@@ -368,8 +404,14 @@ void dsp::init(int sample_rate, int fft_size)
     g_sidetone_nco.phase = 0;
     g_sidetone_nco.inc = 0;
 
-    // APF now handled by QMX via CAT
+    // CW audio passband, mirroring whichever QMX filter the APF button picks.
+    // Designed here so playback is correct before the first APF toggle.
     g_apf_enabled = false;
+    g_cwaud_taps  = 511;
+    g_cwaud_pos   = 0;
+    memset(g_cwaud_delay_i, 0, sizeof(g_cwaud_delay_i));
+    memset(g_cwaud_delay_q, 0, sizeof(g_cwaud_delay_q));
+    design_fir_lowpass(g_cwaud_coeffs, g_cwaud_taps, 250.0f * 0.5f, dec_rate);
 
     // SSB/DIGI filter
     design_fir_lowpass(g_ssb_fir_coeffs, SSB_FIR_TAPS, SSB_FIR_CUTOFF_HZ, dec_rate);
@@ -418,7 +460,28 @@ void dsp::setCwOffset(float offset_hz)
 }
 
 void dsp::setModeKnown(bool known) { g_mode_known = known; }
-void dsp::setApfEnabled(bool enabled) { g_apf_enabled = enabled; }
+// Mirrors the QMX filter the APF button selects over CAT: 50 Hz when engaged,
+// 250 Hz otherwise (those are the only two we leave enabled on the radio).
+// Bandwidth is the full passband, so the complex lowpass cutoff is half of it.
+static void design_cw_audio_filter()
+{
+    float dec_rate = (float)g_sample_rate / AUDIO_DECIM;
+    int   taps     = g_apf_enabled ? 1023 : 511;
+    float bw_hz    = g_apf_enabled ? 50.0f : 250.0f;
+    design_fir_lowpass(g_cwaud_coeffs, taps, bw_hz * 0.5f, dec_rate);
+    if (taps != g_cwaud_taps) {
+        g_cwaud_taps = taps;
+        g_cwaud_pos  = 0;
+        for (int i = 0; i < CWAUD_FIR_MAX_TAPS; i++)
+            g_cwaud_delay_i[i] = g_cwaud_delay_q[i] = 0;
+    }
+}
+
+void dsp::setApfEnabled(bool enabled)
+{
+    g_apf_enabled = enabled;
+    design_cw_audio_filter();
+}
 bool dsp::isApfEnabled() { return g_apf_enabled; }
 
 // ═════════════════════════════════════════════════════════════
@@ -464,8 +527,28 @@ static void process_audio_8k(float di, float dq)
         }
     }
 
-    // Audio output: always 3 kHz LPF on I stream (QMX handles CW sidetone)
-    float audio = ssb_fir_sample(di);
+    // Audio output.
+    //
+    // In CW the wanted signal is sitting at DC, because g_cw_nco shifted it
+    // there at 48k so the filters and Goertzel can work around zero. Taking the
+    // I channel straight out therefore produced a note at 0 Hz -- the reason
+    // local CW playback never sounded right. Filter it to the selected CW
+    // bandwidth, then translate it back up to the radio's CW offset so it is
+    // heard at the same pitch the QMX would give (625 Hz).
+    //
+    // Mixing a complex, one-sided signal up and taking the real part yields the
+    // tone with no image, which is why this is done on I/Q rather than on the
+    // real audio.
+    float audio;
+    if (g_cw_nco_active) {
+        float ci, cq;
+        cwaud_fir_sample(di, dq, ci, cq);
+        float ui, uq;
+        nco::mixUp(g_sidetone_nco, ci, cq, ui, uq);
+        audio = ui;
+    } else {
+        audio = ssb_fir_sample(di);   // SSB/AM/digi: plain 3 kHz LPF on I
+    }
     audio *= g_audio_gain;
     audio = tanhf(audio);
     g_audio_out_buf[g_audio_out_pos++] = audio;
