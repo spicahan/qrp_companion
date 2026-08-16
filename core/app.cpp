@@ -666,10 +666,19 @@ void app::tick()
             bottom_band.dirty = true;   // repaint (button count/labels changed)
         }
 
-        // Show PC-link state on its button (inverted = CDC device is up)
-        bool pclink = pal::pcLinkRunning();
-        if (pclink != btn_pclink.highlight) {
-            btn_pclink.highlight = pclink;
+        // PC-link state, three ways. Highlighting merely "we started" was
+        // misleading: the USB-C half comes up fine even when the QMX has only
+        // one USB serial port, and then every byte from the PC is dropped with
+        // no console left to explain why. Say which half is missing instead.
+        //   0 = off, 1 = up but QMX's 2nd CAT port missing, 2 = whole path live
+        int pclink_state = !pal::pcLinkRunning()        ? 0
+                         : !pal::pcLinkRelayConnected() ? 1
+                                                        : 2;
+        static int last_pclink_state = -1;
+        if (pclink_state != last_pclink_state) {
+            last_pclink_state = pclink_state;
+            btn_pclink.highlight = (pclink_state == 2);
+            btn_pclink.label     = (pclink_state == 1) ? "Need QMX USB2" : "PC Link";
             bottom_band.dirty = true;
         }
     }

@@ -1,6 +1,7 @@
 #include "cat_host.h"
 
 #include <string.h>
+#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_err.h"
@@ -153,6 +154,21 @@ static void cdc_new_dev_cb(usb_device_handle_t usb_dev)
     }
 }
 
+// One line instead of cdc_acm_host_desc_print()'s ~150. The full dump was
+// invaluable while finding the pass-through interface, but it fires on every
+// QMX connect -- exactly when someone is likely probing the port -- and with
+// the PC link off that lands in a PC's serial stream as apparent garbage.
+static void log_iface_summary(void)
+{
+    char list[48] = {0};
+    int n = 0;
+    for (int i = 0; i < s_comm_count && n < (int)sizeof(list) - 4; i++)
+        n += snprintf(list + n, sizeof(list) - n, "%s%u",
+                      i ? "," : "", (unsigned)s_comm_ifaces[i]);
+    ESP_LOGI(TAG, "QMX CDC comm interfaces: [%s] (pass-through wants %d)",
+             list, QMX_CDC_IF_PC);
+}
+
 static esp_err_t try_open_cdc(void)
 {
     if (s_cdc_handle) return ESP_OK;
@@ -169,9 +185,7 @@ static esp_err_t try_open_cdc(void)
     esp_err_t err = cdc_acm_host_open(QMX_VID, QMX_PID, QMX_CDC_IF, &dev_cfg, &s_cdc_handle);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "CDC opened: QMX itf %d", QMX_CDC_IF);
-        // Dump the config descriptor so the interface layout is visible in the
-        // log; this is what tells us where the PC pass-through port lives.
-        cdc_acm_host_desc_print(s_cdc_handle);
+        log_iface_summary();
         return ESP_OK;
     }
     ESP_LOGW(TAG, "open QMX itf %d failed: %s", QMX_CDC_IF, esp_err_to_name(err));
@@ -186,7 +200,7 @@ static esp_err_t try_open_cdc(void)
                                 itf, &dev_cfg, &s_cdc_handle);
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "CDC opened: comm itf %d", itf);
-            cdc_acm_host_desc_print(s_cdc_handle);
+            log_iface_summary();
             return ESP_OK;
         }
         ESP_LOGW(TAG, "open comm itf %d failed: %s", itf, esp_err_to_name(err));

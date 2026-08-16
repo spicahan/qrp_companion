@@ -149,6 +149,7 @@ bool isCharging()      { return s_battery_charging; }
 bool pcLinkSupported() { return true; }
 bool pcLinkRunning()   { return pc_link_running(); }
 void pcLinkStart()     { pc_link_start(); }
+bool pcLinkRelayConnected() { return cat_host_pc_is_connected() != 0; }
 
 int64_t micros() { return esp_timer_get_time(); }
 void delayMs(int ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }

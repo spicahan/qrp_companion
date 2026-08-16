@@ -51,6 +51,10 @@ bool isCharging();
 bool pcLinkSupported();
 bool pcLinkRunning();
 void pcLinkStart();
+// True only when the QMX's second CAT port is also open, i.e. the whole
+// PC <-> QMX path is live. pcLinkRunning() alone only covers the USB-C half,
+// which is up even when the radio has just one USB serial port configured.
+bool pcLinkRelayConnected();
 
 // Timing
 int64_t micros();

@@ -151,6 +151,7 @@ bool isCharging() { return false; }
 bool pcLinkSupported() { return false; }
 bool pcLinkRunning() { return false; }
 void pcLinkStart() {}
+bool pcLinkRelayConnected() { return false; }
 
 int64_t micros()
 {
