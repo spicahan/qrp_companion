@@ -41,7 +41,11 @@ static bool cdc_rx_callback(const uint8_t *data, size_t len, void *user_ctx)
             s_rx_head = next;
         }
     }
-    return false;
+    // true = "consumed, flush the RX buffer". Returning false asks the driver to
+    // APPEND the next transfer to this one, which ESP32-P4 cannot do
+    // (SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE) -- it logged "RX buffer append is not
+    // supported on this target!" once per CAT reply, flooding the console.
+    return true;
 }
 
 static void cdc_event_callback(const cdc_acm_host_dev_event_data_t *event, void *user_ctx)
@@ -64,7 +68,7 @@ static cdc_acm_dev_hdl_t s_pc_handle = NULL;
 static bool pc_rx_callback(const uint8_t *data, size_t len, void *user_ctx)
 {
     pc_link_from_qmx(data, len);
-    return false;
+    return true;   // consumed; see cdc_rx_callback on why this must not be false
 }
 
 static void pc_event_callback(const cdc_acm_host_dev_event_data_t *event, void *user_ctx)
