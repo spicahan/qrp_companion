@@ -21,6 +21,7 @@ add_executable(qrp_companion_desktop
     ../core/app.cpp
     ../core/dsp.cpp
     ../core/cat.cpp
+    ../pal/radio_qmx.cpp
     ../core/nco.cpp
     ../core/ui_state.cpp
     ../core/ui_widget.cpp

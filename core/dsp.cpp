@@ -53,6 +53,7 @@ static float g_d6_coeffs[D6_TAPS];
 
 // ── fs/4 down-conversion mixer ───────────────────────────────
 static int g_mix_phase;
+static int g_input_offset_hz = 12000;
 
 // ── CW offset NCO ───────────────────────────────────────────
 static NcoState g_cw_nco;
@@ -358,6 +359,7 @@ void dsp::init(int sample_rate, int fft_size)
     g_fft_data     = new float[2 * fft_size];
     g_magnitude_db = new float[fft_size];
     g_mix_phase    = 0;
+    g_input_offset_hz = sample_rate / 4;
 
     // WOLA per-span: each span has its own P, M, window, and buffers
     for (int i = 0; i < NUM_SPANS; i++) {
@@ -426,6 +428,18 @@ void dsp::init(int sample_rate, int fft_size)
 }
 
 void dsp::setAudioOutCallback(AudioOutCallback cb) { g_audio_out_cb = cb; }
+bool dsp::setInputOffsetHz(int offset_hz)
+{
+    if (offset_hz != 0 && offset_hz != g_sample_rate / 4) return false;
+    g_input_offset_hz = offset_hz;
+    g_mix_phase = 0;
+    return true;
+}
+
+float dsp::getVfoFraction()
+{
+    return g_cur_span == 0 && g_input_offset_hz != 0 ? 0.75f : 0.5f;
+}
 int  dsp::getDecimatedRate() { return g_sample_rate / AUDIO_DECIM; }
 void dsp::setAudioGain(float gain) { g_audio_gain = gain; }
 float dsp::getAudioGain() { return g_audio_gain; }
@@ -566,15 +580,17 @@ void dsp::pushIQ(const float *iq, int num_frames)
         float I = iq[2 * i];
         float Q = iq[2 * i + 1];
 
-        // fs/4 complex down-conversion
-        float oI, oQ;
-        switch (g_mix_phase) {
-            case 0: oI =  I; oQ =  Q; break;
-            case 1: oI =  Q; oQ = -I; break;
-            case 2: oI = -I; oQ = -Q; break;
-            case 3: oI = -Q; oQ =  I; break;
+        // QMX needs Fs/4 down-conversion; a zero-IF source passes unchanged.
+        float oI = I, oQ = Q;
+        if (g_input_offset_hz != 0) {
+            switch (g_mix_phase) {
+                case 0: oI =  I; oQ =  Q; break;
+                case 1: oI =  Q; oQ = -I; break;
+                case 2: oI = -I; oQ = -Q; break;
+                case 3: oI = -Q; oQ =  I; break;
+            }
+            g_mix_phase = (g_mix_phase + 1) & 3;
         }
-        g_mix_phase = (g_mix_phase + 1) & 3;
 
         // CW offset NCO: shift CW sidetone to DC
         if (g_cw_nco_active) {
@@ -621,7 +637,7 @@ const float* dsp::getMagnitudeDb()   { return g_magnitude_db; }
 
 int dsp::displayBin(int display_idx)
 {
-    if (g_cur_span == 0) {
+    if (g_cur_span == 0 && g_input_offset_hz != 0) {
         // 48k span: rotate by 3N/4 to center VFO (placed at DC by fs/4 mixer)
         return (display_idx + 3 * g_fft_size / 4) % g_fft_size;
     }

@@ -2,7 +2,7 @@
 #include "pal.h"
 #include "draw.h"
 #include "dsp.h"
-#include "cat.h"
+#include "radio.h"
 #include "ui_state.h"
 #include "ui_widget.h"
 #include <cstdio>
@@ -171,7 +171,7 @@ static void draw_waterfall()
 // ═══════════════════════════════════════════════════════════════
 static void on_vfo_change(ui::PropId, ui::Source src) {
     if (src == ui::FROM_UI)
-        cat::setVfoFreq(ui::get_u64(ui::PROP_vfo_freq));
+        pal::radio::setVfoFreq(ui::get_u64(ui::PROP_vfo_freq));
 }
 
 static void on_gain_change(ui::PropId, ui::Source) {
@@ -191,7 +191,7 @@ static void on_span_change(ui::PropId, ui::Source) {
 static void on_apf_change(ui::PropId, ui::Source) {
     bool apf = ui::get_bool(ui::PROP_apf_enabled);
     dsp::setApfEnabled(apf);
-    cat::setCwFilter(apf ? "50" : "250");
+    pal::radio::setCwFilter(apf ? "50" : "250");
 }
 
 static void on_mode_change(ui::PropId, ui::Source src) {
@@ -229,9 +229,9 @@ static void fmt_freq(char *buf, int len) {
         int mhz = (int)(vfo / 1000000);
         int khz = (int)((vfo % 1000000) / 1000);
         int hz  = (int)(vfo % 1000);
-        snprintf(buf, len, "%-4s %d.%03d.%03d", cat::getModeStr(), mhz, khz, hz);
+        snprintf(buf, len, "%-4s %d.%03d.%03d", pal::radio::getModeStr(), mhz, khz, hz);
     } else {
-        snprintf(buf, len, "%-4s ---.---.---", cat::getModeStr());
+        snprintf(buf, len, "%-4s ---.---.---", pal::radio::getModeStr());
     }
     int blen = strlen(buf);
     while (blen < 24) buf[blen++] = ' ';
@@ -288,11 +288,10 @@ static void btn_12k_press(ui::Button &)   { select_span(1); }
 static void btn_4k_press(ui::Button &)    { select_span(2); }
 
 // Band selection — one handler for every dynamically built band button.
-// The button's `tag` carries the QMX BN index discovered by enumeration.
-// BN also restores that band's last-used frequency (band stack), which the
-// old FA-based buttons could not do.
+// The button's `tag` carries a backend-defined band index. The radio backend
+// owns how a band change is implemented, including any band-stack behavior.
 static void btn_band_select_press(ui::Button &self) {
-    cat::setBandIndex(self.tag);
+    pal::radio::setBandIndex(self.tag);
     bottom_band.setLayout("default");
 }
 
@@ -325,10 +324,9 @@ static void btn_mute_press(ui::Button &) {
 
 static ui::Button btn_span, btn_filter, btn_zerobeat, btn_band, btn_dr, btn_mute;
 static ui::Button btn_48k, btn_12k, btn_4k, btn_span_back;
-// Band buttons are built at runtime from the QMX band table (one per
-// configured band), plus Back. Sized to fill the bar so a 5-band QMX gets
-// fat buttons and a 12-band QMX+ still fits on one row.
-static ui::Button btn_bands[cat::MAX_BANDS];
+// Band buttons are built at runtime from the radio's band table, plus Back.
+// Their labels point into backend-owned stable storage.
+static ui::Button btn_bands[pal::radio::MAX_BANDS];
 static ui::Button btn_back;
 static ui::Label  lbl_band_err;   // shown instead when enumeration found nothing
 static ui::Button btn_dr_default, btn_dr_back, btn_pclink;
@@ -364,13 +362,11 @@ static void audio_input_cb(const float *iq_samples, int num_frames) {
 // ═══════════════════════════════════════════════════════════════
 // Dynamic band menu
 // ═══════════════════════════════════════════════════════════════
-// Built from the QMX "Band config." table once CAT enumeration completes, so
-// the menu matches the radio actually connected (QMX vs QMX+ vs custom band
-// sets). Requires firmware with BN + the Band config. grid — if enumeration
-// yields nothing we say so rather than guessing with a hardcoded list.
+// Built from the radio backend's discovered band table. The core does not
+// assume a CAT protocol, band numbering scheme, or hardcoded band list.
 static void fmt_band_err(char *buf, int len) {
     // Enumeration takes a few seconds; only call it a failure once it is done.
-    if (!cat::isBandEnumDone())
+    if (!pal::radio::isBandEnumDone())
         snprintf(buf, len, "Reading bands from radio...");
     else
         snprintf(buf, len, "No bands from radio - please update firmware");
@@ -378,14 +374,14 @@ static void fmt_band_err(char *buf, int len) {
 
 static void rebuild_band_panel()
 {
-    int n = cat::getBandCount();
+    int n = pal::radio::getBandCount();
     int bot_y = log_h - BOTTOM_H;
 
     panel_band_select.clear();
 
     // Wait for the full sweep before showing buttons, otherwise the menu
     // visibly fills in batch by batch if opened during startup.
-    if (!cat::isBandEnumDone()) n = 0;
+    if (!pal::radio::isBandEnumDone()) n = 0;
 
     if (n <= 0) {
         // Still enumerating, or firmware too old to answer.
@@ -398,24 +394,24 @@ static void rebuild_band_panel()
 
     // n band buttons + Back, sized to fill the bar. 5 bands -> fat buttons,
     // 12 bands -> ~98px each, still a comfortable touch target.
-    if (n > cat::MAX_BANDS) n = cat::MAX_BANDS;
+    if (n > pal::radio::MAX_BANDS) n = pal::radio::MAX_BANDS;
     int slots = n + 1;
     int bw = log_w / slots;
-    int cur = cat::getBandIndex();
+    int cur = pal::radio::getBandIndex();
 
     for (int i = 0; i < n; i++) {
-        const cat::BandInfo *bi = cat::getBand(i);
+        const pal::radio::BandInfo *bi = pal::radio::getBand(i);
         if (!bi) continue;
         ui::Button &b = btn_bands[i];
         b.type  = ui::W_BUTTON;
-        b.label = bi->name;          // points into cat's static table
+        b.label = bi->name;          // points into the backend's static table
         b.color = COL_WHITE;
         b.bg    = COL_NAVY;
         b.scale = 2;
         b.on_press = btn_band_select_press;
         b.bind = ui::PROP_COUNT;
         b.show_as_toggle = false;
-        b.tag = bi->index;           // BN index for this band
+        b.tag = bi->index;           // backend-defined index for this band
         b.highlight = (bi->index == cur);
         b.x = i * bw; b.y = bot_y; b.w = bw; b.h = BOTTOM_H;
         panel_band_select.add(&b);
@@ -473,8 +469,14 @@ void app::init()
     ui::on_change(ui::PROP_mode,        on_mode_change);
     ui::on_change(ui::PROP_cw_offset,   on_cwofs_change);
 
+    // The radio owns receiver initialization and the input I/Q convention.
+    // Initialize it before starting audio delivery into the DSP.
+    if (!pal::radio::init())
+        fprintf(stderr, "Radio initialization failed: %s\n", pal::radio::getStatusText());
+
     // --- DSP ---
     dsp::init(SAMPLE_RATE, FFT_SIZE);
+    dsp::setInputOffsetHz(pal::radio::getInputOffsetHz());
     num_bins = dsp::getNumBins();
     wf_db = new float[WF_MAX_LINES * num_bins]();
     wf_pixels_t = new uint16_t[spec_w * WF_MAX_LINES]();
@@ -593,9 +595,7 @@ void app::init()
     panel_span_select.add(&btn_4k);
     panel_span_select.add(&btn_span_back);
 
-    // Band select panel is built at runtime from the QMX band table once CAT
-    // enumeration finishes (see rebuild_band_panel()); until then it shows the
-    // "please update firmware" label.
+    // Build the band panel from backend-provided discovery results.
     make_label(lbl_band_err, 16, bot_y + (BOTTOM_H - 16) / 2, fmt_band_err,
                COL_RED, COL_DGREY, 2, 40);
     make_button(btn_back, "Back", COL_RED, COL_DGREY, btn_back_press);
@@ -620,7 +620,6 @@ void app::init()
     pal::audioOutputOpen(dsp::getDecimatedRate());
     dsp::setAudioOutCallback(audio_output_cb);
     pal::audioInputOpen(audio_input_cb);
-    cat::init();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -640,14 +639,14 @@ void app::tick()
         fps_last_time = t0;
     }
 
-    // --- CAT → properties ---
-    cat::poll();  // RX every frame
+    // --- Radio backend → properties ---
+    pal::radio::poll();
 
-    // 1Hz slow tick — periodic CAT commands and battery readout
+    // 1Hz slow tick — backend housekeeping and battery readout
     static int64_t last_slow_tick = 0;
     if (t0 - last_slow_tick >= 1000000) {
         last_slow_tick = t0;
-        cat::tick1Hz();
+        pal::radio::tick1Hz();
         pal::pollBattery();
 
         // Rebuild the band menu when the table first arrives, and re-highlight
@@ -658,12 +657,12 @@ void app::tick()
         static int  last_band_count = -1;
         static int  last_band_index = -2;
         static bool last_enum_done  = false;
-        if (cat::getBandCount() != last_band_count ||
-            cat::getBandIndex() != last_band_index ||
-            cat::isBandEnumDone() != last_enum_done) {
-            last_band_count = cat::getBandCount();
-            last_band_index = cat::getBandIndex();
-            last_enum_done  = cat::isBandEnumDone();
+        if (pal::radio::getBandCount() != last_band_count ||
+            pal::radio::getBandIndex() != last_band_index ||
+            pal::radio::isBandEnumDone() != last_enum_done) {
+            last_band_count = pal::radio::getBandCount();
+            last_band_index = pal::radio::getBandIndex();
+            last_enum_done  = pal::radio::isBandEnumDone();
             rebuild_band_panel();
             bottom_band.dirty = true;   // repaint (button count/labels changed)
         }
@@ -685,12 +684,12 @@ void app::tick()
         }
     }
 
-    ui::set_i32(ui::PROP_mode, cat::getMode(), ui::FROM_RADIO);
-    ui::set_u64(ui::PROP_vfo_freq, cat::getVfoFreq(), ui::FROM_RADIO);
-    ui::set_i32(ui::PROP_cw_offset, cat::getCwOffset(), ui::FROM_RADIO);
+    ui::set_i32(ui::PROP_mode, pal::radio::getMode(), ui::FROM_RADIO);
+    ui::set_u64(ui::PROP_vfo_freq, pal::radio::getVfoFreq(), ui::FROM_RADIO);
+    ui::set_i32(ui::PROP_cw_offset, pal::radio::getCwOffset(), ui::FROM_RADIO);
 
     // VFO marker position
-    g_vfo_x = (dsp::getSpan() == 0) ? spec_w * 3 / 4 : spec_w / 2;
+    g_vfo_x = static_cast<int>(dsp::getVfoFraction() * spec_w);
 
     // --- Goertzel result → VFO at 1Hz resolution ---
     if (!dsp::isGoertzelRunning() && dsp::getGoertzelResult() != 0) {
@@ -738,7 +737,7 @@ void app::tick()
             drag_start_freq = ui::get_u64(ui::PROP_vfo_freq);
             drag_current_x = evt.x;
             drag_vfo_dirty = false;
-            cat::suppressPolling(true);
+            pal::radio::suppressPolling(true);
         }
         else if (evt.action == pal::TouchEvent::MOVE && dragging) {
             drag_current_x = evt.x;
@@ -766,7 +765,7 @@ void app::tick()
             }
             dragging = false;
             drag_vfo_dirty = false;
-            cat::suppressPolling(false);
+            pal::radio::suppressPolling(false);
         }
     }
 

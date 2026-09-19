@@ -3,6 +3,10 @@
 namespace dsp {
 
 void init(int sample_rate, int fft_size);
+// Configure before audio callbacks start. Supported conventions: zero-IF or
+// +Fs/4 (QMX). Returns false without changing state for unsupported offsets.
+bool setInputOffsetHz(int offset_hz);
+float getVfoFraction(); // Position in displayed span [0,1), including wide span.
 
 // Audio output callback — receives decimated mono float samples at decimated_rate
 using AudioOutCallback = void(*)(const float *samples, int count);
@@ -32,7 +36,7 @@ void clearGoertzelResult();
 void pushIQ(const float *iq, int num_frames);
 
 // Process complex FFT from buffered I/Q data. Returns true if new spectrum available.
-// Data is fs/4 down-converted (VFO at DC) before FFT.
+// The configured input offset is removed (VFO at DC) before FFT.
 bool processIfReady();
 
 int          getNumBins();           // fft_size (full complex spectrum)
