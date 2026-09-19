@@ -1,19 +1,19 @@
 # Tab5 DX software validation
 
-Validated source: `df000b4` on branch `tab5_dx`, 2026-09-19.
+Validated source: `cd5f8f9` on branch `tab5_dx`, 2026-09-19.
 This record is a documentation-only follow-up to that source commit.
 
 ## Result
 
-All four build variants and all four offline regression runners passed.
+All four build variants and all five offline regression runners passed.
 No firmware was flashed, no serial port was opened, and no RF transmission
 was requested. These results do not substitute for supervised board testing.
 
 | Build | Result | Application size |
 | --- | --- | --- |
-| Tab5 DX, default zero IF | PASS | 615696 bytes (`0x96510`) |
-| Tab5 DX, experimental Fs/4 | PASS | 615728 bytes (`0x96530`) |
-| Original Tab5 QMX platform | PASS | 673408 bytes (`0xa4680`) |
+| Tab5 DX, default zero IF | PASS | 619136 bytes (`0x97280`) |
+| Tab5 DX, experimental Fs/4 | PASS | 619168 bytes (`0x972a0`) |
+| Original Tab5 QMX platform | PASS | 673552 bytes (`0xa4710`) |
 | Desktop Qt/PortAudio application, compile only | PASS | Not an embedded image |
 
 ESP-IDF reported version 5.5.1. Existing SDK/library warnings remain; builds
@@ -46,6 +46,7 @@ bash tests/run_native.sh
 bash tests/run_ui.sh
 bash tests/run_rf_engine.sh
 bash tests/run_synth.sh
+bash tests/run_rf_audio.sh
 ```
 
 All run with address/undefined-behavior sanitizers. Coverage includes:
@@ -63,17 +64,32 @@ All run with address/undefined-behavior sanitizers. Coverage includes:
   outliers, ADC rails and incomplete/overflowed batches.
 - Actual Si5351 driver, independently decoded frequency vectors and 404
   injected transaction/readback failures, plus readiness/PLL/reset timeouts.
+- Fast receive retuning: 72 additional injected transaction/readback failures,
+  lock timeout/transient-lock/dead-bus cases. An immediately locked retune uses
+  one PLLB write burst and 13 total transport calls, with no fixed sleep.
+- Production engine: 100 successive retunes leave I2S/G47 running, perform no
+  LPF reads, NVS writes or full clock plans, and retain guarded TX sequencing.
+- Latest-wins mailbox: 20 ms coalescing, in-flight TX exclusion, final gesture
+  target, no-op requests, and cancellation of pending intent across faults.
+- Actual audio dispatcher with native queue/task adapters: bounded fresh-data
+  buffering, copied producer data, stale-after-dequeue invalidation, callback
+  close/reopen barriers, initialization failure and CPU0 task affinity.
+- UI: cancel/cooldown/retry without leaving DR, automatic button readiness,
+  disabled tuning/cooldown gestures, continuous asynchronous drag tuning,
+  touch dispatch before housekeeping/FFT, and no diagnostic header writes.
 
 Framebuffer snapshots from the UI harness were visually inspected for RX,
-TX diagnostics and the power-cycle confirmation screen. The red outline fits
-the physical screen edges and is removed on return to RX.
+TX controls, read-only band tile and the power-cycle confirmation screen. The
+normal screen uses the QMX layout without the former RF diagnostic rows. The
+red outline fits the physical screen edges and is removed on return to RX.
 
 ## Linked-image and migration checks
 
 - RF image has no linked `cat::`, `cat_host_*`, `uac_host_*` or
   `usb_host_install` symbols.
 - Cutoff callback and `gpio_set_level` are in `.iram0.text`; the ISR lock is
-  in `.dram0.data`. Timer ISR affinity is CPU0, RF/ADC worker is CPU1.
+  in `.dram0.data`, and the audio queue storage is in `.dram0.bss`. Timer ISR
+  affinity is CPU0, RF/ADC worker is CPU1, and input DSP runs on CPU0 like QMX.
 - Decoded DX partition table preserves NVS at `0x9000`, size `0x6000`, and
   PHY at `0xf000`, size `0x1000`.
 - Generated DX `flash_args` writes only bootloader at `0x2000`, partition table
@@ -84,10 +100,14 @@ the physical screen edges and is removed on return to RX.
 Default DX binary SHA-256:
 
 ```text
-0671b204430280cba5004a7f2a07c0f23b13b3f0c2c0b05560187396a552c89b
+aa0e3c135f229db6d8620bbce192fb17575b86061c8fa3368403e9fea8050a33
 ```
 
 ## Hardware work still required
+
+The user reported that the initial backend worked on their board. This update's
+fast tuning and audio-dispatch changes have not yet been flashed by this task;
+actual touch latency, audio continuity and PLL settling require another check.
 
 After explicitly arranging a safe flash, first validate boot with no carrier,
 LPF sensing in the full application, shared internal I2C, and PCM stream startup.
