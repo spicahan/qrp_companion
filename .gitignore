@@ -1,4 +1,11 @@
 build/
+build-tab5-dx/
+build-qmx/
+sdkconfig.tab5_dx
+sdkconfig.tab5_dx.old
+sdkconfig.qmx
+sdkconfig.qmx.old
+tests/build/
 desktop/build/
 sdkconfig
 sdkconfig.old

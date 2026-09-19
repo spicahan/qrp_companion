@@ -1,4 +1,5 @@
 #include "pal.h"
+#include "cat_transport.h"
 
 #include <portaudio.h>
 #include <QWidget>

@@ -1,0 +1,6 @@
+# Dedicated RF-board profile; do not reuse the companion's sdkconfig/build dir.
+CONFIG_QRP_PLATFORM_TAB5_DX=y
+CONFIG_QRP_DX_IF_ZERO=y
+CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD=y
+CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.tab5_dx.csv"

@@ -1,7 +1,13 @@
 #include "pal.h"
+#include "sdkconfig.h"
+#if CONFIG_QRP_PLATFORM_TAB5_DX
+#include "rf_board/rf_board.h"
+#else
+#include "cat_transport.h"
 #include "uac_host.h"
 #include "cat_host.h"
 #include "pc_link.h"
+#endif
 
 #include <M5Unified.h>
 #include <lgfx/v1/platforms/esp32p4/Panel_DSI.hpp>
@@ -38,8 +44,14 @@ namespace pal {
 
 bool init(int width, int height)
 {
+#if CONFIG_QRP_PLATFORM_TAB5_DX
+    if (!rf_board::earlySafe()) return false;
+#endif
     auto cfg = M5.config();
     M5.begin(cfg);
+#if CONFIG_QRP_PLATFORM_TAB5_DX
+    if (!rf_board::earlySafe()) return false;
+#endif
 
     auto &dsp = M5.Display;
     dsp.setBrightness(128);
@@ -63,6 +75,9 @@ bool init(int width, int height)
 }
 
 void shutdown() {
+    radio::shutdown();
+    audioInputClose();
+    audioOutputClose();
     if (s_ppa_srm_client) { ppa_unregister_client(s_ppa_srm_client); s_ppa_srm_client = nullptr; }
 }
 
@@ -146,19 +161,28 @@ int  getBatteryLevel() { return s_battery_level; }
 bool isCharging()      { return s_battery_charging; }
 
 // PC link (USB CDC device on USB-C) — see main/pc_link.h
+#if CONFIG_QRP_PLATFORM_TAB5_DX
+bool pcLinkSupported() { return false; }
+bool pcLinkRunning() { return false; }
+void pcLinkStart() {}
+bool pcLinkRelayConnected() { return false; }
+#else
 bool pcLinkSupported() { return true; }
 bool pcLinkRunning()   { return pc_link_running(); }
 void pcLinkStart()     { pc_link_start(); }
 bool pcLinkRelayConnected() { return cat_host_pc_is_connected() != 0; }
+#endif
 
 int64_t micros() { return esp_timer_get_time(); }
 void delayMs(int ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
 int freeHeapKb() { return (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024); }
 int freePsramKb() { return (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024); }
 
+#if !CONFIG_QRP_PLATFORM_TAB5_DX
 bool catIsConnected() { return cat_host_is_connected(); }
 int  catSend(const char *data, int len) { return cat_host_send(data, len); }
 int  catRecv(char *buf, int max_len) { return cat_host_recv(buf, max_len); }
+#endif
 
 void blitBlock(const uint16_t *src, int src_stride, int src_x, int src_y,
                uint16_t *dst, int dst_stride, int dst_x, int dst_y,
@@ -275,14 +299,18 @@ void audioOutputClose()
 }
 
 // Audio input via UAC host
+#if !CONFIG_QRP_PLATFORM_TAB5_DX
 static AudioInputCallback s_audio_cb = nullptr;
 
 bool audioInputOpen(AudioInputCallback cb) { s_audio_cb = cb; uac_host_start(); return true; }
 void audioInputClose() { s_audio_cb = nullptr; }
+#endif
 
 } // namespace pal
 
+#if !CONFIG_QRP_PLATFORM_TAB5_DX
 extern "C" void uac_push_audio_samples(const float *samples, int count)
 {
     if (pal::s_audio_cb) pal::s_audio_cb(samples, count);
 }
+#endif

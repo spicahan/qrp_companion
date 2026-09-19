@@ -7,7 +7,11 @@ extern "C" void app_main(void)
 {
     xTaskCreatePinnedToCore(
         [](void *) {
-            pal::init(1280, 720);
+            if (!pal::init(1280, 720)) {
+                pal::shutdown();
+                vTaskDelete(nullptr);
+                return;
+            }
             app::init();
             for (;;) { app::tick(); vTaskDelay(1); }
         },

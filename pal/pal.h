@@ -65,14 +65,6 @@ void    delayMs(int ms);
 int freeHeapKb();
 int freePsramKb();
 
-// CAT serial transport (raw byte send/receive)
-// Returns true if a CAT-capable serial port is connected.
-bool catIsConnected();
-// Send raw bytes. Returns number of bytes sent, or -1 on error.
-int  catSend(const char *data, int len);
-// Receive up to max_len bytes. Non-blocking, returns bytes read (0 if none).
-int  catRecv(char *buf, int max_len);
-
 // Audio input (stereo 24-bit 48kHz, delivered as I/Q float pairs)
 using AudioInputCallback = void(*)(const float *iq_samples, int num_frames);
 bool audioInputOpen(AudioInputCallback cb);

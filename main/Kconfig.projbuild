@@ -1,0 +1,37 @@
+menu "QRP Companion platform"
+
+choice QRP_PLATFORM
+    prompt "Radio platform"
+    default QRP_PLATFORM_QMX
+
+config QRP_PLATFORM_QMX
+    bool "Tab5 with QMX USB audio/CAT (original companion)"
+
+config QRP_PLATFORM_TAB5_DX
+    bool "Tab5 DX RF daughter board (Si5351 + PCM1808, no CAT)"
+    select ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD
+    select GPIO_CTRL_FUNC_IN_IRAM
+endchoice
+
+choice QRP_DX_IF
+    prompt "RF board receive I/Q offset"
+    depends on QRP_PLATFORM_TAB5_DX
+    default QRP_DX_IF_ZERO
+    help
+        The fitted 33k/1nF amplifier feedback network rolls off above about
+        4.8 kHz. Zero IF is the default for this board. Fs/4 is an experimental
+        option for a revised analog filter or a measured bandwidth comparison;
+        it is not a claim of flat 12 kHz analog response.
+
+config QRP_DX_IF_ZERO
+    bool "Zero IF (current RF board)"
+config QRP_DX_IF_FS4
+    bool "Fs/4 = +12 kHz (experimental, check analog bandwidth)"
+endchoice
+
+config QRP_DX_IQ_OFFSET_HZ
+    int
+    default 12000 if QRP_DX_IF_FS4
+    default 0
+
+endmenu
