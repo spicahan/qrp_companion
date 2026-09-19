@@ -245,8 +245,10 @@ static void flush_audio_out()
 {
     if (g_audio_out_pos > 0 && g_audio_out_cb) {
         g_audio_out_cb(g_audio_out_buf, g_audio_out_pos);
-        g_audio_out_pos = 0;
     }
+    // A missing/closed audio sink still consumes the block. Otherwise the next
+    // input frame would write beyond this fixed buffer during RX transitions.
+    g_audio_out_pos = 0;
 }
 
 // ═════════════════════════════════════════════════════════════
