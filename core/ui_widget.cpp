@@ -46,12 +46,20 @@ void Button::draw(const draw::Framebuf &fb)
 
 bool Button::onTouch(int tx, int ty, int action)
 {
-    if (!contains(tx, ty)) return false;
-    if (action == 0) return true;   // DOWN: consume to prevent fall-through
-    if (action == 1) return true;   // MOVE: consume
-    if (action == 2) {              // UP: fire action
-        if (on_press) on_press(*this);
-        return true;
+    const bool inside = contains(tx, ty);
+    if (action == 0) {
+        pressed = inside;
+        return inside;
+    }
+    if (action == 1) {
+        if (!inside) pressed = false;
+        return inside;
+    }
+    if (action == 2) {
+        const bool activate = pressed && inside;
+        pressed = false;
+        if (activate && on_press) on_press(*this);
+        return inside;
     }
     return false;
 }
@@ -133,17 +141,41 @@ void Panel::draw(const draw::Framebuf &fb)
 
 bool Panel::onTouch(int tx, int ty, int action)
 {
+    auto clear_button_presses = [&]() {
+        for (int i = 0; i < count; ++i)
+            if (widgets[i]->type == W_BUTTON)
+                static_cast<Button*>(widgets[i])->pressed = false;
+    };
+    if (action == 0) clear_button_presses();
+    if (action == 1) {
+        // Do this before dispatch: another button earlier in the panel may
+        // consume the move before the originally pressed button sees it.
+        for (int i = 0; i < count; ++i)
+            if (widgets[i]->type == W_BUTTON && !widgets[i]->contains(tx, ty))
+                static_cast<Button*>(widgets[i])->pressed = false;
+    }
+
+    bool consumed = false;
     // Check sliders first (for drag continuity)
     for (int i = 0; i < count; i++) {
         if (widgets[i]->type == W_SLIDER) {
             auto *s = static_cast<Slider*>(widgets[i]);
-            if (s->dragging) return s->onTouch(tx, ty, action);
+            if (s->dragging) {
+                consumed = s->onTouch(tx, ty, action);
+                break;
+            }
         }
     }
-    for (int i = 0; i < count; i++)
-        if (widgets[i]->visible && widgets[i]->onTouch(tx, ty, action))
-            return true;
-    return false;
+    if (!consumed) {
+        for (int i = 0; i < count; i++) {
+            if (widgets[i]->visible && widgets[i]->onTouch(tx, ty, action)) {
+                consumed = true;
+                break;
+            }
+        }
+    }
+    if (action == 2) clear_button_presses();
+    return consumed;
 }
 
 // ── Band ──
@@ -151,6 +183,11 @@ void Band::setLayout(const char *panel_id)
 {
     for (int i = 0; i < panel_count; i++) {
         if (strcmp(panels[i]->id, panel_id) == 0) {
+            if (Panel *old = active()) {
+                for (int j = 0; j < old->count; ++j)
+                    if (old->widgets[j]->type == W_BUTTON)
+                        static_cast<Button*>(old->widgets[j])->pressed = false;
+            }
             active_idx = i;
             dirty = true;
             return;
@@ -171,8 +208,15 @@ void Band::draw(const draw::Framebuf &fb)
 
 bool Band::onTouch(int tx, int ty, int action)
 {
-    if (tx < x || tx >= x + w || ty < y || ty >= y + h) return false;
     Panel *p = active();
+    if (tx < x || tx >= x + w || ty < y || ty >= y + h) {
+        if (p) {
+            for (int i = 0; i < p->count; ++i)
+                if (p->widgets[i]->type == W_BUTTON)
+                    static_cast<Button*>(p->widgets[i])->pressed = false;
+        }
+        return false;
+    }
     return p ? p->onTouch(tx, ty, action) : false;
 }
 

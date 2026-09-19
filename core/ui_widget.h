@@ -54,6 +54,9 @@ struct Button : Widget {
     int tag = 0;
     // Draw inverted regardless of `bind` (e.g. mark the active band).
     bool highlight = false;
+    // A release must belong to a deliberate press on this button. In
+    // particular, dragging a tuning gesture into a TX button must not key it.
+    bool pressed = false;
 
     void draw(const draw::Framebuf &fb) override;
     bool onTouch(int tx, int ty, int action) override;

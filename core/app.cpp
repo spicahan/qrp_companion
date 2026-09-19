@@ -1,6 +1,7 @@
 #include "app.h"
 #include "pal.h"
 #include "draw.h"
+#include "frame_border.h"
 #include "dsp.h"
 #include "radio.h"
 #include "ui_state.h"
@@ -23,6 +24,7 @@ static int log_w, log_h;
 static int spec_w, spec_x, spec_y;
 static int wf_y, wf_h;
 static draw::Framebuf fb;
+static FrameBorder tx_border;
 
 // Colors
 static uint16_t COL_NAVY, COL_DGREY, COL_BLACK, COL_WHITE;
@@ -56,6 +58,14 @@ static int   drag_current_x;
 static bool  drag_vfo_dirty = false;
 
 static void update_mute_button_label();
+static void rebuild_diagnostic_panel();
+static bool power_cycle_confirmation = false;
+
+static bool tuning_allowed()
+{
+    const auto state = pal::radio::getState();
+    return state == pal::radio::State::Receive || state == pal::radio::State::Unmanaged;
+}
 
 
 
@@ -170,8 +180,15 @@ static void draw_waterfall()
 // Property change callbacks (system integration)
 // ═══════════════════════════════════════════════════════════════
 static void on_vfo_change(ui::PropId, ui::Source src) {
-    if (src == ui::FROM_UI)
+    if (src == ui::FROM_UI) {
+        if (!tuning_allowed()) {
+            ui::set_u64(ui::PROP_vfo_freq, pal::radio::getVfoFreq(), ui::FROM_RADIO);
+            return;
+        }
         pal::radio::setVfoFreq(ui::get_u64(ui::PROP_vfo_freq));
+        // An asynchronous request is not confirmation that hardware moved.
+        ui::set_u64(ui::PROP_vfo_freq, pal::radio::getVfoFreq(), ui::FROM_RADIO);
+    }
 }
 
 static void on_gain_change(ui::PropId, ui::Source) {
@@ -291,20 +308,26 @@ static void btn_4k_press(ui::Button &)    { select_span(2); }
 // The button's `tag` carries a backend-defined band index. The radio backend
 // owns how a band change is implemented, including any band-stack behavior.
 static void btn_band_select_press(ui::Button &self) {
-    pal::radio::setBandIndex(self.tag);
+    if (!pal::radio::bandSelectionReadOnly() && tuning_allowed())
+        pal::radio::setBandIndex(self.tag);
     bottom_band.setLayout("default");
 }
 
 // Dynamic range (DR) mode
 static void btn_dr_press(ui::Button &) {
+    power_cycle_confirmation = false;
+    rebuild_diagnostic_panel();
     bottom_band.setLayout("dr_active");
     right_band.setLayout("dr_sliders");
 }
 static void btn_dr_default_press(ui::Button &) {
+    power_cycle_confirmation = false;
+    rebuild_diagnostic_panel();
     ui::set_f32(ui::PROP_db_floor, SPEC_DB_FLOOR, ui::FROM_UI);
     ui::set_f32(ui::PROP_db_ceil, SPEC_DB_CEIL, ui::FROM_UI);
 }
 static void btn_dr_back_press(ui::Button &) {
+    power_cycle_confirmation = false;
     bottom_band.setLayout("default");
     right_band.setLayout("default");
 }
@@ -322,14 +345,41 @@ static void btn_mute_press(ui::Button &) {
     ui::set_bool(ui::PROP_audio_muted, !ui::get_bool(ui::PROP_audio_muted));
 }
 
+static void btn_tx_test_press(ui::Button &)
+{
+    power_cycle_confirmation = false;
+    const auto state = pal::radio::getState();
+    const bool stopping = state == pal::radio::State::PreparingTx ||
+                          state == pal::radio::State::Transmit ||
+                          state == pal::radio::State::ReturningRx;
+    if (pal::radio::txTestSupported() && (stopping || state == pal::radio::State::Receive))
+        pal::radio::requestTransmit(!stopping);
+}
+
+static void btn_power_cycle_press(ui::Button &)
+{
+    if (!pal::radio::powerCycleAcknowledgementRequired()) {
+        power_cycle_confirmation = false;
+        return;
+    }
+    if (!power_cycle_confirmation) {
+        power_cycle_confirmation = true;
+    } else {
+        power_cycle_confirmation = false;
+        pal::radio::acknowledgePowerCycle();
+    }
+    rebuild_diagnostic_panel();
+}
+
 static ui::Button btn_span, btn_filter, btn_zerobeat, btn_band, btn_dr, btn_mute;
 static ui::Button btn_48k, btn_12k, btn_4k, btn_span_back;
 // Band buttons are built at runtime from the radio's band table, plus Back.
 // Their labels point into backend-owned stable storage.
 static ui::Button btn_bands[pal::radio::MAX_BANDS];
 static ui::Button btn_back;
-static ui::Label  lbl_band_err;   // shown instead when enumeration found nothing
-static ui::Button btn_dr_default, btn_dr_back, btn_pclink;
+static ui::Label  lbl_band_err;   // discovery/LPF read-only status
+static ui::Button btn_dr_default, btn_dr_back, btn_pclink, btn_tx_test, btn_power_cycle;
+static char tx_test_label[32];
 
 static ui::Panel panel_bottom_default = { "default" };
 static ui::Panel panel_span_select    = { "span_select" };
@@ -349,6 +399,69 @@ static void update_mute_button_label()
     btn_mute.label = pal::audioIsMuted() ? "Audio Muted" : "Mute Audio";
 }
 
+static void update_tx_button()
+{
+    using State = pal::radio::State;
+    const State state = pal::radio::getState();
+    btn_tx_test.highlight = state == State::Transmit || state == State::ReturningRx;
+    switch (state) {
+        case State::PreparingTx: btn_tx_test.label = "Cancel TX prep"; break;
+        case State::Transmit: btn_tx_test.label = "Return RX"; break;
+        case State::ReturningRx: btn_tx_test.label = "Stopping TX"; break;
+        case State::Fault: btn_tx_test.label = "TX blocked"; break;
+        case State::Starting: btn_tx_test.label = "Starting RX"; break;
+        case State::Offline: btn_tx_test.label = "Radio offline"; break;
+        default:
+            snprintf(tx_test_label, sizeof(tx_test_label), "TX Test %lus",
+                     static_cast<unsigned long>(pal::radio::getTxTestLimitMs() / 1000));
+            btn_tx_test.label = tx_test_label;
+            break;
+    }
+}
+
+static void rebuild_diagnostic_panel()
+{
+    panel_dr_bottom.clear();
+    ui::Button *buttons[5] = { &btn_dr_default };
+    int count = 1;
+    if (pal::pcLinkSupported()) buttons[count++] = &btn_pclink;
+    if (pal::radio::txTestSupported()) buttons[count++] = &btn_tx_test;
+    if (pal::radio::powerCycleAcknowledgementRequired()) {
+        btn_power_cycle.label = power_cycle_confirmation ? "Confirm restart RX" : "Recover RX";
+        buttons[count++] = &btn_power_cycle;
+    }
+    buttons[count++] = &btn_dr_back;
+    const int width = log_w / count;
+    for (int i = 0; i < count; ++i) {
+        auto &button = *buttons[i];
+        button.x = i * width;
+        button.y = log_h - BOTTOM_H;
+        button.w = (i == count - 1) ? log_w - button.x : width;
+        button.h = BOTTOM_H;
+        button.pressed = false;
+        panel_dr_bottom.add(&button);
+    }
+    update_tx_button();
+    bottom_band.dirty = true;
+}
+
+static void draw_radio_status()
+{
+    if (!pal::radio::txTestSupported() && !pal::radio::bandSelectionReadOnly()) return;
+    const char *caution = power_cycle_confirmation
+        ? "Confirm RF battery AND external power removed, then restored."
+        : "TX test: 40m LPF + rated 50-ohm dummy load. No antenna.";
+    char status[64];
+    snprintf(status, sizeof(status), "%s", power_cycle_confirmation
+        ? "Only then tap Confirm restart RX. Back cancels; never auto-TX."
+        : pal::radio::getStatusText());
+    // Clear full rows so a shorter status never leaves stale text behind.
+    draw::fillRect(fb, 0, 8, log_w, 16, COL_NAVY);
+    draw::fillRect(fb, 0, HEADER_H - 24, log_w, 16, COL_NAVY);
+    draw::drawText(fb, 16, 8, caution, COL_YELLOW, COL_NAVY, 2);
+    draw::drawText(fb, 16, HEADER_H - 24, status, COL_CYAN, COL_NAVY, 2);
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Audio callbacks
 // ═══════════════════════════════════════════════════════════════
@@ -365,6 +478,18 @@ static void audio_input_cb(const float *iq_samples, int num_frames) {
 // Built from the radio backend's discovered band table. The core does not
 // assume a CAT protocol, band numbering scheme, or hardcoded band list.
 static void fmt_band_err(char *buf, int len) {
+    if (pal::radio::bandSelectionReadOnly()) {
+        const pal::radio::BandInfo *current = nullptr;
+        for (int i = 0; i < pal::radio::getBandCount(); ++i) {
+            const auto *band = pal::radio::getBand(i);
+            if (band && band->index == pal::radio::getBandIndex()) current = band;
+        }
+        if (current)
+            snprintf(buf, len, "LPF: %sm (read-only; power off before changing)", current->name);
+        else
+            snprintf(buf, len, "LPF unavailable: %.40s", pal::radio::getStatusText());
+        return;
+    }
     // Enumeration takes a few seconds; only call it a failure once it is done.
     if (!pal::radio::isBandEnumDone())
         snprintf(buf, len, "Reading bands from radio...");
@@ -383,8 +508,9 @@ static void rebuild_band_panel()
     // visibly fills in batch by batch if opened during startup.
     if (!pal::radio::isBandEnumDone()) n = 0;
 
-    if (n <= 0) {
-        // Still enumerating, or firmware too old to answer.
+    if (n <= 0 || pal::radio::bandSelectionReadOnly()) {
+        // Discovery status, or an LPF-derived informational band (never a button).
+        lbl_band_err.color = (n > 0 && pal::radio::bandSelectionReadOnly()) ? COL_CYAN : COL_RED;
         panel_band_select.add(&lbl_band_err);
         btn_back.x = log_w - log_w / 6; btn_back.y = bot_y;
         btn_back.w = log_w / 6;         btn_back.h = BOTTOM_H;
@@ -413,6 +539,7 @@ static void rebuild_band_panel()
         b.show_as_toggle = false;
         b.tag = bi->index;           // backend-defined index for this band
         b.highlight = (bi->index == cur);
+        b.pressed = false;
         b.x = i * bw; b.y = bot_y; b.w = bw; b.h = BOTTOM_H;
         panel_band_select.add(&b);
     }
@@ -527,6 +654,9 @@ void app::init()
     make_button(btn_dr_default, "Default", COL_CYAN, COL_DGREY, btn_dr_default_press);
     make_button(btn_dr_back,    "Back",    COL_RED,  COL_DGREY, btn_dr_back_press);
     make_button(btn_pclink,     "PC Link", COL_CYAN, COL_DGREY, btn_pclink_press);
+    make_button(btn_tx_test, "TX Test", COL_RED, COL_DGREY, btn_tx_test_press);
+    make_button(btn_power_cycle, "Recover RX", COL_YELLOW, COL_DGREY, btn_power_cycle_press);
+    if (pal::radio::bandSelectionReadOnly()) btn_band.label = "LPF";
     update_mute_button_label();
 
     // Init sliders
@@ -601,14 +731,8 @@ void app::init()
     make_button(btn_back, "Back", COL_RED, COL_DGREY, btn_back_press);
     rebuild_band_panel();
 
-    // DR mode bottom panel (Default | PC Link | Back)
-    int drw = log_w / 3;
-    btn_dr_default.x = 0;      btn_dr_default.y = bot_y; btn_dr_default.w = drw;         btn_dr_default.h = BOTTOM_H;
-    btn_pclink.x = drw;        btn_pclink.y = bot_y;     btn_pclink.w = drw;             btn_pclink.h = BOTTOM_H;
-    btn_dr_back.x = 2*drw;     btn_dr_back.y = bot_y;    btn_dr_back.w = log_w - 2*drw;  btn_dr_back.h = BOTTOM_H;
-    panel_dr_bottom.add(&btn_dr_default);
-    panel_dr_bottom.add(&btn_pclink);
-    panel_dr_bottom.add(&btn_dr_back);
+    // Diagnostics expose only controls the selected radio/platform supports.
+    rebuild_diagnostic_panel();
 
     bottom_band.x = 0; bottom_band.y = bot_y; bottom_band.w = log_w; bottom_band.h = BOTTOM_H;
     bottom_band.addPanel(&panel_bottom_default);
@@ -627,6 +751,8 @@ void app::init()
 // ═══════════════════════════════════════════════════════════════
 void app::tick()
 {
+    // Must precede all drawing and any future visible-window/ring movement.
+    tx_border.restore();
     int64_t t0 = pal::micros();
 
     // FPS
@@ -641,6 +767,22 @@ void app::tick()
 
     // --- Radio backend → properties ---
     pal::radio::poll();
+    static bool last_power_cycle_required = false;
+    static bool last_tx_supported = false;
+    const bool power_cycle_required = pal::radio::powerCycleAcknowledgementRequired();
+    const bool tx_supported = pal::radio::txTestSupported();
+    if (power_cycle_required != last_power_cycle_required || tx_supported != last_tx_supported) {
+        last_power_cycle_required = power_cycle_required;
+        last_tx_supported = tx_supported;
+        power_cycle_confirmation = false;
+        rebuild_diagnostic_panel();
+    }
+    update_tx_button();
+    if (!tuning_allowed() && dragging) {
+        dragging = false;
+        drag_vfo_dirty = false;
+        pal::radio::suppressPolling(false);
+    }
 
     // 1Hz slow tick — backend housekeeping and battery readout
     static int64_t last_slow_tick = 0;
@@ -696,7 +838,7 @@ void app::tick()
         float g_offset = dsp::getGoertzelResult();
         dsp::clearGoertzelResult();
         uint64_t vfo = ui::get_u64(ui::PROP_vfo_freq);
-        if (vfo > 0) {
+        if (vfo > 0 && tuning_allowed()) {
             int delta = -(int)roundf(g_offset);
             if (delta != 0)
                 ui::set_u64(ui::PROP_vfo_freq, (int64_t)vfo + delta, ui::FROM_UI);
@@ -731,7 +873,7 @@ void app::tick()
         // Spectrum touch-to-tune / drag-to-tune (only in spectrum/WF area)
         bool in_spec_wf = (evt.x >= spec_x && evt.x < spec_x + spec_w &&
                            evt.y >= spec_y && evt.y < wf_y + wf_h);
-        if (evt.action == pal::TouchEvent::DOWN && in_spec_wf) {
+        if (evt.action == pal::TouchEvent::DOWN && in_spec_wf && tuning_allowed()) {
             dragging = true;
             drag_start_x = evt.x;
             drag_start_freq = ui::get_u64(ui::PROP_vfo_freq);
@@ -779,6 +921,8 @@ void app::tick()
         drag_vfo_dirty = false;
     }
 
+    update_tx_button();
+
     // --- Draw frame ---
     static bool first_frame = true;
     if (first_frame) {
@@ -795,6 +939,11 @@ void app::tick()
     header_band.draw(fb);
     right_band.draw(fb);
     bottom_band.draw(fb);
+
+    draw_radio_status();
+    const auto radio_state = pal::radio::getState();
+    if (radio_state == pal::radio::State::Transmit || radio_state == pal::radio::State::ReturningRx)
+        tx_border.apply(fb, COL_RED, 2);
 
     pal::commitFrame();
     ui::clear_all_dirty();
