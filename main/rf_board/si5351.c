@@ -210,6 +210,10 @@ esp_err_t si5351_write_registers(si5351_t *device, uint8_t start_reg,
                             length <= SI5351_MAX_BURST_BYTES,
                         ESP_ERR_INVALID_ARG, TAG, "invalid register write");
 
+    // Callers that construct a complete, verified radio operation restore this
+    // only after success. Arbitrary public writes must never leave stale state.
+    device->radio_rx_ready = false;
+
     uint8_t transfer[SI5351_MAX_BURST_BYTES + 1U];
     transfer[0] = start_reg;
     memcpy(&transfer[1], values, length);
@@ -523,6 +527,88 @@ esp_err_t si5351_configure_radio_clock_plan(si5351_t *device, uint32_t rf_hz,
         error = configure_radio_clock_plan(device, rf_hz, band_20m, verify);
     if (error != ESP_OK)
         (void)si5351_set_enabled_outputs(device, 0U, false);
+    else {
+        device->radio_rx_ready = verify;
+        device->radio_band_20m = band_20m;
+        device->radio_rx_hz = rf_hz;
+    }
+    return error;
+}
+
+static esp_err_t retune_receive(si5351_t *device, uint32_t rf_hz, bool band_20m)
+{
+    ESP_RETURN_ON_FALSE(device->radio_rx_ready && device->radio_band_20m == band_20m,
+                        ESP_ERR_INVALID_STATE, TAG, "RX retune requires a validated same-band plan");
+    const uint64_t pll_hz = (uint64_t)rf_hz * (band_20m ? 56U : 112U);
+    ESP_RETURN_ON_FALSE(pll_hz >= SI5351_PLL_MIN_HZ && pll_hz <= SI5351_PLL_MAX_HZ,
+                        ESP_ERR_INVALID_ARG, TAG, "RX PLL frequency outside hardware range");
+    uint8_t output_mask = 0;
+    ESP_RETURN_ON_ERROR(si5351_read_register(device, SI5351_REG_OUTPUT_ENABLE,
+                                              &output_mask), TAG, "cannot verify RX output mask");
+    ESP_RETURN_ON_FALSE(output_mask == (uint8_t)~SI5351_OUTPUT_CLK1,
+                        ESP_ERR_INVALID_STATE, TAG, "RX retune found unexpected clock enables");
+
+    si5351_synth_parameters_t pll = {0};
+    ESP_RETURN_ON_ERROR(calculate_parameters(pll_hz, device->reference_hz,
+                                              15U, 90U, &pll), TAG, "invalid RX PLL ratio");
+    uint8_t parameters[8];
+    encode_parameters(&pll, parameters);
+    // AN619 describes PLLB's feedback ratio at 34..41 independently of its
+    // fixed MS1 output divider. The plan/reference/dividers/phase are unchanged,
+    // so update that ratio without replaying the power-up/reset procedure.
+    // AN1423 Q8 notes that dynamic frequency changes lose inter-output skew
+    // guarantees until reset; only CLK1 runs here, and the QSD derives both
+    // phases externally from it. Reset-free PLL adjustment is also supported by
+    // upstream Linux clk-si5351 (commit b2adbc9cea752539f6421e9d4642408f666c1251).
+    // Neither source specifies an analog settling bound for this board; the
+    // lock/readback checks below are not a measurement of that settling time.
+    ESP_RETURN_ON_ERROR(si5351_write_registers(device, SI5351_REG_PLLB_PARAMETERS,
+                                                parameters, sizeof(parameters)),
+                        TAG, "RX PLL update failed");
+    for (size_t index = 0; index < sizeof(parameters); ++index) {
+        uint8_t actual = 0;
+        ESP_RETURN_ON_ERROR(si5351_read_register(device,
+            (uint8_t)(SI5351_REG_PLLB_PARAMETERS + index), &actual), TAG,
+            "RX PLL readback failed");
+        ESP_RETURN_ON_FALSE(actual == parameters[index], ESP_ERR_INVALID_RESPONSE,
+                            TAG, "RX PLL readback mismatch");
+    }
+    // Usually already locked by the end of readback; no unconditional sleep.
+    // Changed parameters need a new lock check, not reset of unrelated PLLA.
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t timeout = pdMS_TO_TICKS(20U) + 1U;
+    unsigned clear_reads = 0;
+    do {
+        uint8_t status = 0;
+        ESP_RETURN_ON_ERROR(si5351_read_register(device, SI5351_REG_DEVICE_STATUS,
+                                                  &status), TAG, "RX lock read failed");
+        if ((status & (SI5351_STATUS_SYS_INIT | SI5351_STATUS_LOS_XTAL | SI5351_STATUS_LOL_B)) == 0) {
+            if (++clear_reads == 2U) break;
+        } else {
+            clear_reads = 0;
+            vTaskDelay(1);
+        }
+    } while ((xTaskGetTickCount() - start) < timeout);
+    ESP_RETURN_ON_FALSE(clear_reads == 2U, ESP_ERR_TIMEOUT, TAG, "RX PLL did not lock");
+    ESP_RETURN_ON_ERROR(si5351_read_register(device, SI5351_REG_OUTPUT_ENABLE,
+                                              &output_mask), TAG, "cannot recheck TX off");
+    ESP_RETURN_ON_FALSE(output_mask == (uint8_t)~SI5351_OUTPUT_CLK1,
+                        ESP_ERR_INVALID_STATE, TAG, "RX output mask changed during retune");
+    return ESP_OK;
+}
+
+esp_err_t si5351_retune_receive(si5351_t *device, uint32_t rf_hz, bool band_20m)
+{
+    ESP_RETURN_ON_FALSE(device != NULL && device->initialized,
+                        ESP_ERR_INVALID_ARG, TAG, "device is not initialized");
+    const esp_err_t error = retune_receive(device, rf_hz, band_20m);
+    if (error != ESP_OK) {
+        device->radio_rx_ready = false;
+        (void)si5351_set_enabled_outputs(device, 0U, false);
+    } else {
+        device->radio_rx_ready = true;
+        device->radio_rx_hz = rf_hz;
+    }
     return error;
 }
 

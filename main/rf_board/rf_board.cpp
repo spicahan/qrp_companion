@@ -1,6 +1,7 @@
 #include "rf_board.h"
 #include "rf_engine.h"
 #include "rf_mailbox.h"
+#include "rf_audio.h"
 #include "iq_format.h"
 #include "pal.h"
 #include "lpf_sense.h"
@@ -8,7 +9,6 @@
 #include "si5351.h"
 #include "sdkconfig.h"
 #include <M5Unified.h>
-#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <driver/gpio.h>
@@ -39,7 +39,7 @@ using State = pal::radio::State;
 constexpr gpio_num_t POWER = GPIO_NUM_48;
 constexpr gpio_num_t RXSW = GPIO_NUM_47;
 constexpr uint32_t BUS_HZ = 100000;
-constexpr size_t FRAMES = 240;
+constexpr size_t FRAMES = rf_audio::BLOCK_FRAMES;
 constexpr uint32_t RATE = 48000;
 constexpr uint64_t PREP_US = 3000000;
 const char *const TAG = "tab5_dx";
@@ -56,9 +56,17 @@ TaskHandle_t worker_handle = nullptr;
 bool start_tx_requested = false;
 bool acknowledge_requested = false;
 bool shutdown_requested = false;
-uint64_t tune_requested = 0;
-std::atomic<pal::AudioInputCallback> audio_callback{nullptr};
-std::atomic<bool> audio_callback_busy{false};
+rf_board::TuneMailbox tune_mailbox;
+
+// Call only while holding guard_mux; the UI hint and actual request share the
+// same authoritative predicate, but requestTransmit always checks it again.
+bool tx_ready_locked()
+{
+    return worker_handle && published.state == State::Receive && published.band == Band::B40 &&
+           !start_tx_requested && !stop_requested && !guard_tripped && !shutdown_requested &&
+           !tune_mailbox.busyOrPending() &&
+           static_cast<uint64_t>(esp_timer_get_time()) / 1000 >= published.cooldown_until_ms;
+}
 
 void IRAM_ATTR cutoff(void *)
 {
@@ -144,9 +152,11 @@ public:
     void publish(const Snapshot &snapshot) override
     {
         portENTER_CRITICAL(&guard_mux);
+        if (snapshot.state != State::Receive) tune_mailbox.cancelPending();
+        const bool routine_rx_update = published.state == State::Receive && snapshot.state == State::Receive;
         published = snapshot;
         portEXIT_CRITICAL(&guard_mux);
-        ESP_LOGI(TAG, "%s", snapshot.status);
+        if (!routine_rx_update) ESP_LOGI(TAG, "%s", snapshot.status);
     }
     uint64_t nowMs() override { return static_cast<uint64_t>(esp_timer_get_time()) / 1000; }
     bool marker(bool pending) override
@@ -187,6 +197,13 @@ public:
         if (cancelled()) return false;
         const uint32_t lo = frequency - (receive ? CONFIG_QRP_DX_IQ_OFFSET_HZ : 0);
         return si5351_configure_radio_clock_plan(&synthesizer, lo, band == Band::B20, true) == ESP_OK &&
+               !cancelled();
+    }
+    bool retuneReceive(uint32_t frequency, Band band) override
+    {
+        if (cancelled() || !adc.enabled) return false;
+        const uint32_t lo = frequency - CONFIG_QRP_DX_IQ_OFFSET_HZ;
+        return si5351_retune_receive(&synthesizer, lo, band == Band::B20) == ESP_OK &&
                !cancelled();
     }
     bool transmitClockOn() override
@@ -252,6 +269,7 @@ public:
     }
     bool stopAudio() override
     {
+        rf_audio::invalidate();
         const bool ok = pcm1808_i2s_deinit(&adc) == ESP_OK;
         // Deleting the channel plus resetting routing removes P4's MCLK.
         if (ok) {
@@ -269,12 +287,7 @@ public:
         if (pcm1808_i2s_read(&adc, words, FRAMES, &received, 30) != ESP_OK || received == 0)
             return false;
         if (!rf_board::convertPcm1808IQ(words, iq, received)) return false;
-        // Mark the critical lifetime BEFORE loading the callback. Close first
-        // clears the pointer, then waits for this section to drain.
-        audio_callback_busy.store(true);
-        const auto callback = audio_callback.load();
-        if (callback) callback(iq, static_cast<int>(received));
-        audio_callback_busy.store(false);
+        rf_audio::submit(iq, received);
         return true;
     }
     bool prepGuardStart() override
@@ -342,19 +355,20 @@ void worker(void *)
         const bool stop = shutdown_requested;
         const bool tx = start_tx_requested;
         const bool ack = acknowledge_requested;
-        const uint64_t frequency = tune_requested;
+        const uint64_t frequency = tune_mailbox.claim(published, tx,
+            static_cast<uint64_t>(esp_timer_get_time()) / 1000);
         start_tx_requested = false;
         acknowledge_requested = false;
-        tune_requested = 0;
-        // Claim tuning under the same lock as the mailbox snapshot. Otherwise
-        // the UI could accept a TX request in the small gap before tune()
-        // publishes Starting, then a cancellation could interrupt that retune.
-        (void)rf_board::claimTune(published, frequency, tx);
         portEXIT_CRITICAL(&guard_mux);
         if (stop) { engine.shutdown(); break; }
         if (ack) (void)engine.acknowledgePowerCycle();
         if (tx) (void)engine.beginTransmit();
-        if (frequency) (void)engine.tune(frequency);
+        if (frequency) {
+            (void)engine.tune(frequency);
+            portENTER_CRITICAL(&guard_mux);
+            tune_mailbox.complete();
+            portEXIT_CRITICAL(&guard_mux);
+        }
         engine.serviceTransmit();
         if (engine.snapshot().state == State::Receive) {
             if (!hardware.deliverAudio()) engine.streamFailed();
@@ -387,20 +401,21 @@ bool rf_board::earlySafe()
 namespace pal {
 bool audioInputOpen(AudioInputCallback callback)
 {
-    audio_callback.store(callback);
-    return callback != nullptr;
+    return rf_audio::open(callback);
 }
-void audioInputClose()
-{
-    audio_callback.store(nullptr);
-    while (audio_callback_busy.load()) vTaskDelay(1);
-}
+void audioInputClose() { rf_audio::close(); }
 } // namespace pal
 
 namespace pal::radio {
 bool init()
 {
     if (!early_safe_ok || worker_handle) return false;
+    if (!rf_audio::initialize()) {
+        published.state = State::Fault;
+        std::strcpy(published.status, "Audio dispatcher initialization failed; RF power OFF");
+        ui_snapshot = published;
+        return false;
+    }
     published.state = State::Starting;
     std::strcpy(published.status, "Starting RF board; no boot TX");
     ui_snapshot = published;
@@ -433,8 +448,8 @@ const char *getModeStr() { return ui_snapshot.frequency ? "I/Q" : "---"; }
 void setVfoFreq(uint64_t frequency)
 {
     portENTER_CRITICAL(&guard_mux);
-    if (published.state == State::Receive && !start_tx_requested &&
-        rf_board::Engine::frequencyAllowed(published.band, frequency)) tune_requested = frequency;
+    if (published.state == State::Receive && !start_tx_requested && !stop_requested && !guard_tripped &&
+        rf_board::Engine::frequencyAllowed(published.band, frequency)) tune_mailbox.request(frequency);
     portEXIT_CRITICAL(&guard_mux);
 }
 void suppressPolling(bool) {}
@@ -453,7 +468,20 @@ int getBandIndex() { const auto *band = getBand(0); return band ? band->index : 
 bool bandSelectionReadOnly() { return true; }
 void setBandIndex(int) {}
 bool txTestSupported() { return ui_snapshot.band == Band::B40; }
+bool txTestReady()
+{
+    portENTER_CRITICAL(&guard_mux);
+    const bool ready = tx_ready_locked();
+    portEXIT_CRITICAL(&guard_mux);
+    return ready;
+}
 uint32_t getTxTestLimitMs() { return rf_board::Engine::TX_HARD_LIMIT_MS; }
+uint32_t getTxCooldownRemainingMs()
+{
+    const uint64_t now = static_cast<uint64_t>(esp_timer_get_time()) / 1000;
+    return now < ui_snapshot.cooldown_until_ms
+        ? static_cast<uint32_t>(ui_snapshot.cooldown_until_ms - now) : 0;
+}
 bool requestTransmit(bool enable)
 {
     bool accepted = false;
@@ -464,11 +492,8 @@ bool requestTransmit(bool enable)
             start_tx_requested = false;
             accepted = true;
         } else accepted = published.state == State::Receive;
-    } else if (worker_handle && published.state == State::Receive && published.band == Band::B40 &&
-               !start_tx_requested && !stop_requested && !guard_tripped &&
-               static_cast<uint64_t>(esp_timer_get_time()) / 1000 >= published.cooldown_until_ms) {
+    } else if (tx_ready_locked()) {
         start_tx_requested = true;
-        tune_requested = 0;
         published.state = State::PreparingTx;
         std::strcpy(published.status, "TX test queued; tap again to cancel");
         accepted = true;
@@ -478,6 +503,8 @@ bool requestTransmit(bool enable)
             // Preserve the useful underlying fault reason.
         } else if (published.band != Band::B40) {
             std::strcpy(published.status, "TX test is commissioned only for a detected 40m LPF");
+        } else if (tune_mailbox.busyOrPending()) {
+            std::strcpy(published.status, "Finishing RX tuning; retry TX test");
         } else {
             const uint64_t now = static_cast<uint64_t>(esp_timer_get_time()) / 1000;
             if (now < published.cooldown_until_ms) {

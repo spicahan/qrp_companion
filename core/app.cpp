@@ -308,8 +308,8 @@ static void btn_4k_press(ui::Button &)    { select_span(2); }
 // The button's `tag` carries a backend-defined band index. The radio backend
 // owns how a band change is implemented, including any band-stack behavior.
 static void btn_band_select_press(ui::Button &self) {
-    if (!pal::radio::bandSelectionReadOnly() && tuning_allowed())
-        pal::radio::setBandIndex(self.tag);
+    if (pal::radio::bandSelectionReadOnly() || !tuning_allowed()) return;
+    pal::radio::setBandIndex(self.tag);
     bottom_band.setLayout("default");
 }
 
@@ -352,7 +352,10 @@ static void btn_tx_test_press(ui::Button &)
     const bool stopping = state == pal::radio::State::PreparingTx ||
                           state == pal::radio::State::Transmit ||
                           state == pal::radio::State::ReturningRx;
-    if (pal::radio::txTestSupported() && (stopping || state == pal::radio::State::Receive))
+    const bool ready = state == pal::radio::State::Receive &&
+                       pal::radio::getTxCooldownRemainingMs() == 0 &&
+                       pal::radio::txTestReady();
+    if (pal::radio::txTestSupported() && (stopping || ready))
         pal::radio::requestTransmit(!stopping);
 }
 
@@ -403,19 +406,41 @@ static void update_tx_button()
 {
     using State = pal::radio::State;
     const State state = pal::radio::getState();
-    btn_tx_test.highlight = state == State::Transmit || state == State::ReturningRx;
+    const bool highlight = state == State::Transmit || state == State::ReturningRx;
+    bool enabled = state == State::PreparingTx || state == State::Transmit || state == State::Receive;
+    const char *label = nullptr;
+    char next_label[sizeof(tx_test_label)];
     switch (state) {
-        case State::PreparingTx: btn_tx_test.label = "Cancel TX prep"; break;
-        case State::Transmit: btn_tx_test.label = "Return RX"; break;
-        case State::ReturningRx: btn_tx_test.label = "Stopping TX"; break;
-        case State::Fault: btn_tx_test.label = "TX blocked"; break;
-        case State::Starting: btn_tx_test.label = "Starting RX"; break;
-        case State::Offline: btn_tx_test.label = "Radio offline"; break;
+        case State::PreparingTx: label = "Cancel TX prep"; break;
+        case State::Transmit: label = "Return RX"; break;
+        case State::ReturningRx: label = "Stopping TX"; break;
+        case State::Fault: label = "TX blocked"; break;
+        case State::Starting: label = "Starting RX"; break;
+        case State::Offline: label = "Radio offline"; break;
         default:
-            snprintf(tx_test_label, sizeof(tx_test_label), "TX Test %lus",
-                     static_cast<unsigned long>(pal::radio::getTxTestLimitMs() / 1000));
-            btn_tx_test.label = tx_test_label;
+            const uint32_t remaining = pal::radio::getTxCooldownRemainingMs();
+            if (remaining > 0) {
+                enabled = false;
+                snprintf(next_label, sizeof(next_label), "Wait %lus",
+                         static_cast<unsigned long>(remaining / 1000 + (remaining % 1000 != 0)));
+            } else if (!pal::radio::txTestReady()) {
+                enabled = false;
+                snprintf(next_label, sizeof(next_label), "Tuning...");
+            } else {
+                snprintf(next_label, sizeof(next_label), "TX Test %lus",
+                         static_cast<unsigned long>(pal::radio::getTxTestLimitMs() / 1000));
+            }
+            label = next_label;
             break;
+    }
+    if (!btn_tx_test.label || strcmp(btn_tx_test.label, label) != 0 ||
+        btn_tx_test.highlight != highlight || btn_tx_test.enabled != enabled) {
+        snprintf(tx_test_label, sizeof(tx_test_label), "%s", label);
+        btn_tx_test.label = tx_test_label;
+        btn_tx_test.highlight = highlight;
+        btn_tx_test.enabled = enabled;
+        if (!enabled) btn_tx_test.pressed = false;
+        bottom_band.dirty = true;
     }
 }
 
@@ -445,21 +470,14 @@ static void rebuild_diagnostic_panel()
     bottom_band.dirty = true;
 }
 
-static void draw_radio_status()
+static void draw_power_cycle_confirmation()
 {
-    if (!pal::radio::txTestSupported() && !pal::radio::bandSelectionReadOnly()) return;
-    const char *caution = power_cycle_confirmation
-        ? "Confirm RF battery AND external power removed, then restored."
-        : "TX test: 40m LPF + rated 50-ohm dummy load. No antenna.";
-    char status[64];
-    snprintf(status, sizeof(status), "%s", power_cycle_confirmation
-        ? "Only then tap Confirm restart RX. Back cancels; never auto-TX."
-        : pal::radio::getStatusText());
-    // Clear full rows so a shorter status never leaves stale text behind.
-    draw::fillRect(fb, 0, 8, log_w, 16, COL_NAVY);
-    draw::fillRect(fb, 0, HEADER_H - 24, log_w, 16, COL_NAVY);
-    draw::drawText(fb, 16, 8, caution, COL_YELLOW, COL_NAVY, 2);
-    draw::drawText(fb, 16, HEADER_H - 24, status, COL_CYAN, COL_NAVY, 2);
+    draw::drawText(fb, 16, 8,
+        "Confirm RF battery AND external power removed, then restored.",
+        COL_YELLOW, COL_DGREY, 2);
+    draw::drawText(fb, 16, HEADER_H - 24,
+        "Only then tap Confirm restart RX. Back cancels; never auto-TX.",
+        COL_CYAN, COL_DGREY, 2);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -479,15 +497,7 @@ static void audio_input_cb(const float *iq_samples, int num_frames) {
 // assume a CAT protocol, band numbering scheme, or hardcoded band list.
 static void fmt_band_err(char *buf, int len) {
     if (pal::radio::bandSelectionReadOnly()) {
-        const pal::radio::BandInfo *current = nullptr;
-        for (int i = 0; i < pal::radio::getBandCount(); ++i) {
-            const auto *band = pal::radio::getBand(i);
-            if (band && band->index == pal::radio::getBandIndex()) current = band;
-        }
-        if (current)
-            snprintf(buf, len, "LPF: %sm (read-only; power off before changing)", current->name);
-        else
-            snprintf(buf, len, "LPF unavailable: %.40s", pal::radio::getStatusText());
+        snprintf(buf, len, "No LPF detected");
         return;
     }
     // Enumeration takes a few seconds; only call it a failure once it is done.
@@ -508,9 +518,9 @@ static void rebuild_band_panel()
     // visibly fills in batch by batch if opened during startup.
     if (!pal::radio::isBandEnumDone()) n = 0;
 
-    if (n <= 0 || pal::radio::bandSelectionReadOnly()) {
-        // Discovery status, or an LPF-derived informational band (never a button).
-        lbl_band_err.color = (n > 0 && pal::radio::bandSelectionReadOnly()) ? COL_CYAN : COL_RED;
+    if (n <= 0) {
+        // Discovery status; a valid LPF uses the normal read-only band tile.
+        lbl_band_err.color = COL_RED;
         panel_band_select.add(&lbl_band_err);
         btn_back.x = log_w - log_w / 6; btn_back.y = bot_y;
         btn_back.w = log_w / 6;         btn_back.h = BOTTOM_H;
@@ -534,7 +544,8 @@ static void rebuild_band_panel()
         b.color = COL_WHITE;
         b.bg    = COL_NAVY;
         b.scale = 2;
-        b.on_press = btn_band_select_press;
+        b.enabled = !pal::radio::bandSelectionReadOnly();
+        b.on_press = b.enabled ? btn_band_select_press : nullptr;
         b.bind = ui::PROP_COUNT;
         b.show_as_toggle = false;
         b.tag = bi->index;           // backend-defined index for this band
@@ -656,7 +667,6 @@ void app::init()
     make_button(btn_pclink,     "PC Link", COL_CYAN, COL_DGREY, btn_pclink_press);
     make_button(btn_tx_test, "TX Test", COL_RED, COL_DGREY, btn_tx_test_press);
     make_button(btn_power_cycle, "Recover RX", COL_YELLOW, COL_DGREY, btn_power_cycle_press);
-    if (pal::radio::bandSelectionReadOnly()) btn_band.label = "LPF";
     update_mute_button_label();
 
     // Init sliders
@@ -784,48 +794,6 @@ void app::tick()
         pal::radio::suppressPolling(false);
     }
 
-    // 1Hz slow tick — backend housekeeping and battery readout
-    static int64_t last_slow_tick = 0;
-    if (t0 - last_slow_tick >= 1000000) {
-        last_slow_tick = t0;
-        pal::radio::tick1Hz();
-        pal::pollBattery();
-
-        // Rebuild the band menu when the table first arrives, and re-highlight
-        // when the radio changes band (band can also be changed on the rig).
-        // Watch enum_done too: the count stops changing on the last populated
-        // batch, so the final "sweep complete" transition would otherwise be
-        // missed and the buttons would never appear.
-        static int  last_band_count = -1;
-        static int  last_band_index = -2;
-        static bool last_enum_done  = false;
-        if (pal::radio::getBandCount() != last_band_count ||
-            pal::radio::getBandIndex() != last_band_index ||
-            pal::radio::isBandEnumDone() != last_enum_done) {
-            last_band_count = pal::radio::getBandCount();
-            last_band_index = pal::radio::getBandIndex();
-            last_enum_done  = pal::radio::isBandEnumDone();
-            rebuild_band_panel();
-            bottom_band.dirty = true;   // repaint (button count/labels changed)
-        }
-
-        // PC-link state, three ways. Highlighting merely "we started" was
-        // misleading: the USB-C half comes up fine even when the QMX has only
-        // one USB serial port, and then every byte from the PC is dropped with
-        // no console left to explain why. Say which half is missing instead.
-        //   0 = off, 1 = up but QMX's 2nd CAT port missing, 2 = whole path live
-        int pclink_state = !pal::pcLinkRunning()        ? 0
-                         : !pal::pcLinkRelayConnected() ? 1
-                                                        : 2;
-        static int last_pclink_state = -1;
-        if (pclink_state != last_pclink_state) {
-            last_pclink_state = pclink_state;
-            btn_pclink.highlight = (pclink_state == 2);
-            btn_pclink.label     = (pclink_state == 1) ? "Need QMX USB2" : "PC Link";
-            bottom_band.dirty = true;
-        }
-    }
-
     ui::set_i32(ui::PROP_mode, pal::radio::getMode(), ui::FROM_RADIO);
     ui::set_u64(ui::PROP_vfo_freq, pal::radio::getVfoFreq(), ui::FROM_RADIO);
     ui::set_i32(ui::PROP_cw_offset, pal::radio::getCwOffset(), ui::FROM_RADIO);
@@ -845,20 +813,8 @@ void app::tick()
         }
     }
 
-    // --- DSP ---
-    bool new_spectrum = dsp::processIfReady();
-    if (new_spectrum) {
-        last_dsp_time = t0;
-        const float *mag = dsp::getMagnitudeDb();
-        memcpy(&wf_db[wf_head * num_bins], mag, num_bins * sizeof(float));
-        wf_head = (wf_head - 1 + WF_MAX_LINES) % WF_MAX_LINES;
-        for (int lx = 0; lx < spec_w; lx++) {
-            int fft_bin = g_pixel_to_fftbin[lx];
-            wf_pixels_t[lx * WF_MAX_LINES + wf_head] = waterfall_color_from_db(mag[fft_bin]);
-        }
-        if (wf_count < WF_MAX_LINES) wf_count++;
-    }
-
+    // Consume touch before slow battery I2C and FFT work so cancellation and
+    // tuning do not wait behind that frame's optional housekeeping.
     // --- Touch events ---
     static constexpr int TAP_THRESHOLD = 5;
     pal::TouchEvent evt;
@@ -921,6 +877,62 @@ void app::tick()
         drag_vfo_dirty = false;
     }
 
+    // 1Hz slow tick — backend housekeeping and battery readout
+    static int64_t last_slow_tick = 0;
+    if (t0 - last_slow_tick >= 1000000) {
+        last_slow_tick = t0;
+        pal::radio::tick1Hz();
+        pal::pollBattery();
+
+        // Rebuild the band menu when the table first arrives, and re-highlight
+        // when the radio changes band (band can also be changed on the rig).
+        // Watch enum_done too: the count stops changing on the last populated
+        // batch, so the final "sweep complete" transition would otherwise be
+        // missed and the buttons would never appear.
+        static int  last_band_count = -1;
+        static int  last_band_index = -2;
+        static bool last_enum_done  = false;
+        if (pal::radio::getBandCount() != last_band_count ||
+            pal::radio::getBandIndex() != last_band_index ||
+            pal::radio::isBandEnumDone() != last_enum_done) {
+            last_band_count = pal::radio::getBandCount();
+            last_band_index = pal::radio::getBandIndex();
+            last_enum_done  = pal::radio::isBandEnumDone();
+            rebuild_band_panel();
+            bottom_band.dirty = true;   // repaint (button count/labels changed)
+        }
+
+        // PC-link state, three ways. Highlighting merely "we started" was
+        // misleading: the USB-C half comes up fine even when the QMX has only
+        // one USB serial port, and then every byte from the PC is dropped with
+        // no console left to explain why. Say which half is missing instead.
+        //   0 = off, 1 = up but QMX's 2nd CAT port missing, 2 = whole path live
+        int pclink_state = !pal::pcLinkRunning()        ? 0
+                         : !pal::pcLinkRelayConnected() ? 1
+                                                        : 2;
+        static int last_pclink_state = -1;
+        if (pclink_state != last_pclink_state) {
+            last_pclink_state = pclink_state;
+            btn_pclink.highlight = (pclink_state == 2);
+            btn_pclink.label     = (pclink_state == 1) ? "Need QMX USB2" : "PC Link";
+            bottom_band.dirty = true;
+        }
+    }
+
+    // --- DSP ---
+    bool new_spectrum = dsp::processIfReady();
+    if (new_spectrum) {
+        last_dsp_time = t0;
+        const float *mag = dsp::getMagnitudeDb();
+        memcpy(&wf_db[wf_head * num_bins], mag, num_bins * sizeof(float));
+        wf_head = (wf_head - 1 + WF_MAX_LINES) % WF_MAX_LINES;
+        for (int lx = 0; lx < spec_w; lx++) {
+            int fft_bin = g_pixel_to_fftbin[lx];
+            wf_pixels_t[lx * WF_MAX_LINES + wf_head] = waterfall_color_from_db(mag[fft_bin]);
+        }
+        if (wf_count < WF_MAX_LINES) wf_count++;
+    }
+
     update_tx_button();
 
     // --- Draw frame ---
@@ -936,11 +948,20 @@ void app::tick()
     draw::fillRect(fb, spec_x, spec_y + SPEC_H, spec_w, GAP, COL_GREEN);
     draw_waterfall();
 
+    static bool confirmation_rendered = false;
+    const bool confirmation_changed = power_cycle_confirmation != confirmation_rendered;
+    if (confirmation_changed) header_band.dirty = true;
+    const bool redraw_confirmation = power_cycle_confirmation && header_band.dirty;
     header_band.draw(fb);
     right_band.draw(fb);
     bottom_band.draw(fb);
 
-    draw_radio_status();
+    // Normal RX/TX screens retain the QMX header exactly. Recovery instructions
+    // appear only for that explicit confirmation when its header needs a
+    // repaint. Exiting restores the original header (no diagnostic rows).
+    if (redraw_confirmation)
+        draw_power_cycle_confirmation();
+    confirmation_rendered = power_cycle_confirmation;
     const auto radio_state = pal::radio::getState();
     if (radio_state == pal::radio::State::Transmit || radio_state == pal::radio::State::ReturningRx)
         tx_border.apply(fb, COL_RED, 2);

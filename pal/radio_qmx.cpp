@@ -38,6 +38,8 @@ bool bandSelectionReadOnly() { return false; }
 void setBandIndex(int index) { cat::setBandIndex(index); }
 bool txTestSupported() { return false; }
 uint32_t getTxTestLimitMs() { return 0; }
+uint32_t getTxCooldownRemainingMs() { return 0; }
+bool txTestReady() { return false; }
 bool requestTransmit(bool) { return false; }
 bool powerCycleAcknowledgementRequired() { return false; }
 bool acknowledgePowerCycle() { return false; }

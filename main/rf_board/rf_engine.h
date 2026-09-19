@@ -28,6 +28,8 @@ public:
     virtual bool rxSwitch(bool receive) = 0;
     virtual bool clocksOff() = 0; // Must write AND read back ALL outputs OFF.
     virtual bool clockPlan(uint32_t frequency, Band, bool receive) = 0;
+    // RX-only same-band PLL update. Must preserve I2S, G47 and CLK0-off state.
+    virtual bool retuneReceive(uint32_t frequency, Band) = 0;
     virtual bool transmitClockOn() = 0; // CLK0 only, with readback.
     virtual bool qualifyBand(Band &) = 0; // Quiet, calibrated, bounded/debounced.
     virtual bool startAudio() = 0; // 48k I/Q; discard one second before delivery.

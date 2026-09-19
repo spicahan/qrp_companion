@@ -5,7 +5,7 @@ set(app_includes "." "../pal" "../core")
 set(app_deps espressif__esp-dsp esp_driver_ppa)
 if(CONFIG_QRP_PLATFORM_TAB5_DX)
     list(APPEND app_sources
-        "rf_board/rf_engine.cpp" "rf_board/rf_board.cpp"
+        "rf_board/rf_engine.cpp" "rf_board/rf_board.cpp" "rf_board/rf_audio.cpp"
         "rf_board/si5351.c" "rf_board/pcm1808_i2s.c"
         "rf_board/lpf_classify.c" "rf_board/lpf_sense.c")
     list(APPEND app_includes "rf_board" "rf_board/include")

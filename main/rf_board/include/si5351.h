@@ -26,6 +26,11 @@ typedef struct {
     uint8_t address;
     uint32_t reference_hz;
     uint8_t reference_load_register;
+    // Valid only after a successful full radio plan or same-band RX retune.
+    // Any public register write invalidates it until the operation completes.
+    bool radio_rx_ready;
+    bool radio_band_20m;
+    uint32_t radio_rx_hz;
 } si5351_t;
 
 typedef enum {
@@ -72,6 +77,17 @@ esp_err_t si5351_configure_40m_clock_plan(si5351_t *device, uint32_t rf_hz,
 /** 40m: MS0=112/MS1=28; 20m: MS0=56/MS1=14. Finishes CLK1 only. */
 esp_err_t si5351_configure_radio_clock_plan(si5351_t *device, uint32_t rf_hz,
                                            bool band_20m, bool verify);
+
+/**
+ * Fast same-band receive retune. Requires the validated radio plan and CLK1-only
+ * output state. Updates PLLB feedback registers 34..41 only: leaves PLLA/MS0,
+ * both output dividers, output enables, phase and drive settings untouched.
+ * Verifies CLK0 stays disabled, all changed bytes, and bounded PLLB lock.
+ * No reset, output gating, full initialization or routine per-tune INFO logs.
+ * Failure invalidates the cached plan and requests all outputs OFF; the caller
+ * must additionally cut RF power if the bus cannot confirm shutdown.
+ */
+esp_err_t si5351_retune_receive(si5351_t *device, uint32_t rf_hz, bool band_20m);
 
 /**
  * Configure independent RX and source clocks for a BS170-absent bench test.

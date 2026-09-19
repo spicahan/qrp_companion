@@ -126,20 +126,19 @@ bool Engine::tune(uint64_t frequency)
     if (s.state != State::Receive || !frequencyAllowed(s.band, frequency))
         return false;
     if (frequency == s.frequency) return true;
-    state(State::Starting, "Retuning receiver; TX OFF");
-    if (!hw.prepGuardStart() || !quiet() || hw.cancelled())
-        return fail("Retune could not establish quiet state");
+    // Continuous receive: no QSD gating, I2S teardown, ADC warm-up, LPF read,
+    // flash write or power-up clock-plan replay for each movement of the dial.
+    // Keep the public Receive state so one touch gesture survives its updates.
+    if (!hw.prepGuardStart() || hw.cancelled())
+        return fail("Retune could not establish safety guard");
     const uint32_t previous = s.frequency;
     // Publish actual/confirmed frequency, not the GUI's optimistic request.
     all_clocks_off = false;
-    if (!hw.clockPlan(static_cast<uint32_t>(frequency), s.band, true) || hw.cancelled()) {
+    if (!hw.retuneReceive(static_cast<uint32_t>(frequency), s.band) || hw.cancelled()) {
         s.frequency = previous;
         return fail("Retune synthesizer failed");
     }
-    all_clocks_off = false;
     s.frequency = static_cast<uint32_t>(frequency);
-    if (!hw.rxSwitch(true) || !hw.startAudio() || hw.cancelled())
-        return fail("Retune I2S startup failed");
     hw.prepGuardStop();
     if (hw.hardTripped()) return fail("Retune exceeded hardware guard");
     state(State::Receive, "RX; tuning confirmed, LPF ID latched");

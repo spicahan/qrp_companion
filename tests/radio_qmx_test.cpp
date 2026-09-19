@@ -74,6 +74,8 @@ int main()
     assert(!bandSelectionReadOnly());
     assert(!txTestSupported());
     assert(getTxTestLimitMs() == 0);
+    assert(getTxCooldownRemainingMs() == 0);
+    assert(!txTestReady());
     assert(!requestTransmit(true));
     assert(!requestTransmit(false));
     assert(!powerCycleAcknowledgementRequired());

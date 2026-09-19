@@ -44,6 +44,8 @@ void setBandIndex(int index); // Must reject/no-op when selection is read-only.
 // Hardware backends must enforce their cutoff independently of UI progress.
 bool txTestSupported();
 uint32_t getTxTestLimitMs();
+uint32_t getTxCooldownRemainingMs(); // 0 when ready; does not itself authorize TX.
+bool txTestReady(); // Current preconditions, including retune exclusion; requests recheck.
 bool requestTransmit(bool enable);
 
 // Fault recovery requires the operator's explicit physical power-cycle

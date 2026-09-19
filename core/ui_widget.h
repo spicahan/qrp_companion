@@ -57,6 +57,7 @@ struct Button : Widget {
     // A release must belong to a deliberate press on this button. In
     // particular, dragging a tuning gesture into a TX button must not key it.
     bool pressed = false;
+    bool enabled = true;
 
     void draw(const draw::Framebuf &fb) override;
     bool onTouch(int tx, int ty, int action) override;

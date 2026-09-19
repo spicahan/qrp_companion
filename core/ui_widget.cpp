@@ -48,7 +48,7 @@ bool Button::onTouch(int tx, int ty, int action)
 {
     const bool inside = contains(tx, ty);
     if (action == 0) {
-        pressed = inside;
+        pressed = inside && enabled;
         return inside;
     }
     if (action == 1) {
@@ -56,7 +56,7 @@ bool Button::onTouch(int tx, int ty, int action)
         return inside;
     }
     if (action == 2) {
-        const bool activate = pressed && inside;
+        const bool activate = pressed && inside && enabled;
         pressed = false;
         if (activate && on_press) on_press(*this);
         return inside;

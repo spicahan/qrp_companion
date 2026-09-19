@@ -118,9 +118,19 @@ sideband-selective demodulation is not implemented in this step.
 The diagnostic has a maximum 10-second independent cutoff and no auto-repeat.
 A normal timed stop starts at about 9.8 seconds, allowing time for clock-off
 readback before the hard cutoff. A completed TX job has a 10-second cooldown.
+Stopping an active carrier early also starts that cooldown. The same button
+shows `Wait Ns`, then returns automatically to `TX Test 10s`; there is no need
+to leave and reopen DR. Cancelling preparation before keying does not itself
+start a TX cooldown.
 A thin red outline marks TX and remains through the return-to-RX transition
 until the backend reports a safe non-TX state. The stop control also cancels
 pending TX preparation. Tuning is unavailable during TX and transitions.
+
+The normal screen retains the QMX layout, without RF diagnostic banners.
+The Band menu shows the detected band as a read-only highlighted tile. Detailed
+status stays in the serial log; physical power-cycle instructions appear only
+when that explicit fault-recovery confirmation is opened. Removing the banners
+does not remove the TX cutoff or dummy-load requirement above.
 
 TX entry stops receive capture, switches G47 low, verifies clocks off, and
 rechecks the LPF before enabling CLK0 only. Return disables and verifies CLK0
@@ -134,6 +144,27 @@ persistent fault requires a physical RF-board power-cycle and explicit UI
 acknowledgement. Acknowledgement only permits receive initialization; it
 never starts a carrier. This carries the earlier `pa_bench/unverified` NVS
 marker forward rather than silently clearing it during migration.
+
+## Responsive receive tuning
+
+Ordinary tuning within the installed band changes the receive PLL feedback
+ratio only. It keeps PCM1808/I2S and the RX switch running, preserves continuous
+DSP processing, and does not repeat the startup sequence, LPF detection, PLL
+reset or one-second ADC discard on each movement. Changed synthesizer bytes,
+lock state and the disabled TX clock are still checked. Failure cuts RF power.
+
+Drag gestures remain active across asynchronous retunes. A latest-request-wins
+mailbox coalesces movements to at most one update per 20 ms, while the displayed
+frequency remains hardware-confirmed. TX cannot start during an in-flight
+retune. Startup and return from TX still use the one-second capture settling
+period; this tuning optimization does not relax that earlier bench finding.
+
+Like QMX, the input DSP and speaker callback run on CPU0. The RF/ADC worker
+stays on CPU1, separate from the CPU0 cutoff ISR. A four-block, nonblocking
+audio queue holds at most 20 ms of waiting samples and drops the oldest block
+if playback falls behind, keeping the RF control worker responsive. RX stop
+invalidates queued samples. Actual touch-to-tune latency and RF settling still
+require observation on the board; native tests cannot measure those timings.
 
 ## Why zero IF remains the current default
 

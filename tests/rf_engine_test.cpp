@@ -26,7 +26,7 @@ struct Sim final : Hardware {
     bool trip_at_audio = false, trip_at_prep_stop = false;
     uint8_t mask = 0;
     uint64_t now = 0;
-    unsigned keys = 0, samples = 0, clear_markers = 0, plans = 0;
+    unsigned keys = 0, samples = 0, clear_markers = 0, plans = 0, retunes = 0;
     std::string fail_operation;
     std::vector<std::string> operations;
     bool event(const char *name) {
@@ -66,6 +66,14 @@ struct Sim final : Hardware {
         mask = 2;
         if (cancel_at_plan && !rx) cancel = true;
         return true;
+    }
+    bool retuneReceive(uint32_t frequency, Band band) override {
+        assert(prep && mask == 2 && audio && receive && !pending);
+        assert(Engine::frequencyAllowed(band, frequency));
+        ++retunes;
+        // UI state remains RX while this operation is in flight.
+        assert(published.state == State::Receive);
+        return event("rx-retune");
     }
     bool transmitClockOn() override {
         assert(power && tx_guard && !prep && pending && mask == 0 && !receive && !audio);
@@ -148,7 +156,7 @@ static void band_and_tuning()
     assert(!engine.tune(7074000));
     assert(engine.tune(14075000));
     assert(engine.snapshot().frequency == 14075000 && hw.samples == 1);
-    hw.fail_operation = "rx-plan";
+    hw.fail_operation = "rx-retune";
     assert(!engine.tune(14076000));
     assert(engine.snapshot().frequency == 14075000 && !hw.power);
     Sim absent; absent.sensed = Band::Unknown; Engine absent_engine(absent);
@@ -265,23 +273,72 @@ static void actual_pcm_format()
 static void actual_tune_mailbox()
 {
     Sim hw; Engine engine(hw); assert(engine.initialize());
+    TuneMailbox mailbox;
     const uint32_t current = engine.snapshot().frequency;
     const unsigned plans = hw.plans;
-    assert(!claimTune(hw.published, current, false));
+    mailbox.request(current);
+    assert(mailbox.claim(hw.published, false, 0) == 0);
+    assert(!mailbox.busyOrPending());
     assert(engine.tune(current));
-    assert(hw.published.state == State::Receive && hw.plans == plans);
-    assert(!claimTune(hw.published, 0, false));
-    assert(!claimTune(hw.published, current + 1000, true));
+    assert(hw.published.state == State::Receive && hw.plans == plans && hw.retunes == 0);
+    assert(mailbox.claim(hw.published, false, 0) == 0);
+    mailbox.request(current + 1000);
+    assert(mailbox.claim(hw.published, true, 0) == 0);
     assert(hw.published.state == State::Receive);
-    assert(claimTune(hw.published, current + 1000, false));
-    assert(hw.published.state == State::Starting);
-    assert(engine.tune(current + 1000));
-    assert(hw.published.state == State::Receive && hw.published.frequency == current + 1000);
+    const uint64_t first = mailbox.claim(hw.published, false, 0);
+    assert(first == current + 1000 && mailbox.busyOrPending());
+    assert(hw.published.state == State::Receive);
+    // Drag updates arriving during an in-flight I2C operation replace older
+    // requested values, but cannot start a second operation or permit TX.
+    mailbox.request(current + 2000);
+    mailbox.request(current + 3000);
+    assert(mailbox.claim(hw.published, false, 1) == 0);
+    assert(engine.tune(first));
+    mailbox.complete();
+    assert(mailbox.claim(hw.published, false, 19) == 0);
+    assert(mailbox.claim(hw.published, false, 20) == current + 3000);
+    assert(engine.tune(current + 3000));
+    mailbox.complete();
+    assert(!mailbox.busyOrPending());
+    assert(hw.published.state == State::Receive && hw.published.frequency == current + 3000);
+    mailbox.request(current + 4000);
+    assert(mailbox.claim(hw.published, false, 40) == current + 4000);
+    mailbox.request(current + 5000);
+    mailbox.cancelPending(); // adapter publishes Fault/Offline during operation
+    assert(mailbox.in_flight && mailbox.requested == 0);
+    mailbox.complete();
+    assert(!mailbox.busyOrPending());
+    assert(mailbox.claim(hw.published, false, 100) == 0); // no stale post-recovery intent
+}
+
+static void fast_tune_work_budget()
+{
+    Sim hw; Engine engine(hw); assert(engine.initialize());
+    const unsigned plans = hw.plans, samples = hw.samples, markers = hw.clear_markers;
+    const uint64_t now = hw.now;
+    hw.operations.clear();
+    for (uint32_t frequency = 7074001; frequency <= 7074100; ++frequency) {
+        assert(engine.tune(frequency));
+        assert(hw.audio && hw.receive && hw.mask == 2 && hw.power);
+        assert(engine.snapshot().state == State::Receive);
+    }
+    assert(hw.retunes == 100 && hw.plans == plans && hw.samples == samples);
+    assert(hw.clear_markers == markers && hw.now == now && hw.keys == 0);
+    assert(hw.operations.size() == 300); // start guard, PLLB update, stop guard.
+    for (size_t i = 0; i < hw.operations.size(); i += 3) {
+        assert(hw.operations[i] == "prep-start");
+        assert(hw.operations[i + 1] == "rx-retune");
+        assert(hw.operations[i + 2] == "prep-stop");
+    }
+    assert(engine.beginTransmit()); // Full TX preparation still happens.
+    assert(hw.plans == plans + 1 && !hw.audio && !hw.receive && hw.mask == 1);
+    assert(engine.returnToReceive());
+    assert(hw.now >= now + 1000); // Real restart still has its startup drain.
 }
 
 int main()
 {
     normal_rx_tx_rx(); band_and_tuning(); safety_faults(); cancellations(); preparation_failures();
-    uncertain_and_interrupted_shutdowns(); actual_pcm_format(); actual_tune_mailbox();
+    uncertain_and_interrupted_shutdowns(); actual_pcm_format(); actual_tune_mailbox(); fast_tune_work_budget();
     std::puts("RF production engine sequencing tests passed");
 }

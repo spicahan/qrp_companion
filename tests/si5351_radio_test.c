@@ -19,6 +19,7 @@ typedef struct {
     bool clear_reset_strobe;
     bool lock_fault_after_reset;
     bool reset_written;
+    unsigned transient_lock_reads;
     uint8_t last_requested_disable_mask;
     bool requested_clk0_on;
     unsigned probes;
@@ -72,6 +73,10 @@ static esp_err_t fake_read(void *context, uint8_t address, uint8_t reg, uint8_t 
         target->registers[reg] &= (uint8_t)~0xa0U;
     *value = target->registers[reg];
     if (reg == 0 && target->reset_written && target->lock_fault_after_reset) *value |= 0x60;
+    if (reg == 0 && target->transient_lock_reads) {
+        --target->transient_lock_reads;
+        *value |= 0x40;
+    }
     if (target->transactions == target->corrupt_read_nth) *value ^= 1;
     return ESP_OK;
 }
@@ -301,12 +306,168 @@ static void test_fault_injection(void)
     printf("Si5351 radio plans PASS (%u injected transaction/readback failures)\n", failures_exercised);
 }
 
+static void reset_trace(void)
+{
+    bus.transactions = 0;
+    bus.fail_nth = bus.corrupt_read_nth = 0;
+    bus.sticky_failure = bus.fail_after_commit = bus.requested_clk0_on = false;
+    bus.last_requested_disable_mask = bus.registers[3];
+    ticks = 0;
+}
+
+static si5351_t rx_fixture(bool band20)
+{
+    si5351_t device = fixture();
+    const uint32_t frequency = band20 ? 14075000 : 7075000;
+    assert(si5351_configure_radio_clock_plan(&device, frequency, band20, true) == ESP_OK);
+    assert(device.radio_rx_ready && device.radio_band_20m == band20 && device.radio_rx_hz == frequency);
+    reset_trace();
+    return device;
+}
+
+static void assert_fast_failure(const si5351_t *device, uint32_t confirmed, bool physical_off_known)
+{
+    assert(!device->radio_rx_ready && device->radio_rx_hz == confirmed);
+    assert(bus.last_requested_disable_mask == 0xff && !bus.requested_clk0_on);
+    if (physical_off_known) assert(bus.registers[3] == 0xff);
+    for (unsigned i = 0; i < bus.transactions; ++i) {
+        if (bus.trace[i].kind != 'W') continue;
+        assert(bus.trace[i].reg == 34 || (bus.trace[i].reg == 3 && bus.trace[i].value == 0xff));
+    }
+}
+
+static void test_fast_retune_work_budget(void)
+{
+    for (unsigned band20 = 0; band20 <= 1; ++band20) {
+        si5351_t device = rx_fixture(band20);
+        const uint32_t frequencies40[] = {7075001, 7074000, 7063000, 7000000, 7300000};
+        const uint32_t frequencies20[] = {14075001, 14074000, 14063000, 14000000, 14350000};
+        const uint32_t *frequencies = band20 ? frequencies20 : frequencies40;
+        for (unsigned j = 0; j < sizeof(frequencies40) / sizeof(frequencies40[0]); ++j) {
+            uint8_t previous[256];
+            memcpy(previous, bus.registers, sizeof(previous));
+            reset_trace();
+            const uint32_t frequency = frequencies[j];
+            assert(si5351_retune_receive(&device, frequency, band20) == ESP_OK);
+            assert(device.radio_rx_ready && device.radio_rx_hz == frequency);
+            assert(bus.transactions == 13 && ticks == 0 && !bus.requested_clk0_on);
+            unsigned writes = 0;
+            unsigned clocked_bits = 0;
+            for (unsigned i = 0; i < bus.transactions; ++i) {
+                const operation_t *op = &bus.trace[i];
+                if (op->kind == 'W') {
+                    ++writes;
+                    assert(op->reg == 34 && op->length == 9);
+                    clocked_bits += (1 + op->length) * 9; // address + register/payload + ACKs
+                } else {
+                    assert(op->kind == 'R');
+                    clocked_bits += 4 * 9; // addrW, pointer, addrR, data (+ACK/NACK)
+                }
+            }
+            // 5.22ms of clocked bus bits at100kHz, not measured wall latency:
+            // excludes START/STOP, scheduler, mutex, stretch, and lock retries.
+            assert(writes == 1 && clocked_bits == 522);
+            for (unsigned reg = 0; reg < sizeof(previous); ++reg)
+                if (reg < 34 || reg > 41) assert(bus.registers[reg] == previous[reg]);
+            const long double received = REFERENCE_HZ * ratio_at(34) / ratio_at(50);
+            assert(fabsl(received - (long double)frequency * 4) < 2.0L);
+            assert(bus.registers[3] == 0xfd);
+        }
+    }
+    puts("Si5351 fast RX work budget PASS: 13 transactions, one PLLB burst, 522 clocked I2C bits, no fixed waits");
+}
+
+static void test_fast_retune_faults(void)
+{
+    unsigned failures = 0;
+    for (unsigned band20 = 0; band20 <= 1; ++band20) {
+        const uint32_t initial = band20 ? 14075000 : 7075000;
+        const uint32_t next = initial + 100;
+        si5351_t device = rx_fixture(band20);
+        assert(si5351_retune_receive(&device, next, band20) == ESP_OK);
+        const unsigned operations = bus.transactions;
+        operation_t success[16];
+        assert(operations <= sizeof(success) / sizeof(success[0]));
+        memcpy(success, bus.trace, operations * sizeof(success[0]));
+        for (unsigned after = 0; after <= 1; ++after) {
+            for (unsigned nth = 1; nth <= operations; ++nth) {
+                device = rx_fixture(band20);
+                bus.fail_nth = nth;
+                bus.fail_after_commit = after;
+                assert(si5351_retune_receive(&device, next, band20) != ESP_OK);
+                assert_fast_failure(&device, initial, true);
+                ++failures;
+            }
+        }
+        for (unsigned i = 0; i < operations; ++i) {
+            if (success[i].kind != 'R' || success[i].reg == 0) continue;
+            device = rx_fixture(band20);
+            bus.corrupt_read_nth = i + 1;
+            assert(si5351_retune_receive(&device, next, band20) != ESP_OK);
+            assert_fast_failure(&device, initial, true);
+            ++failures;
+        }
+        const uint8_t unhealthy_statuses[] = {0x80, 0x08, 0x40};
+        for (unsigned i = 0; i < sizeof(unhealthy_statuses); ++i) {
+            device = rx_fixture(band20);
+            bus.registers[0] = unhealthy_statuses[i];
+            assert(si5351_retune_receive(&device, next, band20) == ESP_ERR_TIMEOUT);
+            assert(ticks == 21); //20ms + one scheduler tick, fake ticks are 1ms
+            assert_fast_failure(&device, initial, true);
+        }
+        device = rx_fixture(band20);
+        bus.registers[0] = 0x20; // unused PLLA lock does not block receiving
+        bus.transient_lock_reads = 3;
+        assert(si5351_retune_receive(&device, next, band20) == ESP_OK && ticks == 3);
+        device = rx_fixture(band20);
+        bus.fail_nth = 2;
+        bus.sticky_failure = true;
+        assert(si5351_retune_receive(&device, next, band20) != ESP_OK);
+        assert_fast_failure(&device, initial, false);
+        assert(bus.registers[3] == 0xfd); // best effort OFF is not physical proof
+    }
+    printf("Si5351 fast RX failures PASS (%u injected transaction/readback failures; lock timeout/recovery and dead bus)\n", failures);
+}
+
+static void test_fast_retune_preconditions(void)
+{
+    si5351_t device = {0};
+    assert(si5351_retune_receive(NULL, 7075000, false) == ESP_ERR_INVALID_ARG);
+    assert(si5351_retune_receive(&device, 7075000, false) == ESP_ERR_INVALID_ARG);
+    device = rx_fixture(false);
+    assert(si5351_retune_receive(&device, 14075000, true) == ESP_ERR_INVALID_STATE);
+    assert_fast_failure(&device, 7075000, true);
+    device = rx_fixture(false);
+    assert(si5351_retune_receive(&device, UINT32_MAX, false) == ESP_ERR_INVALID_ARG);
+    assert_fast_failure(&device, 7075000, true);
+    device = fixture();
+    assert(si5351_configure_radio_clock_plan(&device, 7075000, false, false) == ESP_OK);
+    reset_trace();
+    assert(!device.radio_rx_ready);
+    assert(si5351_retune_receive(&device, 7075100, false) == ESP_ERR_INVALID_STATE);
+    assert_fast_failure(&device, 7075000, true);
+    device = rx_fixture(false);
+    assert(si5351_write_register(&device, 16, 0x4f) == ESP_OK);
+    assert(!device.radio_rx_ready); // even identical arbitrary writes invalidate cache
+    reset_trace();
+    assert(si5351_retune_receive(&device, 7075100, false) == ESP_ERR_INVALID_STATE);
+    assert_fast_failure(&device, 7075000, true);
+    device = rx_fixture(false);
+    bus.registers[3] = 0xfe; // stale/external mutation unexpectedly enabled CLK0
+    assert(si5351_retune_receive(&device, 7075100, false) == ESP_ERR_INVALID_STATE);
+    assert_fast_failure(&device, 7075000, true);
+    assert(bus.transactions == 2); // mask check then OFF, no PLL write
+}
+
 int main(void)
 {
     test_nominal_and_offsets();
     test_input_ranges();
     test_transport_contract();
     test_fault_injection();
+    test_fast_retune_work_budget();
+    test_fast_retune_faults();
+    test_fast_retune_preconditions();
     puts("40m/20m zero-IF and experimental Fs/4 plans; shared transport contract PASS");
     return 0;
 }

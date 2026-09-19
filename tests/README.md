@@ -7,6 +7,7 @@ bash tests/run_native.sh
 bash tests/run_ui.sh
 bash tests/run_rf_engine.sh
 bash tests/run_synth.sh
+bash tests/run_rf_audio.sh
 ```
 
 The runner builds into a new temporary directory with address and undefined-
@@ -49,3 +50,8 @@ clock. It independently decodes 40 m / 20 m register plans, fractional tuning
 and Fs/4 LO offsets, checks CLK1-only receive completion, and injects 404
 transaction/readback failures plus readiness, PLL and reset timeouts. A dead
 bus cannot prove clocks off; the separate GPIO cutoff remains essential.
+
+`run_rf_audio.sh` compiles the actual RF audio dispatcher against a native
+FreeRTOS test adapter. It checks bounded/nonblocking queue behavior, stale
+sample invalidation, callback-close synchronization, and the QMX-style CPU0
+consumer affinity. It does not run ESP interrupt scheduling or physical audio.
